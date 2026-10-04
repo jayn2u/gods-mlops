@@ -6,15 +6,8 @@
   vars:
     gods_versions_lock_document: >-
       {{ lookup('ansible.builtin.file', playbook_dir ~ '/../versions.lock.yaml') | from_yaml }}
+    gods_preflight_helper_source: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/preflight_helpers.py') }}"
   tasks:
-    - name: Validate the Gods root is new or owned by this deployment
-      ansible.builtin.assert:
-        that:
-          - gods_data_root.startswith(gods_storage_mount.rstrip('/') + '/')
-          - gods_data_root not in gods_preserve_paths
-          - not (gods_data_root | regex_search('(^|/)(minio|labclip|rtsp)(/|$)'))
-        fail_msg: "Gods storage root must be a new path beneath its declared data mount."
-
     - name: Check non-interactive administrator permission without using it
       ansible.builtin.command:
         argv: [sudo, -n, true]
@@ -35,51 +28,75 @@
       changed_when: false
       failed_when: false
 
-    - name: Read free bytes on the persistent filesystem
+    - name: Read free bytes with the compatible df output mode
       ansible.builtin.command:
         argv:
-          - df
-          - -PB1
-          - --no-sync
-          - --output=avail
+          - python3
+          - -c
+          - "{{ gods_preflight_helper_source }}"
+          - disk
+          - --path
           - "{{ gods_storage_mount }}"
       register: gods_disk_check
       changed_when: false
       failed_when: false
+
+    - name: Parse the byte-count report as JSON
+      ansible.builtin.set_fact:
+        gods_disk_check_document: >-
+          {{ gods_disk_check.stdout | from_json
+             if gods_disk_check.stdout | default('') | length > 0
+             else {'status': 'blocked', 'available_bytes': 0, 'error': 'disk helper returned no JSON'} }}
+      changed_when: false
+
+    - name: Validate new data paths and preserved boundaries without writing files
+      ansible.builtin.command:
+        argv:
+          - python3
+          - -c
+          - "{{ gods_preflight_helper_source }}"
+          - paths
+          - --data-root
+          - "{{ gods_data_root }}"
+          - --k3s-data-dir
+          - "{{ gods_k3s_data_dir }}"
+          - --data-directories-json
+          - "{{ gods_data_directories | to_json }}"
+          - --preserved-paths-json
+          - "{{ gods_preserve_paths | to_json }}"
+          - --preserved-patterns-json
+          - "{{ gods_preserve_patterns | to_json }}"
+          - --owner-marker-name
+          - "{{ gods_owner_marker_name }}"
+          - --expected-owner
+          - gods-mlops
+          - --expected-k3s-version
+          - "{{ gods_versions_lock_document.platform.k3s }}"
+          - --expected-root-uid
+          - "{{ gods_expected_root_uid }}"
+      register: gods_path_check
+      changed_when: false
+      failed_when: false
+
+    - name: Parse the path and ownership result as JSON
+      ansible.builtin.set_fact:
+        gods_path_check_document: >-
+          {{ gods_path_check.stdout | from_json
+             if gods_path_check.stdout | default('') | length > 0
+             else {
+               'status': 'blocked',
+               'blockers': ['path helper returned no JSON'],
+               'root_exists': false,
+               'root_owned': false,
+               'owner_marker_valid': false
+             } }}
+      changed_when: false
 
     - name: Inspect the Gods data root without following symlinks
       ansible.builtin.stat:
         path: "{{ gods_data_root }}"
         follow: false
       register: gods_root_stat
-
-    - name: Inspect the Gods ownership marker without following symlinks
-      ansible.builtin.stat:
-        path: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
-        follow: false
-      register: gods_owner_marker_stat
-
-    - name: Read the marker only when an existing Gods root needs ownership proof
-      ansible.builtin.slurp:
-        src: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
-      register: gods_owner_marker
-      failed_when: false
-      when:
-        - gods_root_stat.stat.exists
-        - gods_root_stat.stat.isdir | default(false)
-        - not (gods_root_stat.stat.islnk | default(false))
-        - gods_owner_marker_stat.stat.exists
-        - gods_owner_marker_stat.stat.isreg | default(false)
-        - not (gods_owner_marker_stat.stat.islnk | default(false))
-        - gods_owner_marker_stat.stat.uid | default(-1) == 0
-
-    - name: Parse the non-secret Gods ownership marker
-      ansible.builtin.set_fact:
-        gods_owner_marker_document: >-
-          {{ gods_owner_marker.content | b64decode | from_json
-             if gods_owner_marker is defined and gods_owner_marker.content is defined
-             else {} }}
-      changed_when: false
 
     - name: Check which network interface routes to the peer node
       ansible.builtin.command:
@@ -193,20 +210,12 @@
     - name: Start the node readiness blocker list
       ansible.builtin.set_fact:
         gods_preflight_blockers: []
-        gods_root_owned: >-
-          {{ gods_root_stat.stat.exists and
-             not (gods_root_stat.stat.islnk | default(false)) and
-             gods_owner_marker_stat.stat.exists and
-             not (gods_owner_marker_stat.stat.islnk | default(false)) and
-             gods_owner_marker_stat.stat.uid | default(-1) == 0 and
-             not (gods_owner_marker.failed | default(false)) and
-             gods_owner_marker_document.owner | default('') == 'gods-mlops' and
-             gods_owner_marker_document.schema_version | default(0) == 1 and
-             gods_owner_marker_document.data_root | default('') == gods_data_root and
-             gods_owner_marker_document.k3s_data_dir | default('') == gods_k3s_data_dir and
-             gods_owner_marker_document.k3s_version | default('') == gods_versions_lock_document.platform.k3s }}
-        gods_owner_marker_valid: >-
-          {{ not gods_root_stat.stat.exists or gods_root_owned }}
+      changed_when: false
+
+    - name: Block unsafe roots, out-of-root storage, and preserved data overlaps
+      ansible.builtin.set_fact:
+        gods_preflight_blockers: "{{ gods_preflight_blockers + [gods_path_check_document.blockers | join('; ')] }}"
+      when: gods_path_check_document.status != 'ready'
       changed_when: false
 
     - name: Require non-interactive administrator access before any host change
@@ -226,30 +235,15 @@
       ansible.builtin.set_fact:
         gods_preflight_blockers: "{{ gods_preflight_blockers + ['persistent filesystem free space is below the approved safety reserve'] }}"
       when: >-
-        gods_disk_check.rc != 0 or
-        (gods_disk_check.stdout_lines | last | default('0') | int) <
+        gods_disk_check_document.status != 'ready' or
+        gods_disk_check_document.available_bytes | int <
         (gods_min_free_gib | int * 1024 * 1024 * 1024)
       changed_when: false
 
     - name: Refuse to overwrite a path that is not marked as Gods-owned
       ansible.builtin.set_fact:
         gods_preflight_blockers: "{{ gods_preflight_blockers + ['existing Gods path lacks a valid root-owned Gods ownership marker'] }}"
-      when: gods_root_stat.stat.exists and not gods_root_owned
-      changed_when: false
-
-    - name: Refuse to initialize existing storage directories without owner proof
-      ansible.builtin.set_fact:
-        gods_preflight_blockers: "{{ gods_preflight_blockers + ['existing Gods storage directory has an unexpected type or owner'] }}"
-      when: >-
-        item.stat.exists and (
-          item.stat.islnk | default(false) or
-          not (item.stat.isdir | default(false)) or
-          item.stat.uid | default(-1) != gods_container_uid | int or
-          item.stat.gid | default(-1) != gods_container_gid | int
-        )
-      loop: "{{ gods_data_directory_stats.results }}"
-      loop_control:
-        label: "{{ item.item.role }}"
+      when: gods_path_check_document.root_exists and not gods_path_check_document.owner_marker_valid
       changed_when: false
 
     - name: Refuse to replace a currently running non-Gods K3s service
@@ -258,14 +252,14 @@
       when: >-
         (gods_k3s_server_service.stdout | trim == 'active' or
          gods_k3s_agent_service.stdout | trim == 'active') and
-        not gods_root_owned
+        not (gods_path_check_document.root_owned and gods_path_check_document.owner_marker_valid)
       changed_when: false
 
     - name: Require an active Gods K3s service to match the pinned release
       ansible.builtin.set_fact:
         gods_preflight_blockers: "{{ gods_preflight_blockers + ['active Gods K3s binary differs from the immutable version lock'] }}"
       when: >-
-        gods_root_owned and
+        gods_path_check_document.root_owned and gods_path_check_document.owner_marker_valid and
         (gods_k3s_server_service.stdout | trim == 'active' or
          gods_k3s_agent_service.stdout | trim == 'active') and
         gods_versions_lock_document.platform.k3s not in gods_k3s_version_check.stdout
@@ -292,13 +286,13 @@
           storage:
             mount: "{{ gods_storage_mount }}"
             mounted_target: "{{ gods_mount_check.stdout | trim }}"
-            available_bytes: "{{ gods_disk_check.stdout_lines | last | default('0') | int }}"
+            available_bytes: "{{ gods_disk_check_document.available_bytes | int }}"
             min_free_gib: "{{ gods_min_free_gib }}"
             data_root: "{{ gods_data_root }}"
             data_root_exists: "{{ gods_root_stat.stat.exists }}"
             data_root_owner: "{{ gods_root_stat.stat.pw_name | default('unknown') }}"
-            owner_marker_valid: >-
-              "{{ gods_owner_marker_valid }}"
+            root_owned: "{{ gods_path_check_document.root_owned }}"
+            owner_marker_valid: "{{ gods_path_check_document.owner_marker_valid }}"
             planned_data_directories: "{{ gods_data_directory_snapshot | default([]) }}"
           existing_cluster:
             k3s_server_active: "{{ gods_k3s_server_service.stdout | trim == 'active' }}"
@@ -313,8 +307,9 @@
             peer_address: "{{ gods_peer_ip }}"
             peer_route: "{{ gods_peer_route.stdout | default('') }}"
             peer_route_interface: >-
-              {{ (gods_peer_route.stdout | regex_search('\\bdev\\s+([^ ]+)', '\\1') | first)
-                 if gods_peer_route.rc | default(1) == 0 else '' }}
+              {% set route_tokens = gods_peer_route.stdout.split() | default([]) %}
+              {{ route_tokens[route_tokens.index('dev') + 1]
+                 if gods_peer_route.rc | default(1) == 0 and 'dev' in route_tokens else '' }}
           preserved_paths: "{{ gods_preservation_snapshot | default([]) }}"
           preserved_patterns: "{{ gods_preserve_patterns }}"
           preserved_services: "{{ gods_preserve_services }}"

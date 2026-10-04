@@ -18,6 +18,7 @@ PRESERVED_PREFIXES = (
     "/data/jayn2u/minio",
     "/data/jayn2u/labclip-cache",
     "/data/jayn2u/labclip-k3s",
+    "/mnt/data/gods-mlops",
     "/mnt/data/minio-code",
     "/mnt/data/labclip-cache",
     "/mnt/data/labclip-k3s",
@@ -98,9 +99,19 @@ def test_profile_and_gpu_admission_are_scoped_to_gods_training_namespace(
     mutation_expression = mutation_spec["mutations"][0]["applyConfiguration"][
         "expression"
     ]
+    assert mutation_expression.lstrip().startswith("Object{")
     assert "kubernetes.io/hostname" in mutation_expression
     assert '"ubuntu"' in mutation_expression
     assert '"nvidia"' in mutation_expression
+    mutation_binding = _find_one(
+        rendered_objects,
+        kind="MutatingAdmissionPolicyBinding",
+        name="gods-mlops-gpu-placement-binding",
+    )
+    assert mutation_binding["spec"]["policyName"] == "gods-mlops-gpu-placement"
+    assert mutation_binding["spec"]["matchResources"]["namespaceSelector"][
+        "matchLabels"
+    ]["kubernetes.io/metadata.name"] == "gods-mlops"
 
     validation = _find_one(
         rendered_objects,
@@ -122,11 +133,18 @@ def test_profile_and_gpu_admission_are_scoped_to_gods_training_namespace(
         "runtimeClassName" in expression and "nvidia" in expression
         for expression in validation_expressions
     )
+    assert any(
+        "size()" in expression and "== 1" in expression
+        for expression in validation_expressions
+    )
+    assert any(
+        'quantity("1")' in expression for expression in validation_expressions
+    )
 
     binding = _find_one(
         rendered_objects,
         kind="ValidatingAdmissionPolicyBinding",
-        name="gods-mlops-gpu-placement-binding",
+        name="gods-mlops-gpu-placement-validation-binding",
     )
     assert binding["spec"]["validationActions"] == ["Deny"]
     assert binding["spec"]["matchResources"]["namespaceSelector"][
@@ -163,10 +181,15 @@ def test_gods_local_volumes_are_retained_and_use_only_new_paths(
         assert spec["persistentVolumeReclaimPolicy"] == "Retain"
         assert spec["storageClassName"] == "gods-mlops-local-retain"
         local_path = spec["local"]["path"]
-        assert local_path.startswith(
-            ("/data/jayn2u/gods-mlops/", "/mnt/data/gods-mlops/")
+        local_path_parts = Path(local_path)
+        assert any(
+            local_path_parts.is_relative_to(Path(root))
+            for root in ("/data/jayn2u/gods-mlops", "/mnt/data/gods-mlops-runtime")
         )
-        assert not any(local_path.startswith(path) for path in PRESERVED_PREFIXES)
+        assert not any(
+            local_path_parts == Path(path) or Path(path) in local_path_parts.parents
+            for path in PRESERVED_PREFIXES
+        )
 
         affinity = spec["nodeAffinity"]["required"]["nodeSelectorTerms"]
         hostnames = {

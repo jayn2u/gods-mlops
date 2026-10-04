@@ -57,7 +57,7 @@ The storage roots and initial limits are:
 | `ubuntu` | `/data/jayn2u/gods-mlops/objects` | 1 TiB | SeaweedFS objects, datasets, models, and checkpoints |
 | `ubuntu` | `/data/jayn2u/gods-mlops/cache` | 200 GiB | Re-creatable model and training cache |
 | `ubuntu` | `/data/jayn2u/gods-mlops/metadata` | 50 GiB | SeaweedFS master and filer state |
-| `vis-lab` | `/mnt/data/gods-mlops/spool` | 20 GiB | Future asynchronous intake spool |
+| `vis-lab` | `/mnt/data/gods-mlops-runtime/spool` | 20 GiB | Future asynchronous intake spool |
 
 Ansible preflight reads node addresses and routes, non-interactive administrator access, K3s service state, GPU/runtime availability, free space, the Gods root marker, and the ownership of preserved paths. It writes a mode-`0600` JSON report to `infra/ansible/artifacts/preflight.json` on the controller before reporting readiness. The remote host tasks only run read-only commands and `stat`/`slurp`; they do not create the new data roots or use `sudo` to inspect them. The `site.yml` installation starts only after the report says both nodes are ready. It rejects an active K3s service unless a root-owned Gods marker proves that the service already belongs to this deployment.
 
@@ -70,7 +70,7 @@ ansible-playbook \
   -i infra/ansible/inventory.example.yml infra/ansible/preflight.yml
 ```
 
-The inventory uses the known SSH alias `jayn2u-179-pub-vis` for `ubuntu` and the current `vis-lab` node address. Replace either connection input only with the approved SSH route for that host. The report identifies `sudo -n` failure as a blocker and is still written when a node is unreachable. Do not bypass that gate through Docker access. The current environment has an active non-Gods K3s cluster and lacks non-interactive sudo, so `site.yml` is expected to stop at preflight; no cluster, firewall, or host data is changed by this documentation or the static checks.
+The inventory uses the known SSH alias `jayn2u-179-pub-vis` for `ubuntu` and `203.253.25.54:2222` for `vis-lab` when using SSH. A controller running on `vis-lab` can use a temporary local-connection inventory for read-only preflight; do not change SSH known-host data to work around a refused route. The report identifies `sudo -n` failure as a blocker and is still written when a node is unreachable. Do not bypass that gate through Docker access. The current environment has an active non-Gods K3s cluster, an unmarked `/mnt/data/gods-mlops` directory, and no non-interactive sudo. That pre-existing checkout path is preserved; new spool data uses the separate `/mnt/data/gods-mlops-runtime` root. `site.yml` is expected to stop at preflight until the old path is reviewed and the cluster preservation/reclaim task is complete. No cluster, firewall, or host data is changed by static checks.
 
 The install playbook reads K3s `v1.36.2+k3s1` from the version lock, installs server on `vis-lab` and joins only `ubuntu`, and disables K3s Traefik, ServiceLB, and the default `local-path` provisioner. Its persistent host directories are rooted at the new Gods paths. The marker is non-secret and records the project, root, K3s data directory, and pinned version. Storage directories use UID/GID `10001`, which matches the training image. The join token comes from `GODS_K3S_TOKEN`; supply it from the approved secret store and keep it there for later recovery.
 
@@ -83,7 +83,7 @@ The two-node K3s flows that the existing route must permit are:
 | Kubelet API | TCP 10250 | `203.253.25.54/32` (`vis-lab`) | `203.253.21.179/32` (`ubuntu`), target interface reported by `ip route get` |
 | Kubeflow browser access | TCP 8080, loopback only | local operator process | `127.0.0.1` port-forward to the in-cluster Istio gateway |
 
-The JSON report records each host's IPv4 addresses, the selected peer-route interface, and preserved paths. The playbooks contain no firewall tasks; the table describes the existing node-to-node flows that must be available and does not open them. Kubeflow remains internal: the rendered distribution has no `Ingress`, `NodePort`, `LoadBalancer`, pod `hostPort`, or public Service. Use `kubectl port-forward --address 127.0.0.1` for operator access.
+The JSON report records each host's IPv4 addresses, the selected peer-route interface, and preserved paths. The playbooks contain no firewall tasks; the table describes the existing node-to-node flows that must be available and does not open them. The current preflight uses `sudo -n` to fail before host changes when non-interactive elevation is unavailable. Resolve this with a scoped administrative method before deployment; the current gate does not support an interactive become-password probe. Do not grant blanket passwordless sudo as a workaround. Kubeflow remains internal: the rendered distribution has no `Ingress`, `NodePort`, `LoadBalancer`, pod `hostPort`, or public Service. Use `kubectl port-forward --address 127.0.0.1` for operator access.
 
 After the separate existing-cluster preservation/reclaim task is complete and preflight is ready, prepare and review the render before applying it:
 
@@ -95,5 +95,7 @@ kubectl apply -k infra/kubeflow
 Terraform owns only the SeaweedFS and NVIDIA device-plugin releases; Kustomize owns the Profile, GPU policies, RuntimeClass, StorageClass, PVs, and PVCs. Apply the Kustomize resources first so Terraform can verify the `gods-mlops` namespace and consume those claims. Terraform reads both the preflight report and the Task 1 version lock, and its preconditions fail closed if either node is not ready or the locked versions change.
 
 Provide S3 keys in a private `infra/terraform/terraform.tfvars` file with mode `0600`; all four values are required and marked sensitive. Terraform state also contains Helm release values and can contain those credentials, so keep state private and preserve an encrypted recovery copy. `.gitignore` excludes local Terraform state, variable files, Ansible reports, and generated kubeconfig material. Do not commit them or print them in logs.
+
+The pinned Kubeflow distribution still supplies its upstream example Dex identity. Task 2 does not create an operator-specific Dex password or verify browser login. Configure explicit operator credentials through a private deployment input before runtime acceptance; the example identity and password are not claimed to be secure defaults.
 
 Static IaC checks are not a deployment result. The runtime K3s/Kubeflow apply, NVIDIA device allocation, S3 write/read, and Retain-volume recovery still need the separate authorized lifecycle validation after administrator access and the preservation/reclaim gate are complete.

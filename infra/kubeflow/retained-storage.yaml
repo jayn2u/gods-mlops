@@ -96,7 +96,7 @@ spec:
   storageClassName: gods-mlops-local-retain
   volumeMode: Filesystem
   local:
-    path: /mnt/data/gods-mlops/spool
+    path: /mnt/data/gods-mlops-runtime/spool
   nodeAffinity:
     required:
       nodeSelectorTerms:

@@ -30,14 +30,27 @@ spec:
     - patchType: ApplyConfiguration
       applyConfiguration:
         expression: >-
-          Object.spec{
-            nodeSelector: has(object.spec.nodeSelector)
-              ? object.spec.nodeSelector
-              : {"kubernetes.io/hostname": "ubuntu"},
-            runtimeClassName: has(object.spec.runtimeClassName)
-              ? object.spec.runtimeClassName
-              : "nvidia"
+          Object{
+            spec: Object.spec{
+              nodeSelector: has(object.spec.nodeSelector)
+                ? object.spec.nodeSelector
+                : {"kubernetes.io/hostname": "ubuntu"},
+              runtimeClassName: has(object.spec.runtimeClassName)
+                ? object.spec.runtimeClassName
+                : "nvidia"
+            }
           }
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: gods-mlops-gpu-placement-binding
+spec:
+  policyName: gods-mlops-gpu-placement
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: gods-mlops
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -68,6 +81,35 @@ spec:
         )
   validations:
     - expression: >-
+        object.spec.containers.filter(container,
+          has(container.resources) && has(container.resources.requests) &&
+          "nvidia.com/gpu" in container.resources.requests
+        ).size() + (
+          has(object.spec.initContainers)
+          ? object.spec.initContainers.filter(container,
+              has(container.resources) && has(container.resources.requests) &&
+              "nvidia.com/gpu" in container.resources.requests
+            ).size()
+          : 0
+        ) == 1
+      message: "Gods GPU pods must request exactly one NVIDIA GPU across regular and init containers."
+    - expression: >-
+        object.spec.containers.filter(container,
+          has(container.resources) && has(container.resources.requests) &&
+          "nvidia.com/gpu" in container.resources.requests
+        ).all(container,
+          container.resources.requests["nvidia.com/gpu"] == quantity("1")
+        ) && (
+          !has(object.spec.initContainers) ||
+          object.spec.initContainers.filter(container,
+            has(container.resources) && has(container.resources.requests) &&
+            "nvidia.com/gpu" in container.resources.requests
+          ).all(container,
+            container.resources.requests["nvidia.com/gpu"] == quantity("1")
+          )
+        )
+      message: "Each Gods GPU container must request exactly one NVIDIA GPU."
+    - expression: >-
         has(object.spec.nodeSelector) &&
         "kubernetes.io/hostname" in object.spec.nodeSelector &&
         object.spec.nodeSelector["kubernetes.io/hostname"] == "ubuntu"
@@ -79,7 +121,7 @@ spec:
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
-  name: gods-mlops-gpu-placement-binding
+  name: gods-mlops-gpu-placement-validation-binding
 spec:
   policyName: gods-mlops-gpu-placement-validation
   validationActions: [Deny]

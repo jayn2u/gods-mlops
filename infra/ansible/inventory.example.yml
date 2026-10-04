@@ -6,6 +6,7 @@ all:
     gods_owner_marker_name: .gods-mlops-owner.json
     gods_container_uid: 10001
     gods_container_gid: 10001
+    gods_expected_root_uid: 0
     gods_network_flows:
       - name: K3s API
         protocol: tcp
@@ -30,17 +31,19 @@ all:
       hosts:
         vis-lab:
           ansible_host: 203.253.25.54
+          ansible_port: 2222
           k3s_node_ip: 203.253.25.54
           gods_peer_ip: 203.253.21.179
           gods_k3s_data_dir: "{{ gods_data_root }}/{{ gods_k3s_data_dir_name }}"
           gods_storage_mount: /mnt/data
-          gods_data_root: /mnt/data/gods-mlops
+          gods_data_root: /mnt/data/gods-mlops-runtime
           gods_min_free_gib: 50
           gods_data_directories:
-            - path: /mnt/data/gods-mlops/spool
+            - path: /mnt/data/gods-mlops-runtime/spool
               capacity: 20Gi
               role: spool
           gods_preserve_paths:
+            - /mnt/data/gods-mlops
             - /mnt/data/minio-code
             - /mnt/data/minio-data
             - /mnt/data/labclip-cache
