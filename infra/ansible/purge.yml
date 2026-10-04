@@ -3,6 +3,8 @@
   hosts: localhost
   connection: local
   gather_facts: false
+  vars:
+    gods_lifecycle_inventory: "{{ gods_lifecycle_inventory_file | default(playbook_dir ~ '/inventory.example.yml') }}"
   tasks:
     - name: Require a separately supplied target file and SHA-256 confirmation
       ansible.builtin.assert:
@@ -11,6 +13,8 @@
           - gods_purge_targets_file | length > 0
           - gods_purge_target_digest is defined
           - gods_purge_target_digest is match('^[0-9a-f]{64}$')
+          - gods_reclaim_plan_id is defined
+          - gods_reclaim_plan_id is match('^[0-9a-f]{64}$')
         fail_msg: "Purge requires an explicit target list and its exact SHA-256 confirmation."
 
     - name: Revalidate the target digest and preservation exclusions
@@ -23,12 +27,26 @@
           - "{{ gods_purge_targets_file }}"
           - --confirm-targets
           - "{{ gods_purge_target_digest }}"
+          - --confirm-plan
+          - "{{ gods_reclaim_plan_id }}"
+          - --inventory
+          - "{{ gods_lifecycle_inventory }}"
+      register: gods_purge_plan_verification
       changed_when: false
+
+    - name: Require the controller verifier to bind target and reclaim digests
+      ansible.builtin.assert:
+        that:
+          - (gods_purge_plan_verification.stdout | from_json).plan_id == gods_reclaim_plan_id
+          - (gods_purge_plan_verification.stdout | from_json).target_sha256 == gods_purge_target_digest
 
 - name: Permanently remove only exact confirmed children of Gods data roots
   hosts: gods_cluster
   gather_facts: false
   become: true
+  vars:
+    gods_cluster_marker: "{{ gods_cluster_marker_name | default('.gods-mlops-cluster-owner.json') }}"
+    gods_reclaim_state_path: "{{ gods_data_root }}/.gods-mlops-reclaim-state.json"
   tasks:
     - name: Verify authenticated privilege by checking the effective UID
       ansible.builtin.command:
@@ -46,10 +64,66 @@
       ansible.builtin.set_fact:
         gods_lifecycle_service: "{{ 'k3s' if inventory_hostname in groups['gods_server'] else 'k3s-agent' }}"
 
+    - name: Select the exact reclaim-state and cluster-marker paths
+      ansible.builtin.set_fact:
+        gods_cluster_marker_path: "{{ gods_k3s_data_dir }}/{{ gods_cluster_marker }}"
+
+    - name: Inspect purge ownership and reclaim evidence without following links
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
+        - "{{ gods_cluster_marker_path }}"
+        - "{{ gods_reclaim_state_path }}"
+      register: gods_purge_evidence_stats
+
+    - name: Require real marker files and a private completed reclaim record
+      ansible.builtin.assert:
+        that:
+          - gods_purge_evidence_stats.results[0].stat.isreg | default(false)
+          - not (gods_purge_evidence_stats.results[0].stat.islnk | default(false))
+          - gods_purge_evidence_stats.results[1].stat.isreg | default(false)
+          - not (gods_purge_evidence_stats.results[1].stat.islnk | default(false))
+          - gods_purge_evidence_stats.results[2].stat.isreg | default(false)
+          - not (gods_purge_evidence_stats.results[2].stat.islnk | default(false))
+          - gods_purge_evidence_stats.results[2].stat.mode == '0600'
+        fail_msg: "Purge requires real owner markers and a private reclaim-state file on {{ inventory_hostname }}."
+
     - name: Verify ownership marker for this host before any purge
       ansible.builtin.slurp:
         src: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
       register: gods_root_marker
+      no_log: true
+
+    - name: Verify the cluster marker and matching reclaim-state record
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ gods_cluster_marker_path }}"
+        - "{{ gods_reclaim_state_path }}"
+      register: gods_purge_evidence_files
+      no_log: true
+
+    - name: Require matching completed reclaim and cold-state evidence before purge
+      ansible.builtin.assert:
+        that:
+          - (gods_purge_evidence_files.results[0].content | b64decode | from_json).owner == 'gods-mlops'
+          - (gods_purge_evidence_files.results[0].content | b64decode | from_json).data_root == gods_data_root
+          - (gods_purge_evidence_files.results[0].content | b64decode | from_json).k3s_data_dir == gods_k3s_data_dir
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).schema_version == 1
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).owner == 'gods-mlops'
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).node == inventory_hostname
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).plan_id == gods_reclaim_plan_id
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).step == 'service_stopped'
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).service == gods_lifecycle_service
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).k3s_data_dir == gods_k3s_data_dir
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).runtime_status == 'verified_stopped'
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).cold_retained_paths is mapping
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).cold_retained_paths | length >= 9
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).cold_k3s_state is mapping
+          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).cold_k3s_state | length > 0
+        fail_msg: "Purge requires matching plan-bound reclaim state, verified cold PV hashes, and managed cluster ownership on {{ inventory_hostname }}."
       no_log: true
 
     - name: Require the current managed root to match the confirmed target records
@@ -65,21 +139,25 @@
         label: "{{ item.node }} {{ item.path }}"
       no_log: true
 
-    - name: Require the Gods K3s service to be stopped before removing persistent data
-      ansible.builtin.command:
-        argv:
-          - systemctl
-          - is-active
-          - "{{ gods_lifecycle_service }}"
-      register: gods_purge_service_status
+    - name: Recheck K3s service, CRI socket, and owned runtime processes before purge
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/runtime_probe.py --service {{ gods_lifecycle_service }}
+          --data-dir {{ gods_k3s_data_dir | quote }}
+          --socket /run/k3s/containerd/containerd.sock
+      register: gods_purge_runtime_probe
       changed_when: false
       failed_when: false
 
-    - name: Block purge while the managed service is active
+    - name: Parse current runtime-quiescence evidence
+      ansible.builtin.set_fact:
+        gods_purge_runtime_report: "{{ gods_purge_runtime_probe.stdout | default('{}', true) | from_json }}"
+
+    - name: Block purge unless current runtime quiescence is independently verified
       ansible.builtin.assert:
         that:
-          - gods_purge_service_status.stdout | trim != 'active'
-        fail_msg: "Stop the marked Gods K3s service with the data-preserving reclaim command before purge."
+          - gods_purge_runtime_report.status | default('pending') == 'verified_stopped'
+        fail_msg: "Current K3s runtime evidence is active, ambiguous, or incomplete; retained data will not be purged."
 
     - name: Remove only exact confirmed target paths for this node
       ansible.builtin.file:

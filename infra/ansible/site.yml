@@ -1,6 +1,8 @@
 ---
 - name: Gather the read-only readiness report before any installation
   ansible.builtin.import_playbook: preflight.yml
+  vars:
+    gods_preflight_use_become: true
 
 - name: Install the locked Gods-only K3s control plane on vis-lab
   hosts: gods_server

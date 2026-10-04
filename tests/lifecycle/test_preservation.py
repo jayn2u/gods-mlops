@@ -8,7 +8,9 @@ import pytest
 
 from gods_mlops.lifecycle.inventory import InventoryError, plan_reclaim
 from gods_mlops.lifecycle.recovery import (
+    canonical_database_dump_sha256,
     hash_tree,
+    main as recovery_main,
     purge_targets_digest,
     validate_purge_targets,
     verify_recovery_artifacts,
@@ -78,8 +80,10 @@ def _retained_manifest(tmp_path: Path) -> dict:
 
     source_dump = tmp_path / "backup" / "metadata.sql"
     restored_dump = tmp_path / "restore-check" / "metadata.sql"
-    dump_hash = _write(source_dump, b"canonical pg_dump bytes")
+    _write(source_dump, b"canonical pg_dump bytes")
     _write(restored_dump, b"canonical pg_dump bytes")
+    dump_format = "postgresql-sql-v1"
+    dump_hash = canonical_database_dump_sha256(source_dump, dump_format=dump_format)
     source_dump.chmod(0o600)
     restored_dump.chmod(0o600)
 
@@ -109,6 +113,16 @@ def _retained_manifest(tmp_path: Path) -> dict:
                 "backup_dump_path": str(source_dump),
                 "restored_dump_path": str(restored_dump),
                 "expected_sha256": dump_hash,
+                "dump_format": dump_format,
+                "provenance": {
+                    "backup_tool": "pg_dump",
+                    "backup_tool_version": "17.4",
+                    "restore_tool": "psql",
+                    "restore_tool_version": "17.4",
+                    "redump_tool": "pg_dump",
+                    "redump_tool_version": "17.4",
+                    "options": ["--format=plain", "--column-inserts", "--rows-per-insert=1", "--no-owner", "--no-acl"],
+                },
                 "expected_uid": uid,
                 "expected_mode": "0600",
             }
@@ -221,6 +235,187 @@ def test_verify_retained_checks_content_ownership_restore_and_secret_permissions
     assert result["status"] == "verified"
     assert result["failures"] == []
     assert "never include this in output" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("same_file", ["same_path", "same_inode"])
+def test_database_restore_proof_requires_a_distinct_dump_file(
+    tmp_path: Path, same_file: str
+) -> None:
+    manifest = _retained_manifest(tmp_path)
+    database = manifest["database_restores"][0]
+    backup = Path(database["backup_dump_path"])
+    restored = Path(database["restored_dump_path"])
+    if same_file == "same_path":
+        database["restored_dump_path"] = str(backup)
+    else:
+        restored.unlink()
+        os.link(backup, restored)
+
+    result = verify_retained(manifest)
+
+    assert result["status"] == "failed"
+    assert "database_restore_separation" in {failure["check"] for failure in result["failures"]}
+
+
+def test_database_restore_comparison_normalizes_dump_headers_and_row_order(
+    tmp_path: Path,
+) -> None:
+    manifest = _retained_manifest(tmp_path)
+    database = manifest["database_restores"][0]
+    backup = Path(database["backup_dump_path"])
+    restored = Path(database["restored_dump_path"])
+    backup.write_text(
+        "-- PostgreSQL database dump\n"
+        "-- Dumped from database version 17.4\n"
+        "-- Dumped by pg_dump version 17.4\n"
+        "\\restrict backup-session-token\n"
+        "CREATE TABLE public.records (id integer PRIMARY KEY, value text);\n"
+        "INSERT INTO public.records (id, value) VALUES (1, 'one');\n"
+        "INSERT INTO public.records (id, value) VALUES (2, 'two');\n"
+        "\\unrestrict backup-session-token\n"
+        "-- Dump completed on 2026-10-05 00:00:00\n",
+        encoding="utf-8",
+    )
+    restored.write_text(
+        "-- PostgreSQL database dump\n"
+        "-- Dumped from database version 17.4\n"
+        "-- Dumped by pg_dump version 17.4\n"
+        "\\restrict restore-session-token\n"
+        "CREATE TABLE public.records (id integer PRIMARY KEY, value text);\n"
+        "INSERT INTO public.records (id, value) VALUES (2, 'two');\n"
+        "INSERT INTO public.records (id, value) VALUES (1, 'one');\n"
+        "\\unrestrict restore-session-token\n"
+        "-- Dump completed on 2026-10-06 00:00:00\n",
+        encoding="utf-8",
+    )
+    database["dump_format"] = "postgresql-sql-v1"
+    database["provenance"] = {
+        "backup_tool": "pg_dump",
+        "backup_tool_version": "17.4",
+        "restore_tool": "psql",
+        "restore_tool_version": "17.4",
+        "redump_tool": "pg_dump",
+        "redump_tool_version": "17.4",
+        "options": ["--format=plain", "--column-inserts", "--rows-per-insert=1", "--no-owner", "--no-acl"],
+    }
+    database["expected_sha256"] = canonical_database_dump_sha256(backup, dump_format="postgresql-sql-v1")
+
+    result = verify_retained(manifest)
+
+    assert result["status"] == "verified"
+    assert result["failures"] == []
+
+
+@pytest.mark.parametrize(
+    ("restored_schema", "restored_row"),
+    [
+        ("CREATE TABLE public.records (id text PRIMARY KEY);", "INSERT INTO public.records (id) VALUES ('1');"),
+        ("CREATE TABLE public.records (id integer PRIMARY KEY);", "INSERT INTO public.records (id) VALUES (2);"),
+    ],
+)
+def test_canonical_restore_comparison_rejects_schema_or_data_mismatch(
+    tmp_path: Path, restored_schema: str, restored_row: str
+) -> None:
+    manifest = _retained_manifest(tmp_path)
+    database = manifest["database_restores"][0]
+    backup = Path(database["backup_dump_path"])
+    restored = Path(database["restored_dump_path"])
+    backup.write_text(
+        "-- Dumped by pg_dump version 17.4\n"
+        "\\restrict backup-token\n"
+        "CREATE TABLE public.records (id integer PRIMARY KEY);\n"
+        "INSERT INTO public.records (id) VALUES (1);\n"
+        "\\unrestrict backup-token\n",
+        encoding="utf-8",
+    )
+    restored.write_text(
+        "-- Dump completed on 2026-10-06\n"
+        "\\restrict restore-token\n"
+        f"{restored_schema}\n"
+        f"{restored_row}\n"
+        "\\unrestrict restore-token\n",
+        encoding="utf-8",
+    )
+    database["expected_sha256"] = canonical_database_dump_sha256(
+        backup, dump_format="postgresql-sql-v1"
+    )
+
+    result = verify_retained(manifest)
+
+    assert result["status"] == "failed"
+    assert "database_restore" in {failure["check"] for failure in result["failures"]}
+
+
+def test_mysql_restore_comparison_normalizes_headers_database_name_and_row_order(
+    tmp_path: Path,
+) -> None:
+    manifest = _retained_manifest(tmp_path)
+    database = manifest["database_restores"][0]
+    backup = Path(database["backup_dump_path"])
+    restored = Path(database["restored_dump_path"])
+    backup.write_text(
+        "-- MySQL dump 10.13 Distrib 8.0.42\n"
+        "-- Host: localhost Database: metadata\n"
+        "USE `metadata`;\n"
+        "CREATE TABLE `records` (`id` int NOT NULL, PRIMARY KEY (`id`));\n"
+        "INSERT INTO `records` VALUES (1);\n"
+        "INSERT INTO `records` VALUES (2);\n"
+        "-- Dump completed on 2026-10-05\n",
+        encoding="utf-8",
+    )
+    restored.write_text(
+        "-- MySQL dump 10.13 Distrib 8.0.42\n"
+        "-- Host: localhost Database: metadata_restore_check\n"
+        "USE `metadata_restore_check`;\n"
+        "CREATE TABLE `records` (`id` int NOT NULL, PRIMARY KEY (`id`));\n"
+        "INSERT INTO `records` VALUES (2);\n"
+        "INSERT INTO `records` VALUES (1);\n"
+        "-- Dump completed on 2026-10-06\n",
+        encoding="utf-8",
+    )
+    database["dump_format"] = "mysql-sql-v1"
+    database["provenance"] = {
+        "backup_tool": "mysqldump",
+        "backup_tool_version": "8.0.42",
+        "restore_tool": "mysql",
+        "restore_tool_version": "8.0.42",
+        "redump_tool": "mysqldump",
+        "redump_tool_version": "8.0.42",
+        "options": [
+            "--skip-comments", "--skip-dump-date", "--skip-extended-insert", "--order-by-primary",
+            "--routines", "--events", "--triggers", "--no-tablespaces", "--single-transaction",
+            "--set-gtid-purged=OFF",
+        ],
+    }
+    database["expected_sha256"] = canonical_database_dump_sha256(backup, dump_format="mysql-sql-v1")
+
+    result = verify_retained(manifest)
+
+    assert result["status"] == "verified"
+    assert result["failures"] == []
+
+
+def test_canonical_dump_hash_command_returns_only_path_format_and_digest(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dump = tmp_path / "metadata.sql"
+    dump.write_text("CREATE TABLE public.records (id integer PRIMARY KEY);\n", encoding="utf-8")
+
+    result = recovery_main([
+        "hash-database-dump",
+        "--path",
+        str(dump),
+        "--format",
+        "postgresql-sql-v1",
+    ])
+
+    output = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert output == {
+        "path": str(dump),
+        "format": "postgresql-sql-v1",
+        "sha256": canonical_database_dump_sha256(dump, dump_format="postgresql-sql-v1"),
+    }
 
 
 def test_pre_stop_recovery_gate_hashes_the_backup_but_checks_live_source_ownership_only(

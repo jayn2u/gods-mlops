@@ -1,4 +1,168 @@
 ---
+- name: Verify both Gods roots exist and carry ownership markers before any controller work
+  hosts: gods_cluster
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Inspect both managed roots and non-secret ownership marker metadata
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ gods_data_root }}"
+        - "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
+        - "{{ gods_k3s_data_dir }}"
+        - "{{ gods_k3s_data_dir }}/{{ gods_cluster_marker_name | default('.gods-mlops-cluster-owner.json') }}"
+      register: gods_ownership_precheck
+
+    - name: Require both exact root-owned Gods markers before running controller or Kubernetes commands
+      ansible.builtin.assert:
+        that:
+          - gods_ownership_precheck.results[0].stat.isdir | default(false)
+          - not (gods_ownership_precheck.results[0].stat.islnk | default(false))
+          - gods_ownership_precheck.results[1].stat.isreg | default(false)
+          - gods_ownership_precheck.results[1].stat.uid | default(-1) | int == 0
+          - gods_ownership_precheck.results[2].stat.isdir | default(false)
+          - not (gods_ownership_precheck.results[2].stat.islnk | default(false))
+          - gods_ownership_precheck.results[3].stat.isreg | default(false)
+          - gods_ownership_precheck.results[3].stat.uid | default(-1) | int == 0
+        fail_msg: "Both Gods ownership markers must exist under the exact managed roots on {{ inventory_hostname }} before reclaim can start."
+
+- name: Verify exact marker contents and service identity before any cluster mutation
+  hosts: gods_cluster
+  gather_facts: false
+  become: true
+  any_errors_fatal: true
+  tasks:
+    - name: Select the role-specific managed K3s service
+      ansible.builtin.set_fact:
+        gods_lifecycle_service: "{{ 'k3s' if inventory_hostname in groups['gods_server'] else 'k3s-agent' }}"
+
+    - name: Require effective root for exact ownership and retained-state inspection
+      ansible.builtin.command:
+        argv: [id, -u]
+      register: gods_precheck_effective_uid
+      changed_when: false
+
+    - name: Verify authenticated privilege before inspecting retained state
+      ansible.builtin.assert:
+        that:
+          - gods_precheck_effective_uid.stdout | trim == '0'
+        fail_msg: "Ansible become did not produce effective uid 0 on {{ inventory_hostname }}."
+
+    - name: Read non-secret Gods ownership markers
+      ansible.builtin.slurp:
+        src: "{{ item }}"
+      loop:
+        - "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
+        - "{{ gods_k3s_data_dir }}/{{ gods_cluster_marker_name | default('.gods-mlops-cluster-owner.json') }}"
+      register: gods_precheck_marker_docs
+      no_log: true
+
+    - name: Validate exact data-root and cluster-state ownership
+      ansible.builtin.assert:
+        that:
+          - (gods_precheck_marker_docs.results[0].content | b64decode | from_json).owner == 'gods-mlops'
+          - (gods_precheck_marker_docs.results[0].content | b64decode | from_json).data_root == gods_data_root
+          - (gods_precheck_marker_docs.results[0].content | b64decode | from_json).k3s_data_dir == gods_k3s_data_dir
+          - (gods_precheck_marker_docs.results[1].content | b64decode | from_json).owner == 'gods-mlops'
+          - (gods_precheck_marker_docs.results[1].content | b64decode | from_json).data_root == gods_data_root
+          - (gods_precheck_marker_docs.results[1].content | b64decode | from_json).k3s_data_dir == gods_k3s_data_dir
+        fail_msg: "Ownership markers do not match the configured Gods roots on {{ inventory_hostname }}."
+      no_log: true
+
+    - name: Inspect the selected service command before checking the cluster phase
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - show
+          - --property=ExecStart
+          - --value
+          - "{{ gods_lifecycle_service }}"
+      register: gods_precheck_exec_start
+      changed_when: false
+
+    - name: Require the service to point at this Gods-only state directory
+      ansible.builtin.assert:
+        that:
+          - gods_k3s_data_dir in gods_precheck_exec_start.stdout
+        fail_msg: "{{ gods_lifecycle_service }} does not name the configured Gods state directory on {{ inventory_hostname }}."
+
+    - name: Record a digest of the verified service configuration
+      ansible.builtin.set_fact:
+        gods_precheck_service_exec_start_sha256: "{{ gods_precheck_exec_start.stdout | hash('sha256') }}"
+
+    - name: Read the current service state without treating command errors as stopped
+      ansible.builtin.command:
+        argv: [systemctl, is-active, "{{ gods_lifecycle_service }}"]
+      register: gods_precheck_service_state
+      changed_when: false
+      failed_when: false
+
+    - name: Require a known active or inactive state
+      ansible.builtin.assert:
+        that:
+          - gods_precheck_service_state.stdout | trim in ['active', 'inactive']
+        fail_msg: "{{ gods_lifecycle_service }} state is unknown or failed on {{ inventory_hostname }}; refusing to infer a safe reclaim phase."
+
+    - name: Record whether this managed service is active
+      ansible.builtin.set_fact:
+        gods_lifecycle_service_active: "{{ gods_precheck_service_state.stdout | trim == 'active' }}"
+
+    - name: Inspect a durable reclaim phase record if present
+      ansible.builtin.stat:
+        path: "{{ gods_data_root }}/.gods-mlops-reclaim-state.json"
+        follow: false
+      register: gods_precheck_reclaim_state_stat
+
+    - name: Require durable reclaim evidence to be a private regular file
+      ansible.builtin.assert:
+        that:
+          - gods_precheck_reclaim_state_stat.stat.isreg | default(false)
+          - not (gods_precheck_reclaim_state_stat.stat.islnk | default(false))
+          - gods_precheck_reclaim_state_stat.stat.mode == '0600'
+        fail_msg: "The durable reclaim state on {{ inventory_hostname }} is not a private regular file."
+      when: gods_precheck_reclaim_state_stat.stat.exists
+
+    - name: Read the durable reclaim phase record
+      ansible.builtin.slurp:
+        src: "{{ gods_data_root }}/.gods-mlops-reclaim-state.json"
+      register: gods_precheck_reclaim_state_file
+      when: gods_precheck_reclaim_state_stat.stat.exists
+      no_log: true
+
+    - name: Keep the durable reclaim phase record for controller mode selection
+      ansible.builtin.set_fact:
+        gods_reclaim_state_doc: "{{ gods_precheck_reclaim_state_file.content | default('') | b64decode | from_json if gods_precheck_reclaim_state_stat.stat.exists else {} }}"
+        gods_reclaim_state_exists: "{{ gods_precheck_reclaim_state_stat.stat.exists }}"
+      no_log: true
+
+    - name: Reject stale, malformed, or unsupported durable reclaim state
+      ansible.builtin.assert:
+        that:
+          - gods_reclaim_state_doc.owner == 'gods-mlops'
+          - gods_reclaim_state_doc.node == inventory_hostname
+          - gods_reclaim_state_doc.plan_id == gods_reclaim_plan_id
+          - gods_reclaim_state_doc.step in ['runtime_verification_pending', 'retained_hash_pending', 'service_stopped']
+        fail_msg: "{{ inventory_hostname }} has stale or unsupported reclaim state; review the exact plan before retrying."
+      when: gods_reclaim_state_exists | bool
+      no_log: true
+
+    - name: Require durable matching evidence when a managed service is already inactive
+      ansible.builtin.assert:
+        that:
+          - gods_reclaim_state_exists | bool
+          - gods_reclaim_state_doc.step in ['runtime_verification_pending', 'retained_hash_pending', 'service_stopped']
+          - gods_reclaim_state_doc.daemonset_snapshot_path is defined
+          - gods_reclaim_state_doc.daemonset_snapshot_sha256 is match('^[0-9a-f]{64}$')
+        fail_msg: "{{ inventory_hostname }} is inactive without matching durable reclaim evidence; refusing an offline retry."
+      when: not (gods_lifecycle_service_active | bool)
+      no_log: true
+
+    - name: Require the durable state to agree with this active service configuration
+      ansible.builtin.set_fact:
+        gods_service_exec_start_sha256: "{{ gods_precheck_service_exec_start_sha256 }}"
+
 - name: Verify backups, the exact plan, and a safe workload stop on the controller
   hosts: localhost
   connection: local
@@ -46,11 +210,57 @@
           - "{{ gods_lifecycle_inventory }}"
       changed_when: false
 
+    - name: Select online or offline reclaim from the verified control-plane service state
+      ansible.builtin.set_fact:
+        gods_reclaim_offline_resume: "{{ not (hostvars[groups['gods_server'][0]].gods_lifecycle_service_active | bool) }}"
+
+    - name: Require matching saved node state and snapshot before an API-free resume
+      ansible.builtin.assert:
+        that:
+          - hostvars[groups['gods_server'][0]].gods_reclaim_state_exists | bool
+          - hostvars[groups['gods_server'][0]].gods_reclaim_state_doc.step in ['runtime_verification_pending', 'retained_hash_pending', 'service_stopped']
+          - hostvars[groups['gods_gpu_worker'][0]].gods_reclaim_state_exists | bool
+          - hostvars[groups['gods_gpu_worker'][0]].gods_reclaim_state_doc.step == 'service_stopped'
+          - hostvars[groups['gods_gpu_worker'][0]].gods_reclaim_state_doc.plan_id == gods_reclaim_plan_id
+          - hostvars[groups['gods_gpu_worker'][0]].gods_reclaim_state_doc.daemonset_snapshot_path == hostvars[groups['gods_server'][0]].gods_reclaim_state_doc.daemonset_snapshot_path
+          - hostvars[groups['gods_gpu_worker'][0]].gods_reclaim_state_doc.daemonset_snapshot_sha256 == hostvars[groups['gods_server'][0]].gods_reclaim_state_doc.daemonset_snapshot_sha256
+        fail_msg: "The control plane is stopped but the worker/snapshot evidence is incomplete; no API-free retry is safe."
+      when: gods_reclaim_offline_resume | bool
+      no_log: true
+
+    - name: Load the original captured snapshot from durable server state for an offline resume
+      ansible.builtin.set_fact:
+        gods_daemonset_snapshot_doc:
+          path: "{{ hostvars[groups['gods_server'][0]].gods_reclaim_state_doc.daemonset_snapshot_path }}"
+          snapshot_sha256: "{{ hostvars[groups['gods_server'][0]].gods_reclaim_state_doc.daemonset_snapshot_sha256 }}"
+        gods_daemonsets_to_stop: []
+      when: gods_reclaim_offline_resume | bool
+      no_log: true
+
+    - name: Verify the saved DaemonSet snapshot before an API-free resume
+      ansible.builtin.command:
+        argv:
+          - gods-mlops
+          - lifecycle
+          - verify-daemonset-snapshot
+          - --snapshot
+          - "{{ gods_daemonset_snapshot_doc.path }}"
+          - --confirm-plan
+          - "{{ gods_reclaim_plan_id }}"
+          - --confirm-snapshot-sha256
+          - "{{ gods_daemonset_snapshot_doc.snapshot_sha256 }}"
+          - --inventory
+          - "{{ gods_lifecycle_inventory }}"
+      changed_when: false
+      when: gods_reclaim_offline_resume | bool
+      no_log: true
+
     - name: Inspect the local kubeconfig without reading its contents
       ansible.builtin.stat:
         path: "{{ gods_kubeconfig }}"
         follow: false
       register: gods_kubeconfig_stat
+      when: not (gods_reclaim_offline_resume | bool)
 
     - name: Require the private local kubeconfig for workload drain
       ansible.builtin.assert:
@@ -59,6 +269,7 @@
           - gods_kubeconfig_stat.stat.isreg
           - gods_kubeconfig_stat.stat.mode == '0600'
         fail_msg: "A generated mode-0600 kubeconfig is required to drain and verify Gods workloads."
+      when: not (gods_reclaim_offline_resume | bool)
 
     - name: Verify that only known platform DaemonSets exist before cordoning nodes
       ansible.builtin.command:
@@ -70,10 +281,12 @@
           - "{{ gods_kubeconfig }}"
       register: gods_daemonset_scope
       changed_when: false
+      when: not (gods_reclaim_offline_resume | bool)
 
     - name: Read the exact owned DaemonSets to stop
       ansible.builtin.set_fact:
         gods_daemonsets_to_stop: "{{ (gods_daemonset_scope.stdout | from_json)['delete'] }}"
+      when: not (gods_reclaim_offline_resume | bool)
 
     - name: Capture the exact owned DaemonSet specs before removal
       ansible.builtin.command:
@@ -92,11 +305,13 @@
       register: gods_daemonset_snapshot_result
       changed_when: (gods_daemonset_snapshot_result.stdout | from_json).status == 'captured'
       no_log: true
+      when: not (gods_reclaim_offline_resume | bool)
 
     - name: Keep the captured snapshot path and digest for node state records
       ansible.builtin.set_fact:
         gods_daemonset_snapshot_doc: "{{ gods_daemonset_snapshot_result.stdout | from_json }}"
       no_log: true
+      when: not (gods_reclaim_offline_resume | bool)
 
     - name: Classify every live emptyDir use before changing nodes
       ansible.builtin.command:
@@ -108,10 +323,17 @@
           - "{{ gods_kubeconfig }}"
       register: gods_emptydir_scope
       changed_when: false
+      when: not (gods_reclaim_offline_resume | bool)
 
     - name: Read exact disposable pod instances allowed by the rendered-volume policy
       ansible.builtin.set_fact:
         gods_emptydir_approved_pods: "{{ (gods_emptydir_scope.stdout | from_json)['approved_pods'] }}"
+      when: not (gods_reclaim_offline_resume | bool)
+
+    - name: Skip emptyDir discovery during an API-free retry of an already drained cluster
+      ansible.builtin.set_fact:
+        gods_emptydir_approved_pods: []
+      when: gods_reclaim_offline_resume | bool
 
 - ansible.builtin.import_playbook: verify-retained.yml
   vars:
@@ -127,9 +349,9 @@
     gods_emptydir_approved_pods: "{{ hostvars['localhost'].gods_emptydir_approved_pods }}"
   tasks:
 
-    - name: Drain both managed nodes without deleting ephemeral data
+    - name: Drain both managed nodes after validating disposable emptyDir volumes
       block:
-        - name: Cordon both nodes before deleting approved disposable pod instances
+        - name: Cordon both nodes before evicting disposable pod instances
           ansible.builtin.command:
             argv:
               - kubectl
@@ -158,26 +380,6 @@
           ansible.builtin.set_fact:
             gods_emptydir_approved_pods: "{{ (gods_emptydir_recheck.stdout | from_json)['approved_pods'] }}"
 
-        - name: Delete only exact pods with rendered disposable or injected Istio emptyDir volumes
-          ansible.builtin.command:
-            argv:
-              - kubectl
-              - --kubeconfig
-              - "{{ gods_kubeconfig }}"
-              - delete
-              - pod
-              - "{{ item.name }}"
-              - --namespace
-              - "{{ item.namespace }}"
-              - --grace-period=60
-              - --wait=true
-              - --ignore-not-found=true
-              - --timeout=2m
-          loop: "{{ gods_emptydir_approved_pods }}"
-          loop_control:
-            label: "{{ item.namespace }}/{{ item.name }} {{ item.volumes | join(',') }}"
-          changed_when: true
-
         - name: Gracefully evict schedulable workloads from each managed node
           ansible.builtin.command:
             argv:
@@ -187,6 +389,7 @@
               - drain
               - "{{ item }}"
               - --ignore-daemonsets
+              - --delete-emptydir-data
               - --grace-period=60
               - --timeout=5m
           loop: "{{ groups['gods_cluster'] | sort }}"
@@ -228,6 +431,7 @@
         - name: Stop before changing either K3s service
           ansible.builtin.fail:
             msg: "Workload drain was incomplete. Nodes were uncordoned where reachable; no K3s service was stopped."
+      when: not (hostvars['localhost'].gods_reclaim_offline_resume | bool)
 
     - name: Stop only the rendered Istio CNI and locked NVIDIA plugin DaemonSets
       ansible.builtin.command:
@@ -247,6 +451,7 @@
       loop_control:
         label: "{{ item.namespace }}/{{ item.name }}"
       changed_when: true
+      when: not (hostvars['localhost'].gods_reclaim_offline_resume | bool)
 
     - name: Wait until no scheduled Kubernetes workloads remain
       ansible.builtin.command:
@@ -261,6 +466,7 @@
       retries: 24
       delay: 5
       until: gods_workload_check.rc == 0
+      when: not (hostvars['localhost'].gods_reclaim_offline_resume | bool)
 
 - name: Stop and verify the Gods GPU-worker K3s runtime
   hosts: gods_gpu_worker
@@ -513,6 +719,27 @@
         mode: "0600"
       when: gods_reclaim_node_status == 'service_stopped'
 
+- name: Require worker cold evidence before stopping the control plane
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+  tasks:
+    - name: Verify the GPU worker completed runtime and retained-data checks
+      ansible.builtin.assert:
+        that:
+          - hostvars[groups['gods_gpu_worker'][0]].gods_reclaim_node_status | default('pending') == 'service_stopped'
+        fail_msg: "Worker reclaim is incomplete; the control-plane service will remain running."
+
+- name: Stop and verify the Gods control-plane K3s runtime last
+  hosts: gods_server
+  gather_facts: false
+  become: true
+  vars:
+    gods_lifecycle_inventory: "{{ gods_lifecycle_inventory_file | default(playbook_dir ~ '/inventory.example.yml') }}"
+    gods_remote_retained_manifest: "/tmp/gods-mlops-retained-{{ gods_reclaim_plan_id }}.json"
+  tasks: *gods_service_stop_tasks
+
 - name: Require both nodes to have cold retained-state evidence before reporting reclaim complete
   hosts: localhost
   connection: local
@@ -524,12 +751,3 @@
           - hostvars[item].gods_reclaim_node_status | default('pending') == 'service_stopped'
         fail_msg: "Reclaim is pending on {{ item }}; update the recovery manifest from cold data and run verify-retained before reconnect."
       loop: "{{ groups['gods_cluster'] | sort }}"
-
-- name: Stop and verify the Gods control-plane K3s runtime last
-  hosts: gods_server
-  gather_facts: false
-  become: true
-  vars:
-    gods_lifecycle_inventory: "{{ gods_lifecycle_inventory_file | default(playbook_dir ~ '/inventory.example.yml') }}"
-    gods_remote_retained_manifest: "/tmp/gods-mlops-retained-{{ gods_reclaim_plan_id }}.json"
-  tasks: *gods_service_stop_tasks

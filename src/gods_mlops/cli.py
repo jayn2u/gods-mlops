@@ -111,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
     purge = lifecycle_commands.add_parser("purge", help="permanently delete only a separately confirmed target list")
     purge.add_argument("--targets", type=Path, required=True)
     purge.add_argument("--confirm-targets", help="exact digest printed when targets are reviewed")
+    purge.add_argument("--confirm-plan", help="exact reclaim plan_id printed by lifecycle plan-reclaim")
     purge.add_argument("--inventory", type=Path, default=DEFAULT_ANSIBLE_INVENTORY)
     purge.add_argument("--ask-become-pass", action="store_true", help="let Ansible prompt for normal sudo authentication")
 
@@ -119,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     verify_purge.add_argument("--targets", type=Path, required=True)
     verify_purge.add_argument("--confirm-targets", required=True)
+    verify_purge.add_argument("--confirm-plan", required=True)
+    verify_purge.add_argument("--inventory", type=Path, default=DEFAULT_ANSIBLE_INVENTORY)
 
     check_manifest = lifecycle_commands.add_parser("check-retained-manifest", help=argparse.SUPPRESS)
     check_manifest.add_argument("--manifest", type=Path, required=True)
@@ -157,6 +160,13 @@ def main(argv: list[str] | None = None) -> int:
     hash_tree_command.add_argument("--node", help="hash a path on its owning inventory node")
     hash_tree_command.add_argument("--inventory", type=Path, default=DEFAULT_ANSIBLE_INVENTORY)
     hash_tree_command.add_argument("--ask-become-pass", action="store_true", help="let Ansible prompt for normal sudo authentication")
+
+    hash_dump_command = lifecycle_commands.add_parser("hash-database-dump", help="hash a canonical PostgreSQL or MySQL logical dump on its owning node")
+    hash_dump_command.add_argument("--path", type=Path, required=True)
+    hash_dump_command.add_argument("--format", choices={"postgresql-sql-v1", "mysql-sql-v1"}, required=True)
+    hash_dump_command.add_argument("--node", required=True)
+    hash_dump_command.add_argument("--inventory", type=Path, default=DEFAULT_ANSIBLE_INVENTORY)
+    hash_dump_command.add_argument("--ask-become-pass", action="store_true", help="let Ansible prompt for normal sudo authentication")
 
     for command_name in ("verify-daemonset-scope", "verify-workloads-stopped", "verify-emptydir-policy"):
         verify_kubernetes = lifecycle_commands.add_parser(command_name, help=argparse.SUPPRESS)
@@ -275,6 +285,8 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
         "verify-retained",
         "reclaim",
         "reconnect",
+        "purge",
+        "verify-purge-targets",
         "check-retained-manifest",
         "export-retained-node",
         "capture-daemonsets",
@@ -458,10 +470,13 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
                 "dry_run": True,
                 "targets": target_document.get("targets", []),
                 "target_sha256": digest,
-                "confirmation_required": f"--confirm-targets {digest}",
+                "reclaim_plan_id": plan["plan_id"],
+                "confirmation_required": f"--confirm-targets {digest} --confirm-plan {plan['plan_id']}",
             }, indent=2, sort_keys=True))
             return 2
         normalized = validate_purge_targets(target_document, confirmation=args.confirm_targets)
+        if args.confirm_plan != plan["plan_id"]:
+            raise ValueError(f"purge reclaim plan confirmation does not match current plan {plan['plan_id']}")
         command_args = [
             "ansible-playbook",
             "--inventory",
@@ -473,6 +488,8 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             f"gods_purge_target_digest={digest}",
             "--extra-vars",
             f"gods_purge_targets_file={args.targets.resolve()}",
+            "--extra-vars",
+            f"gods_reclaim_plan_id={plan['plan_id']}",
         ]
         if args.ask_become_pass:
             command_args.append("--ask-become-pass")
@@ -482,10 +499,13 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
     if command == "verify-purge-targets":
         target_document = _read_json(args.targets)
         normalized = validate_purge_targets(target_document, confirmation=args.confirm_targets)
+        if args.confirm_plan != plan["plan_id"]:
+            raise ValueError(f"purge reclaim plan confirmation does not match current plan {plan['plan_id']}")
         print(json.dumps({
             "status": "verified",
             "target_sha256": purge_targets_digest(normalized),
             "target_count": len(normalized["targets"]),
+            "plan_id": plan["plan_id"],
         }, sort_keys=True))
         return 0
 
@@ -506,6 +526,23 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             return _run_ansible(command_args)
         print(json.dumps({"path": str(args.path), "sha256": hash_tree(args.path)}, sort_keys=True))
         return 0
+
+    if command == "hash-database-dump":
+        command_args = [
+            "ansible-playbook",
+            "--inventory",
+            str(args.inventory),
+            "--limit",
+            args.node,
+            str(DEFAULT_HASH_PATH_PLAYBOOK),
+            "--extra-vars",
+            f"gods_hash_path={args.path}",
+            "--extra-vars",
+            f"gods_hash_dump_format={args.format}",
+        ]
+        if args.ask_become_pass:
+            command_args.append("--ask-become-pass")
+        return _run_ansible(command_args)
 
     if command == "verify-daemonset-scope":
         document = _kubectl_json(args.kubeconfig, "get", "daemonsets", "--all-namespaces")

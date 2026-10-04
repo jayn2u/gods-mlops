@@ -51,6 +51,7 @@
 - ansible.builtin.import_playbook: site.yml
   vars:
     gods_defer_uncordon: true
+    gods_preflight_use_become: true
 
 - name: Restore only the captured DaemonSets, verify rollout, then uncordon nodes
   hosts: localhost

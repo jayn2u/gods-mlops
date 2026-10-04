@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import stat
 from typing import Any
 
@@ -15,6 +16,31 @@ from typing import Any
 OWNER = "gods-mlops"
 OWNER_MARKER = ".gods-mlops-owner.json"
 SHA256_LENGTH = 64
+DATABASE_DUMP_FORMATS = {
+    "postgresql-sql-v1": {
+        "backup_tool": "pg_dump",
+        "restore_tool": "psql",
+        "redump_tool": "pg_dump",
+        "required_options": {"--format=plain", "--column-inserts", "--rows-per-insert=1", "--no-owner", "--no-acl"},
+    },
+    "mysql-sql-v1": {
+        "backup_tool": "mysqldump",
+        "restore_tool": "mysql",
+        "redump_tool": "mysqldump",
+        "required_options": {
+            "--skip-comments",
+            "--skip-dump-date",
+            "--skip-extended-insert",
+            "--order-by-primary",
+            "--routines",
+            "--events",
+            "--triggers",
+            "--no-tablespaces",
+            "--single-transaction",
+            "--set-gtid-purged=OFF",
+        },
+    },
+}
 
 
 def verify_retained(
@@ -643,8 +669,16 @@ def _verify_database_restore(entry: Any, identifier: str, failures: list[dict[st
         return
     source_path = entry.get("backup_dump_path")
     restored_path = entry.get("restored_dump_path")
-    source_hash = _verify_file_hash(source_path, identifier, "database_backup", failures)
-    restored_hash = _verify_file_hash(restored_path, identifier, "database_restore", failures)
+    if _same_file_identity(source_path, restored_path):
+        failures.append({"check": "database_restore_separation", "id": identifier, "reason": "the restore proof must be a separate file and inode from the backup dump"})
+    dump_format = _verify_database_dump_provenance(entry, identifier, failures)
+    source_file_hash = _verify_file_hash(source_path, identifier, "database_backup", failures)
+    restored_file_hash = _verify_file_hash(restored_path, identifier, "database_restore", failures)
+    source_hash = restored_hash = None
+    if dump_format is not None and source_file_hash is not None:
+        source_hash = _verify_canonical_database_dump(source_path, identifier, "database_backup", dump_format, failures)
+    if dump_format is not None and restored_file_hash is not None:
+        restored_hash = _verify_canonical_database_dump(restored_path, identifier, "database_restore", dump_format, failures)
     expected_uid = entry.get("expected_uid")
     expected_mode = entry.get("expected_mode")
     if not isinstance(expected_uid, int) or expected_mode != "0600":
@@ -656,6 +690,129 @@ def _verify_database_restore(entry: Any, identifier: str, failures: list[dict[st
         failures.append({"check": "database_restore", "id": identifier, "reason": "database backup digest does not match"})
     if restored_hash is not None and restored_hash != expected:
         failures.append({"check": "database_restore", "id": identifier, "reason": "restored database dump digest does not match the backup"})
+
+
+def _verify_database_dump_provenance(
+    entry: dict[str, Any], identifier: str, failures: list[dict[str, str]]
+) -> str | None:
+    dump_format = entry.get("dump_format")
+    policy = DATABASE_DUMP_FORMATS.get(dump_format) if isinstance(dump_format, str) else None
+    provenance = entry.get("provenance")
+    if policy is None or not isinstance(provenance, dict):
+        failures.append({"check": "database_restore_provenance", "id": identifier, "reason": "a supported dump format and executable provenance are required"})
+        return None
+    required_fields = (
+        "backup_tool",
+        "backup_tool_version",
+        "restore_tool",
+        "restore_tool_version",
+        "redump_tool",
+        "redump_tool_version",
+    )
+    if any(not isinstance(provenance.get(field), str) or not provenance[field].strip() for field in required_fields):
+        failures.append({"check": "database_restore_provenance", "id": identifier, "reason": "tool names and exact client versions must be recorded"})
+        return None
+    tools_match = all(provenance[field] == policy[field] for field in ("backup_tool", "restore_tool", "redump_tool"))
+    versions_match = provenance["backup_tool_version"] == provenance["redump_tool_version"]
+    options = provenance.get("options")
+    options_valid = isinstance(options, list) and all(isinstance(option, str) for option in options)
+    if not tools_match or not versions_match or not options_valid:
+        failures.append({"check": "database_restore_provenance", "id": identifier, "reason": "backup and redump must use the same supported dumper version and explicit options"})
+        return None
+    missing_options = policy["required_options"].difference(options)
+    if missing_options:
+        failures.append({"check": "database_restore_provenance", "id": identifier, "reason": f"deterministic dump options are missing: {sorted(missing_options)}"})
+        return None
+    return str(dump_format)
+
+
+def _verify_canonical_database_dump(
+    value: Any,
+    identifier: str,
+    label: str,
+    dump_format: str,
+    failures: list[dict[str, str]],
+) -> str | None:
+    try:
+        return canonical_database_dump_sha256(value, dump_format=dump_format)
+    except (OSError, UnicodeError, ValueError) as exc:
+        failures.append({"check": label, "id": identifier, "reason": f"database dump cannot be canonicalized: {exc}"})
+        return None
+
+
+def canonical_database_dump_sha256(value: str | Path, *, dump_format: str) -> str:
+    """Hash a deterministic logical dump while preserving statement/table order."""
+    if dump_format not in DATABASE_DUMP_FORMATS:
+        raise ValueError(f"unsupported canonical SQL dump format: {dump_format}")
+    path = Path(value)
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("database dump must be a regular non-symlink file")
+    canonical_lines: list[str] = []
+    insert_block: list[str] = []
+    insert_target: str | None = None
+
+    def flush_inserts() -> None:
+        if insert_block:
+            canonical_lines.extend(sorted(insert_block))
+            insert_block.clear()
+
+    identifier = r'(?:`[^`]+`|"(?:""|[^"])+"|[A-Za-z_][A-Za-z0-9_$]*)'
+    insert_target_pattern = re.compile(
+        rf"^INSERT\s+INTO\s+(?P<table>{identifier}(?:\s*\.\s*{identifier})?)(?:\s*\(|\s+VALUES\b)",
+        flags=re.IGNORECASE,
+    )
+    with path.open("r", encoding="utf-8", newline=None) as stream:
+        for raw_line in stream:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if dump_format == "postgresql-sql-v1":
+                if re.match(r"^\\(?:un)?restrict(?:\s|$)", line):
+                    continue
+                if line.startswith(("-- Dumped from database version", "-- Dumped by pg_dump version", "-- Dump completed on")):
+                    continue
+            elif line.startswith("--"):
+                continue
+            elif re.match(r"^USE\s+.+;\s*$", line, flags=re.IGNORECASE):
+                # The validation database has a different name from the source.
+                line = "USE <logical-database>;"
+            if line.upper().startswith("COPY "):
+                raise ValueError("COPY data ordering is not canonical; use the recorded one-row INSERT options")
+            if line.upper().startswith("INSERT INTO "):
+                if not line.endswith(";"):
+                    raise ValueError("multi-line INSERT statements are not supported by canonical SQL dump v1")
+                match = insert_target_pattern.match(line)
+                if match is None:
+                    raise ValueError("INSERT target cannot be identified for scoped row comparison")
+                target = match.group("table")
+                if insert_target is not None and target != insert_target:
+                    flush_inserts()
+                insert_target = target
+                insert_block.append(line)
+                continue
+            flush_inserts()
+            insert_target = None
+            canonical_lines.append(line)
+    flush_inserts()
+    canonical_bytes = ("\n".join(canonical_lines) + "\n").encode("utf-8")
+    return hashlib.sha256(canonical_bytes).hexdigest()
+
+
+def _same_file_identity(source_path: Any, restored_path: Any) -> bool:
+    if not isinstance(source_path, str) or not isinstance(restored_path, str):
+        return False
+    if os.path.abspath(os.path.normpath(source_path)) == os.path.abspath(os.path.normpath(restored_path)):
+        return True
+    try:
+        source_metadata = Path(source_path).lstat()
+        restored_metadata = Path(restored_path).lstat()
+    except OSError:
+        return False
+    return (source_metadata.st_dev, source_metadata.st_ino) == (
+        restored_metadata.st_dev,
+        restored_metadata.st_ino,
+    )
 
 
 def _verify_credential(entry: Any, identifier: str, failures: list[dict[str, str]]) -> None:
@@ -920,10 +1077,20 @@ def _json_sha256(value: Any) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices={"verify-recovery-artifacts", "verify-retained", "hash-tree"})
+    parser.add_argument("operation", choices={"verify-recovery-artifacts", "verify-retained", "hash-tree", "hash-database-dump"})
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--path", type=Path)
+    parser.add_argument("--format", choices=set(DATABASE_DUMP_FORMATS))
     args = parser.parse_args(argv)
+    if args.operation == "hash-database-dump":
+        if args.path is None or args.format is None:
+            parser.error("hash-database-dump requires --path and --format")
+        print(json.dumps({
+            "path": str(args.path),
+            "format": args.format,
+            "sha256": canonical_database_dump_sha256(args.path, dump_format=args.format),
+        }, sort_keys=True))
+        return 0
     if args.operation == "hash-tree":
         if args.path is None:
             parser.error("hash-tree requires --path")

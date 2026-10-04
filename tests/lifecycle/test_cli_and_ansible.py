@@ -60,7 +60,7 @@ def test_purge_without_exact_confirmation_is_only_a_dry_run(
     assert result == 2
     assert output["dry_run"] is True
     assert output["target_sha256"] == purge_targets_digest(targets)
-    assert output["confirmation_required"] == f"--confirm-targets {output['target_sha256']}"
+    assert output["confirmation_required"] == f"--confirm-targets {output['target_sha256']} --confirm-plan {output['reclaim_plan_id']}"
 
 
 def test_purge_with_wrong_confirmation_never_launches_ansible(
@@ -96,6 +96,45 @@ def test_purge_with_wrong_confirmation_never_launches_ansible(
 
     assert result == 1
     assert "confirmation digest" in capsys.readouterr().err
+
+
+def test_confirmed_purge_also_binds_to_current_reclaim_plan_and_become_prompt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inventory_path = REPO_ROOT / "infra" / "ansible" / "inventory.example.yml"
+    plan = plan_reclaim(load_inventory(inventory_path))
+    root = tmp_path / "managed"
+    targets = {
+        "schema_version": 1,
+        "owner": "gods-mlops",
+        "owned_roots": [str(root)],
+        "protected_paths": [],
+        "targets": [{
+            "node": "ubuntu",
+            "path": str(root / "objects"),
+            "owner_marker": str(root / ".gods-mlops-owner.json"),
+        }],
+    }
+    targets_path = tmp_path / "purge-targets.json"
+    targets_path.write_text(json.dumps(targets), encoding="utf-8")
+    calls: list[list[str]] = []
+    monkeypatch.setattr(cli, "_run_ansible", lambda arguments: calls.append(arguments) or 0)
+
+    result = cli.main([
+        "lifecycle",
+        "purge",
+        "--targets",
+        str(targets_path),
+        "--confirm-targets",
+        purge_targets_digest(targets),
+        "--confirm-plan",
+        plan["plan_id"],
+        "--ask-become-pass",
+    ])
+
+    assert result == 0
+    assert any(f"gods_reclaim_plan_id={plan['plan_id']}" == arg for arg in calls[0])
+    assert calls[0][-1] == "--ask-become-pass"
 
 
 def test_hash_tree_command_prints_only_path_and_digest(
@@ -146,6 +185,31 @@ def test_remote_tree_hash_uses_the_owning_node_and_optional_become_prompt(
 
     assert result == 0
     assert calls[0][calls[0].index("--limit") + 1] == "ubuntu"
+    assert calls[0][-1] == "--ask-become-pass"
+    assert str(cli.DEFAULT_HASH_PATH_PLAYBOOK) in calls[0]
+
+
+def test_canonical_database_dump_hash_uses_owner_and_format_on_remote_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(cli, "_run_ansible", lambda arguments: calls.append(arguments) or 0)
+
+    result = cli.main([
+        "lifecycle",
+        "hash-database-dump",
+        "--path",
+        "/data/jayn2u/gods-mlops-recovery/metadata.sql",
+        "--node",
+        "ubuntu",
+        "--format",
+        "mysql-sql-v1",
+        "--ask-become-pass",
+    ])
+
+    assert result == 0
+    assert calls[0][calls[0].index("--limit") + 1] == "ubuntu"
+    assert "gods_hash_dump_format=mysql-sql-v1" in calls[0]
     assert calls[0][-1] == "--ask-become-pass"
     assert str(cli.DEFAULT_HASH_PATH_PLAYBOOK) in calls[0]
 
@@ -233,13 +297,17 @@ def test_playbooks_stop_only_marked_services_and_authenticate_become() -> None:
     assert len(drain_tasks) == 1
     assert "drain" in drain_tasks[0]["ansible.builtin.command"]["argv"]
     assert "--ignore-daemonsets" in drain_tasks[0]["ansible.builtin.command"]["argv"]
-    assert "--delete-emptydir-data" not in teardown_text
+    assert "--delete-emptydir-data" in drain_tasks[0]["ansible.builtin.command"]["argv"]
+    assert "delete pod" not in teardown_text
     assert "verify-daemonset-scope" in teardown_text
     assert "runtime_probe.py" in teardown_text
     assert "runtime_verification_pending" in teardown_text
     assert controller_blocks
     assert purge[1]["become"] is True
     assert any("ansible.builtin.file" in task and task["ansible.builtin.file"].get("state") == "absent" for task in purge[1]["tasks"])
+    purge_text = (REPO_ROOT / "infra" / "ansible" / "purge.yml").read_text(encoding="utf-8")
+    assert "runtime_probe.py" in purge_text
+    assert "gods_reclaim_plan_id" in purge_text
     assert probe[0]["become"] is True
     assert any(task.get("ansible.builtin.command", {}).get("argv") == ["id", "-u"] for task in probe[0]["tasks"])
     assert reconnect[0]["hosts"] == "localhost"

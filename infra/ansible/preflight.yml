@@ -2,12 +2,18 @@
 - name: Inspect Gods K3s hosts without changing remote nodes
   hosts: gods_cluster
   gather_facts: true
-  become: false
+  become: "{{ gods_preflight_use_become | default(false) | bool }}"
   vars:
     gods_versions_lock_document: >-
       {{ lookup('ansible.builtin.file', playbook_dir ~ '/../versions.lock.yaml') | from_yaml }}
     gods_preflight_helper_source: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/preflight_helpers.py') }}"
   tasks:
+    - name: Record the effective UID used for authenticated preflight checks
+      ansible.builtin.command:
+        argv: [id, -u]
+      register: gods_effective_uid
+      changed_when: false
+
     - name: Check non-interactive administrator permission without using it
       ansible.builtin.command:
         argv: [sudo, -n, true]
@@ -227,7 +233,7 @@
     - name: Require non-interactive administrator access before any host change
       ansible.builtin.set_fact:
         gods_preflight_blockers: "{{ gods_preflight_blockers + ['sudo -n is unavailable; privileged K3s setup is not ready'] }}"
-      when: gods_sudo_check.rc != 0
+      when: gods_sudo_check.rc != 0 and gods_effective_uid.stdout | trim != '0'
       changed_when: false
 
     - name: Require the configured path to be the actual persistent mount
@@ -289,6 +295,7 @@
           blockers: "{{ gods_preflight_blockers }}"
           permissions:
             sudo_noninteractive: "{{ gods_sudo_check.rc == 0 }}"
+            effective_uid_is_root: "{{ gods_effective_uid.stdout | trim == '0' }}"
           storage:
             mount: "{{ gods_storage_mount }}"
             mounted_target: "{{ gods_mount_check.stdout | trim }}"

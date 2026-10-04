@@ -218,6 +218,143 @@ def test_runtime_probe_fails_closed_when_socket_is_unresponsive_but_state_is_unk
     }
 
 
+def test_runtime_collector_excludes_its_own_verifier_chain_but_counts_real_k3s_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc_root = tmp_path / "proc"
+    _patch_proc_root(monkeypatch, proc_root)
+    verifier_pid = os.getpid()
+    _write_proc_process(
+        proc_root,
+        verifier_pid,
+        comm="python3",
+        cmdline="python3 /tmp/ansible/runtime_probe.py --service k3s-agent --data-dir /srv/gods/k3s --socket /run/k3s.sock",
+        cgroup="0::/user.slice/session.scope",
+        ppid=99,
+    )
+    _write_proc_process(
+        proc_root,
+        99,
+        comm="sh",
+        cmdline="sh -c /tmp/ansible/runtime_probe.py --service k3s-agent --data-dir /srv/gods/k3s --socket /run/k3s.sock",
+        cgroup="0::/user.slice/session.scope",
+        ppid=1,
+    )
+    _write_proc_process(
+        proc_root,
+        200,
+        comm="k3s",
+        cmdline="/usr/local/bin/k3s agent --data-dir /srv/gods/k3s",
+        cgroup="0::/system.slice/k3s-agent.service",
+        ppid=1,
+    )
+    monkeypatch.setattr(RUNTIME_PROBE.subprocess, "run", lambda *args, **kwargs: type("Result", (), {"stdout": "inactive\n"})())
+    monkeypatch.setattr(RUNTIME_PROBE, "_socket_responsive", lambda _path: False)
+
+    evidence = RUNTIME_PROBE.collect_runtime_evidence(
+        service="k3s-agent",
+        data_dir="/srv/gods/k3s",
+        socket_path="/run/k3s.sock",
+    )
+
+    assert evidence["process_scan_complete"] is True
+    assert evidence["owned_process_count"] == 1
+    assert evidence["process_kinds"] == ["k3s-runtime"]
+    assert RUNTIME_PROBE.assess_runtime_quiescence(evidence)["status"] == "pending"
+
+
+def test_runtime_collector_fails_closed_on_unknown_process_in_managed_cgroup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc_root = tmp_path / "proc"
+    _patch_proc_root(monkeypatch, proc_root)
+    _write_proc_process(
+        proc_root,
+        300,
+        comm="future-runtime-helper",
+        cmdline="future-runtime-helper --serve",
+        cgroup="0::/system.slice/k3s.service",
+        ppid=1,
+    )
+    monkeypatch.setattr(RUNTIME_PROBE.subprocess, "run", lambda *args, **kwargs: type("Result", (), {"stdout": "inactive\n"})())
+    monkeypatch.setattr(RUNTIME_PROBE, "_socket_responsive", lambda _path: False)
+
+    evidence = RUNTIME_PROBE.collect_runtime_evidence(
+        service="k3s",
+        data_dir="/srv/gods/k3s",
+        socket_path="/run/k3s.sock",
+    )
+
+    assert evidence["owned_process_count"] == 1
+    assert evidence["process_kinds"] == ["unknown-owned-runtime-process"]
+    assert RUNTIME_PROBE.assess_runtime_quiescence(evidence)["status"] == "pending"
+
+
+def test_runtime_collector_treats_failed_service_state_as_unknown_not_quiescent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    _patch_proc_root(monkeypatch, proc_root)
+    monkeypatch.setattr(RUNTIME_PROBE.subprocess, "run", lambda *args, **kwargs: type("Result", (), {"stdout": "failed\n"})())
+    monkeypatch.setattr(RUNTIME_PROBE, "_socket_responsive", lambda _path: False)
+
+    evidence = RUNTIME_PROBE.collect_runtime_evidence(
+        service="k3s",
+        data_dir="/srv/gods/k3s",
+        socket_path="/run/k3s.sock",
+    )
+
+    assert evidence["service_active"] is None
+    assert RUNTIME_PROBE.assess_runtime_quiescence(evidence)["status"] == "pending"
+
+
+def _write_proc_process(
+    proc_root: Path,
+    pid: int,
+    *,
+    comm: str,
+    cmdline: str,
+    cgroup: str,
+    ppid: int,
+) -> None:
+    process = proc_root / str(pid)
+    process.mkdir(parents=True)
+    (process / "comm").write_text(f"{comm}\n", encoding="utf-8")
+    (process / "cmdline").write_bytes(cmdline.encode("utf-8").replace(b" ", b"\0"))
+    (process / "cgroup").write_text(f"{cgroup}\n", encoding="utf-8")
+    (process / "stat").write_text(f"{pid} ({comm}) S {ppid} 0 0\n", encoding="utf-8")
+    (process / "exe").symlink_to(f"/usr/bin/{comm}")
+
+
+def _patch_proc_root(monkeypatch: pytest.MonkeyPatch, proc_root: Path) -> None:
+    class ProcPath:
+        def __init__(self, value: str | Path) -> None:
+            path = Path(value)
+            self.path = proc_root / path.relative_to("/proc") if path.is_absolute() and path.parts[:2] == ("/", "proc") else path
+
+        @property
+        def name(self) -> str:
+            return self.path.name
+
+        def iterdir(self) -> list[ProcPath]:
+            return [ProcPath(path) for path in self.path.iterdir()]
+
+        def __truediv__(self, child: str) -> ProcPath:
+            return ProcPath(self.path / child)
+
+        def read_text(self, **kwargs: object) -> str:
+            return self.path.read_text(**kwargs)
+
+        def read_bytes(self) -> bytes:
+            return self.path.read_bytes()
+
+        def readlink(self) -> str:
+            return self.path.readlink().as_posix()
+
+    monkeypatch.setattr(RUNTIME_PROBE, "Path", ProcPath)
+
+
 def test_cold_server_state_hashes_sqlite_token_tls_credentials_and_manifests(tmp_path: Path) -> None:
     root = tmp_path / "k3s"
     for relative in (

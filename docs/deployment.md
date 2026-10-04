@@ -64,7 +64,7 @@ The storage roots and initial limits are:
 | `ubuntu` | `/data/jayn2u/gods-mlops/metadata/kubeflow/seaweedfs-pvc` | 20 GiB | Kubeflow Pipelines SeaweedFS data |
 | `vis-lab` | `/mnt/data/gods-mlops-runtime/spool` | 20 GiB | Future asynchronous intake spool |
 
-Ansible preflight reads node addresses and routes, non-interactive administrator access, K3s service state, GPU/runtime availability, free space, the Gods root marker, and the ownership of preserved paths. It writes a mode-`0600` JSON report to `infra/ansible/artifacts/preflight.json` on the controller before reporting readiness. The remote host tasks only run read-only commands and `stat`; the path/disk helper runs inline through Python and is not copied to the host. The helper requires the Gods root to be strictly beneath its declared mount, every storage and K3s path to stay inside the root, and any existing storage directory to be a real directory owned by UID/GID `10001`. Preflight does not create roots or use `sudo` to inspect them. The `site.yml` installation starts only after the report says both nodes are ready. It rejects an active K3s service unless a root-owned Gods marker proves that the service already belongs to this deployment.
+Ansible preflight reads node addresses and routes, administrator privilege, K3s service state, GPU/runtime availability, free space, the Gods root marker, and the ownership of preserved paths. It writes a mode-`0600` JSON report to `infra/ansible/artifacts/preflight.json` on the controller before reporting readiness. The remote host tasks only run read-only commands and `stat`; the path/disk helper runs inline through Python and is not copied to the host. The helper requires the Gods root to be strictly beneath its declared mount, every storage and K3s path to stay inside the root, and any existing storage directory to be a real directory owned by UID/GID `10001`. Running `preflight.yml` directly uses the non-interactive `sudo -n` readiness check and remains blocked without privilege. `site.yml` enables Ansible become for its imported preflight, so its authenticated effective UID is checked when run with `--ask-become-pass`; it starts only after the report says both nodes are ready. It rejects an active K3s service unless a root-owned Gods marker proves that the service already belongs to this deployment.
 
 Run the syntax check and read-only preflight with the copied inventory:
 
@@ -74,6 +74,14 @@ ansible-playbook --syntax-check \
 ansible-playbook \
   -i infra/ansible/inventory.example.yml infra/ansible/preflight.yml
 gods-mlops lifecycle verify-privilege --ask-become-pass
+```
+
+After the separate preservation/reclaim step is complete and a deployment window is approved, run the install playbook with normal become authentication:
+
+```bash
+ansible-playbook \
+  -i infra/ansible/inventory.example.yml infra/ansible/site.yml \
+  --ask-become-pass
 ```
 
 The inventory uses the known SSH alias `jayn2u-179-pub-vis` for `ubuntu` and `203.253.25.54:2222` for `vis-lab` when using SSH. A controller running on `vis-lab` can use a temporary local-connection inventory for read-only preflight; do not change SSH known-host data to work around a refused route. The report identifies `sudo -n` failure as a blocker and is still written when a node is unreachable. Do not bypass that gate through Docker access. The current environment has an active non-Gods K3s cluster, an unmarked `/mnt/data/gods-mlops` directory, and no non-interactive sudo. That pre-existing checkout path is preserved; new spool data uses the separate `/mnt/data/gods-mlops-runtime` root. `site.yml` is expected to stop at preflight until the old path is reviewed and the cluster preservation/reclaim task is complete. No cluster, firewall, or host data is changed by static checks.
