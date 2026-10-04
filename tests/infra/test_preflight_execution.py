@@ -11,6 +11,8 @@ import sys
 import pytest
 import yaml
 
+from gods_mlops.lifecycle.inventory import load_inventory
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PLAYBOOK = REPO_ROOT / "infra" / "ansible" / "preflight.yml"
@@ -171,12 +173,17 @@ def test_teardown_checks_both_host_ownership_before_controller_or_cluster_work(t
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     call_log = tmp_path / "controller-calls.log"
+    become_log = tmp_path / "become-calls.log"
+    _write_fake_command(
+        fake_bin / "sudo",
+        'printf "%s\\n" "$*" >> "$GODS_TEST_BECOME_LOG"\nwhile [ "$#" -gt 0 ]; do case "$1" in -H|-S|-n) shift ;; -p|-u|-i) shift 2 ;; --) shift; break ;; *) break ;; esac; done\nGODS_TEST_ROOT=1 exec "$@"',
+    )
     _write_fake_command(fake_bin / "gods-mlops", 'printf "%s\\n" "$*" >> "$GODS_TEST_CALL_LOG"; exit 98')
     inventory = {
         "all": {
             "children": {
-                "gods_server": {"hosts": {"vis-lab": _teardown_test_host(tmp_path / "server")}},
-                "gods_gpu_worker": {"hosts": {"ubuntu": _teardown_test_host(tmp_path / "worker")}},
+                "gods_server": {"hosts": {"vis-lab": _teardown_test_host(tmp_path / "server", fake_bin / "sudo")}},
+                "gods_gpu_worker": {"hosts": {"ubuntu": _teardown_test_host(tmp_path / "worker", fake_bin / "sudo")}},
                 "gods_cluster": {"children": {"gods_server": None, "gods_gpu_worker": None}},
             }
         }
@@ -186,11 +193,13 @@ def test_teardown_checks_both_host_ownership_before_controller_or_cluster_work(t
     env = os.environ.copy()
     env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
     env["GODS_TEST_CALL_LOG"] = str(call_log)
+    env["GODS_TEST_BECOME_LOG"] = str(become_log)
 
     result = subprocess.run(
-        [ansible_playbook, "-v", str(TEARDOWN_PLAYBOOK), "-i", str(inventory_path), "-e", f"gods_reclaim_plan_id={'a' * 64}"],
+        [ansible_playbook, "-v", str(TEARDOWN_PLAYBOOK), "-i", str(inventory_path), "-e", f"gods_reclaim_plan_id={'a' * 64}", "--ask-become-pass"],
         cwd=REPO_ROOT,
         env=env,
+        input="test-only\n",
         capture_output=True,
         text=True,
         check=False,
@@ -200,6 +209,65 @@ def test_teardown_checks_both_host_ownership_before_controller_or_cluster_work(t
     assert result.returncode != 0
     assert "ownership" in (result.stdout + result.stderr).lower()
     assert not call_log.exists(), "controller plan/API operations must not start before both nodes prove ownership"
+    assert become_log.is_file(), "the protected-root metadata precheck must run through authenticated become"
+
+
+def test_teardown_ownership_precheck_succeeds_with_a_protected_cluster_marker_under_become(tmp_path: Path) -> None:
+    ansible_playbook = shutil.which("ansible-playbook")
+    if not ansible_playbook:
+        pytest.skip("ansible-playbook is required for the teardown execution contract")
+    first_play = yaml.safe_load(TEARDOWN_PLAYBOOK.read_text(encoding="utf-8"))[0]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    become_log = tmp_path / "become-calls.log"
+    _write_fake_command(
+        fake_bin / "sudo",
+        'printf "%s\\n" "$*" >> "$GODS_TEST_BECOME_LOG"\nwhile [ "$#" -gt 0 ]; do case "$1" in -H|-S|-n) shift ;; -p|-u|-i) shift 2 ;; --) shift; break ;; *) break ;; esac; done\nGODS_TEST_ROOT=1 exec "$@"',
+    )
+    roots = {"vis-lab": tmp_path / "server", "ubuntu": tmp_path / "worker"}
+    hosts = {}
+    for node, root in roots.items():
+        k3s_root = root / "k3s"
+        k3s_root.mkdir(parents=True)
+        root_marker = root / ".gods-mlops-owner.json"
+        cluster_marker = k3s_root / ".gods-mlops-cluster-owner.json"
+        marker = {"owner": "gods-mlops", "data_root": str(root), "k3s_data_dir": str(k3s_root)}
+        root_marker.write_text(json.dumps(marker), encoding="utf-8")
+        cluster_marker.write_text(json.dumps(marker), encoding="utf-8")
+        k3s_root.chmod(0o700)
+        cluster_marker.chmod(0o600)
+        hosts[node] = _teardown_test_host(root, fake_bin / "sudo")
+    inventory = {
+        "all": {"children": {
+            "gods_server": {"hosts": {"vis-lab": hosts["vis-lab"]}},
+            "gods_gpu_worker": {"hosts": {"ubuntu": hosts["ubuntu"]}},
+            "gods_cluster": {"children": {"gods_server": None, "gods_gpu_worker": None}},
+        }}
+    }
+    inventory_path = tmp_path / "inventory.yml"
+    inventory_path.write_text(yaml.safe_dump(inventory), encoding="utf-8")
+    playbook_path = tmp_path / "ownership-gate.yml"
+    playbook_path.write_text(yaml.safe_dump([first_play]), encoding="utf-8")
+    env = os.environ.copy()
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+    env["GODS_TEST_BECOME_LOG"] = str(become_log)
+
+    result = subprocess.run(
+        [ansible_playbook, "-v", str(playbook_path), "-i", str(inventory_path), "--ask-become-pass"],
+        cwd=REPO_ROOT,
+        env=env,
+        input="test-only\n",
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert become_log.is_file()
+    assert "-u root" in become_log.read_text(encoding="utf-8")
+
+
 
 
 @pytest.mark.parametrize("server_step", ["runtime_verification_pending", "retained_hash_pending", "service_stopped"])
@@ -440,6 +508,9 @@ def test_purge_requires_plan_bound_cold_state_and_current_quiescence(
     root_marker.write_text(json.dumps({"owner": "gods-mlops", "data_root": str(root), "k3s_data_dir": str(k3s_root)}), encoding="utf-8")
     cluster_marker.write_text(json.dumps({"owner": "gods-mlops", "data_root": str(root), "k3s_data_dir": str(k3s_root)}), encoding="utf-8")
     if state_present:
+        required_by_node = load_inventory(REPO_ROOT / "infra" / "ansible" / "inventory.example.yml")["requirements_by_node"]
+        assert len(required_by_node["vis-lab"]["retained_paths"]) == 1
+        assert len(required_by_node["ubuntu"]["retained_paths"]) == 8
         state = {
             "schema_version": 1,
             "owner": "gods-mlops",
@@ -449,7 +520,7 @@ def test_purge_requires_plan_bound_cold_state_and_current_quiescence(
             "service": "k3s-agent",
             "k3s_data_dir": str(k3s_root),
             "runtime_status": "verified_stopped",
-            "cold_retained_paths": {f"pv-{index}": "a" * 64 for index in range(9)},
+            "cold_retained_paths": {identifier: "a" * 64 for identifier in required_by_node["ubuntu"]["retained_paths"]},
             "cold_k3s_state": {"agent_state_sha256": "b" * 64},
         }
         state_path = root / ".gods-mlops-reclaim-state.json"
@@ -494,9 +565,19 @@ def test_purge_requires_plan_bound_cold_state_and_current_quiescence(
     fake_bin.mkdir()
     _write_fake_command(fake_bin / "sudo", 'if [ "$1" = "-n" ] && [ "$2" = "true" ]; then exit 1; fi\nwhile [ "$#" -gt 0 ]; do case "$1" in -H|-S|-n) shift ;; -p|-u|-i) shift 2 ;; --) shift; break ;; *) break ;; esac; done\nGODS_TEST_ROOT=1 exec "$@"')
     _write_fake_command(fake_bin / "id", 'if [ "$GODS_TEST_ROOT" = "1" ]; then printf "0\\n"; else exec /usr/bin/id -u; fi')
+    expected_by_node = load_inventory(REPO_ROOT / "infra" / "ansible" / "inventory.example.yml")["requirements_by_node"]
+    purge_precheck = {
+        "status": "verified",
+        "target_sha256": target_digest,
+        "plan_id": plan_id,
+        "target_count": 1,
+        "required_retained_paths_by_node": {
+            node: requirements["retained_paths"] for node, requirements in expected_by_node.items()
+        },
+    }
     _write_fake_command(
         fake_bin / "gods-mlops",
-        f'printf "{{\\"status\\":\\"verified\\",\\"target_sha256\\":\\"{target_digest}\\",\\"plan_id\\":\\"{plan_id}\\",\\"target_count\\":1}}\\n"',
+        f'printf "%s\\n" \'{json.dumps(purge_precheck, separators=(",", ":"))}\'',
     )
     _write_fake_command(
         fake_bin / "python3",
@@ -511,7 +592,7 @@ def test_purge_requires_plan_bound_cold_state_and_current_quiescence(
         f"gods_purge_targets_file={targets_path}",
         f"gods_purge_target_digest={target_digest}",
         f"gods_reclaim_plan_id={plan_id}",
-        f"gods_lifecycle_inventory_file={inventory_path}",
+        f"gods_lifecycle_inventory_file={REPO_ROOT / 'infra' / 'ansible' / 'inventory.example.yml'}",
     ]
     command = [ansible_playbook, str(REPO_ROOT / "infra" / "ansible" / "purge.yml"), "-i", str(inventory_path)]
     for value in extra_vars:
@@ -525,10 +606,14 @@ def test_purge_requires_plan_bound_cold_state_and_current_quiescence(
 
 
 
-def _teardown_test_host(root: Path) -> dict[str, object]:
+def _teardown_test_host(root: Path, sudo_path: Path) -> dict[str, object]:
     return {
         "ansible_connection": "local",
         "ansible_python_interpreter": sys.executable,
+        "ansible_become_exe": str(sudo_path),
+        "ansible_become_method": "sudo",
+        "ansible_become_pass": "test-only",
+        "gods_expected_root_uid": os.getuid(),
         "gods_data_root": str(root),
         "gods_k3s_data_dir": str(root / "k3s"),
         "gods_owner_marker_name": ".gods-mlops-owner.json",

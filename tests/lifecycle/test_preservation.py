@@ -395,6 +395,36 @@ def test_mysql_restore_comparison_normalizes_headers_database_name_and_row_order
     assert result["failures"] == []
 
 
+def test_canonical_dump_preserves_whitespace_inside_multiline_sql_literals(
+    tmp_path: Path,
+) -> None:
+    manifest = _retained_manifest(tmp_path)
+    database = manifest["database_restores"][0]
+    backup = Path(database["backup_dump_path"])
+    restored = Path(database["restored_dump_path"])
+    backup.write_text(
+        "CREATE TABLE public.records (\n"
+        "  value text DEFAULT 'a\n"
+        "    b'\n"
+        ");\n",
+        encoding="utf-8",
+    )
+    restored.write_text(
+        "CREATE TABLE public.records (\n"
+        "  value text DEFAULT 'a\n"
+        "b'\n"
+        ");\n",
+        encoding="utf-8",
+    )
+    database["expected_sha256"] = canonical_database_dump_sha256(backup, dump_format="postgresql-sql-v1")
+
+    result = verify_retained(manifest)
+
+    assert result["status"] == "failed"
+    assert "database_restore" in {failure["check"] for failure in result["failures"]}
+
+
+
 def test_canonical_dump_hash_command_returns_only_path_format_and_digest(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -2,6 +2,7 @@
 - name: Verify both Gods roots exist and carry ownership markers before any controller work
   hosts: gods_cluster
   gather_facts: false
+  become: true
   any_errors_fatal: true
   tasks:
     - name: Inspect both managed roots and non-secret ownership marker metadata
@@ -21,11 +22,11 @@
           - gods_ownership_precheck.results[0].stat.isdir | default(false)
           - not (gods_ownership_precheck.results[0].stat.islnk | default(false))
           - gods_ownership_precheck.results[1].stat.isreg | default(false)
-          - gods_ownership_precheck.results[1].stat.uid | default(-1) | int == 0
+          - gods_ownership_precheck.results[1].stat.uid | default(-1) | int == gods_expected_root_uid | default(0) | int
           - gods_ownership_precheck.results[2].stat.isdir | default(false)
           - not (gods_ownership_precheck.results[2].stat.islnk | default(false))
           - gods_ownership_precheck.results[3].stat.isreg | default(false)
-          - gods_ownership_precheck.results[3].stat.uid | default(-1) | int == 0
+          - gods_ownership_precheck.results[3].stat.uid | default(-1) | int == gods_expected_root_uid | default(0) | int
         fail_msg: "Both Gods ownership markers must exist under the exact managed roots on {{ inventory_hostname }} before reclaim can start."
 
 - name: Verify exact marker contents and service identity before any cluster mutation

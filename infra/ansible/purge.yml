@@ -39,6 +39,11 @@
         that:
           - (gods_purge_plan_verification.stdout | from_json).plan_id == gods_reclaim_plan_id
           - (gods_purge_plan_verification.stdout | from_json).target_sha256 == gods_purge_target_digest
+          - (gods_purge_plan_verification.stdout | from_json).required_retained_paths_by_node is mapping
+
+    - name: Keep exact retained-path requirements for each node
+      ansible.builtin.set_fact:
+        gods_purge_required_retained_paths_by_node: "{{ (gods_purge_plan_verification.stdout | from_json).required_retained_paths_by_node }}"
 
 - name: Permanently remove only exact confirmed children of Gods data roots
   hosts: gods_cluster
@@ -120,7 +125,7 @@
           - (gods_purge_evidence_files.results[1].content | b64decode | from_json).k3s_data_dir == gods_k3s_data_dir
           - (gods_purge_evidence_files.results[1].content | b64decode | from_json).runtime_status == 'verified_stopped'
           - (gods_purge_evidence_files.results[1].content | b64decode | from_json).cold_retained_paths is mapping
-          - (gods_purge_evidence_files.results[1].content | b64decode | from_json).cold_retained_paths | length >= 9
+          - ((gods_purge_evidence_files.results[1].content | b64decode | from_json).cold_retained_paths.keys() | list | sort) == (hostvars['localhost'].gods_purge_required_retained_paths_by_node[inventory_hostname] | sort)
           - (gods_purge_evidence_files.results[1].content | b64decode | from_json).cold_k3s_state is mapping
           - (gods_purge_evidence_files.results[1].content | b64decode | from_json).cold_k3s_state | length > 0
         fail_msg: "Purge requires matching plan-bound reclaim state, verified cold PV hashes, and managed cluster ownership on {{ inventory_hostname }}."

@@ -764,32 +764,31 @@ def canonical_database_dump_sha256(value: str | Path, *, dump_format: str) -> st
     )
     with path.open("r", encoding="utf-8", newline=None) as stream:
         for raw_line in stream:
-            line = raw_line.strip()
-            if not line:
-                continue
+            line = raw_line.rstrip("\n")
+            statement = line.strip()
             if dump_format == "postgresql-sql-v1":
-                if re.match(r"^\\(?:un)?restrict(?:\s|$)", line):
+                if re.match(r"^\\(?:un)?restrict(?:\s|$)", statement):
                     continue
-                if line.startswith(("-- Dumped from database version", "-- Dumped by pg_dump version", "-- Dump completed on")):
+                if statement.startswith(("-- Dumped from database version", "-- Dumped by pg_dump version", "-- Dump completed on")):
                     continue
-            elif line.startswith("--"):
+            elif statement.startswith("--"):
                 continue
-            elif re.match(r"^USE\s+.+;\s*$", line, flags=re.IGNORECASE):
+            elif re.match(r"^USE\s+.+;\s*$", statement, flags=re.IGNORECASE):
                 # The validation database has a different name from the source.
-                line = "USE <logical-database>;"
-            if line.upper().startswith("COPY "):
+                line = statement = "USE <logical-database>;"
+            if statement.upper().startswith("COPY "):
                 raise ValueError("COPY data ordering is not canonical; use the recorded one-row INSERT options")
-            if line.upper().startswith("INSERT INTO "):
-                if not line.endswith(";"):
+            if statement.upper().startswith("INSERT INTO "):
+                if not statement.endswith(";"):
                     raise ValueError("multi-line INSERT statements are not supported by canonical SQL dump v1")
-                match = insert_target_pattern.match(line)
+                match = insert_target_pattern.match(statement)
                 if match is None:
                     raise ValueError("INSERT target cannot be identified for scoped row comparison")
                 target = match.group("table")
                 if insert_target is not None and target != insert_target:
                     flush_inserts()
                 insert_target = target
-                insert_block.append(line)
+                insert_block.append(statement)
                 continue
             flush_inserts()
             insert_target = None

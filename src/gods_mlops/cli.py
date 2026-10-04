@@ -506,6 +506,10 @@ def _lifecycle_command(args: argparse.Namespace) -> int:
             "target_sha256": purge_targets_digest(normalized),
             "target_count": len(normalized["targets"]),
             "plan_id": plan["plan_id"],
+            "required_retained_paths_by_node": {
+                node: requirements["retained_paths"]
+                for node, requirements in inventory["requirements_by_node"].items()
+            },
         }, sort_keys=True))
         return 0
 
