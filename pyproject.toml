@@ -1,0 +1,43 @@
+[project]
+name = "gods-mlops"
+version = "0.1.0"
+description = "Reproducible preparation tools for the Gods Kubeflow MLOps platform."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "huggingface-hub==0.36.2",
+    "numpy==2.3.3",
+    "pillow==12.0.0",
+    "pycocotools==2.0.11",
+    "pyyaml==6.0.3",
+    "safetensors==0.7.0",
+    "torch==2.12.0",
+    "torchvision==0.27.0",
+    "transformers==4.57.1",
+]
+
+[project.scripts]
+gods-mlops = "gods_mlops.cli:main"
+gods-mlops-training-preflight = "gods_mlops.cli:training_preflight_main"
+
+[dependency-groups]
+dev = ["pytest==8.4.2"]
+
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gods_mlops"]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
