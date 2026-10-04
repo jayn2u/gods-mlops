@@ -23,6 +23,8 @@ COPY src ./src
 COPY models/lock.json ./models/lock.json
 COPY infra/versions.lock.yaml ./infra/versions.lock.yaml
 RUN uv sync --frozen --no-dev --no-editable \
+    && printf 'gods:x:10001:10001:Gods MLOps:/home/gods:/usr/sbin/nologin\n' >> /etc/passwd \
+    && printf 'gods:x:10001:\n' >> /etc/group \
     && mkdir -p /home/gods \
     && mkdir -p /mnt/model-cache \
     && chown -R 10001:10001 /home/gods /mnt/model-cache
