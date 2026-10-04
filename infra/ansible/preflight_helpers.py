@@ -76,6 +76,7 @@ def _overlaps_pattern(candidate: Path, pattern: str) -> bool:
 
 def validate_paths(
     data_root_raw: str,
+    storage_mount_raw: str,
     k3s_data_dir_raw: str,
     data_directories: list[dict[str, Any]],
     preserved_paths_raw: list[str],
@@ -84,10 +85,13 @@ def validate_paths(
     expected_owner: str = "gods-mlops",
     expected_k3s_version: str = "v1.36.2+k3s1",
     expected_root_uid: int = 0,
+    expected_data_uid: int = 10001,
+    expected_data_gid: int = 10001,
 ) -> dict[str, Any]:
     """Check path ownership boundaries without creating or modifying files."""
     blockers: list[str] = []
     data_root = _normalized_absolute(data_root_raw, "Gods data root", blockers)
+    storage_mount = _normalized_absolute(storage_mount_raw, "storage mount", blockers)
     k3s_data_dir = _normalized_absolute(k3s_data_dir_raw, "K3s data directory", blockers)
     preserved_paths: list[Path] = []
     preserved_patterns: list[str] = []
@@ -126,6 +130,8 @@ def validate_paths(
         planned_paths.append((data_root, "Gods data root"))
         if data_root == Path(data_root.anchor):
             blockers.append("Gods data root cannot be a filesystem root")
+        if storage_mount is not None and (data_root == storage_mount or storage_mount not in data_root.parents):
+            blockers.append("Gods data root must be strictly beneath the approved storage mount")
         root_symlink_error = _has_symlink_ancestor(data_root)
         if root_symlink_error:
             blockers.append(f"Gods data root: {root_symlink_error}")
@@ -220,6 +226,26 @@ def validate_paths(
                 "capacity": str(entry.get("capacity", "")),
             }
         )
+        symlink_error = _has_symlink_ancestor(path)
+        if symlink_error:
+            blockers.append(f"storage directory {role}: {symlink_error}")
+            continue
+        try:
+            directory_stat = path.lstat()
+        except FileNotFoundError:
+            directory_stat = None
+        except OSError as exc:
+            directory_stat = None
+            blockers.append(f"cannot inspect storage directory {role} {path}: {exc}")
+        if directory_stat is not None:
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                blockers.append(f"existing storage directory {role} must be a directory, not a file or symlink")
+            if directory_stat.st_uid != expected_data_uid or directory_stat.st_gid != expected_data_gid:
+                blockers.append(
+                    f"existing storage directory {role} has unexpected owner/group; "
+                    f"expected {expected_data_uid}:{expected_data_gid}, got "
+                    f"{directory_stat.st_uid}:{directory_stat.st_gid}"
+                )
 
     for path, label in planned_paths:
         symlink_error = _has_symlink_ancestor(path)
@@ -245,6 +271,7 @@ def validate_paths(
         "status": "ready" if not blockers else "blocked",
         "blockers": blockers,
         "data_root": str(data_root) if data_root is not None else None,
+        "storage_mount": str(storage_mount) if storage_mount is not None else None,
         "root_exists": root_exists,
         "root_owned": root_owned,
         "owner_marker_valid": owner_marker_valid,
@@ -308,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
 
     paths_parser = subparsers.add_parser("paths")
     paths_parser.add_argument("--data-root", required=True)
+    paths_parser.add_argument("--storage-mount", required=True)
     paths_parser.add_argument("--k3s-data-dir", required=True)
     paths_parser.add_argument("--data-directories-json", required=True)
     paths_parser.add_argument("--preserved-paths-json", required=True)
@@ -316,6 +344,8 @@ def main(argv: list[str] | None = None) -> int:
     paths_parser.add_argument("--expected-owner", default="gods-mlops")
     paths_parser.add_argument("--expected-k3s-version", default="v1.36.2+k3s1")
     paths_parser.add_argument("--expected-root-uid", type=int, default=0)
+    paths_parser.add_argument("--expected-data-uid", type=int, default=10001)
+    paths_parser.add_argument("--expected-data-gid", type=int, default=10001)
 
     disk_parser = subparsers.add_parser("disk")
     disk_parser.add_argument("--path", required=True)
@@ -327,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             result = validate_paths(
                 data_root_raw=args.data_root,
+                storage_mount_raw=args.storage_mount,
                 k3s_data_dir_raw=args.k3s_data_dir,
                 data_directories=_json_argument(args.data_directories_json, "data_directories"),
                 preserved_paths_raw=_json_argument(args.preserved_paths_json, "preserved_paths"),
@@ -335,6 +366,8 @@ def main(argv: list[str] | None = None) -> int:
                 expected_owner=args.expected_owner,
                 expected_k3s_version=args.expected_k3s_version,
                 expected_root_uid=args.expected_root_uid,
+                expected_data_uid=args.expected_data_uid,
+                expected_data_gid=args.expected_data_gid,
             )
     except (TypeError, ValueError, json.JSONDecodeError) as exc:
         result = {"status": "blocked", "blockers": [str(exc)]}

@@ -58,6 +58,8 @@
           - paths
           - --data-root
           - "{{ gods_data_root }}"
+          - --storage-mount
+          - "{{ gods_storage_mount }}"
           - --k3s-data-dir
           - "{{ gods_k3s_data_dir }}"
           - --data-directories-json
@@ -74,6 +76,10 @@
           - "{{ gods_versions_lock_document.platform.k3s }}"
           - --expected-root-uid
           - "{{ gods_expected_root_uid }}"
+          - --expected-data-uid
+          - "{{ gods_container_uid }}"
+          - --expected-data-gid
+          - "{{ gods_container_gid }}"
       register: gods_path_check
       changed_when: false
       failed_when: false
