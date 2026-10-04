@@ -1,0 +1,110 @@
+---
+- name: Inspect the configured Gods data root and marker
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ gods_data_root }}"
+    - "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
+  register: gods_data_root_inspection
+
+- name: Refuse to adopt an existing data root without its owner marker
+  ansible.builtin.assert:
+    that:
+      - not gods_data_root_inspection.results[0].stat.exists or gods_data_root_inspection.results[1].stat.exists
+    fail_msg: "The configured Gods data root already exists without its ownership marker."
+
+- name: Read an existing data-root ownership marker
+  ansible.builtin.slurp:
+    src: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
+  register: gods_existing_root_marker
+  when: gods_data_root_inspection.results[1].stat.exists
+  no_log: true
+
+- name: Require an existing root marker to identify this exact Gods root
+  ansible.builtin.assert:
+    that:
+      - (gods_existing_root_marker.content | default('') | b64decode | from_json).owner == 'gods-mlops'
+      - (gods_existing_root_marker.content | default('') | b64decode | from_json).data_root == gods_data_root
+      - (gods_existing_root_marker.content | default('') | b64decode | from_json).k3s_data_dir == gods_k3s_data_dir
+  when: gods_data_root_inspection.results[1].stat.exists
+  no_log: true
+
+- name: Create the new Gods data root after ownership checks
+  ansible.builtin.file:
+    path: "{{ gods_data_root }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Write a non-secret marker that identifies this managed data root
+  ansible.builtin.copy:
+    dest: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
+    content: >-
+      {{ {
+        'schema_version': 1,
+        'owner': 'gods-mlops',
+        'data_root': gods_data_root,
+        'k3s_data_dir': gods_k3s_data_dir,
+        'k3s_version': gods_k3s_version
+      } | to_nice_json }}
+    owner: root
+    group: root
+    mode: "0644"
+    force: false
+
+- name: Inspect the configured Gods K3s state directory and marker
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ gods_k3s_data_dir }}"
+    - "{{ gods_k3s_data_dir }}/{{ gods_cluster_marker_name }}"
+  register: gods_k3s_dir_inspection
+
+- name: Refuse to adopt unmarked K3s state
+  ansible.builtin.assert:
+    that:
+      - not gods_k3s_dir_inspection.results[0].stat.exists or gods_k3s_dir_inspection.results[1].stat.exists
+    fail_msg: "The configured K3s state directory exists without a Gods cluster marker."
+
+- name: Read an existing cluster-state marker
+  ansible.builtin.slurp:
+    src: "{{ gods_k3s_data_dir }}/{{ gods_cluster_marker_name }}"
+  register: gods_existing_cluster_marker
+  when: gods_k3s_dir_inspection.results[1].stat.exists
+  no_log: true
+
+- name: Require an existing K3s marker to identify this exact cluster path
+  ansible.builtin.assert:
+    that:
+      - (gods_existing_cluster_marker.content | default('') | b64decode | from_json).owner == 'gods-mlops'
+      - (gods_existing_cluster_marker.content | default('') | b64decode | from_json).data_root == gods_data_root
+      - (gods_existing_cluster_marker.content | default('') | b64decode | from_json).k3s_data_dir == gods_k3s_data_dir
+  when: gods_k3s_dir_inspection.results[1].stat.exists
+  no_log: true
+
+- name: Create the explicitly configured Gods K3s state directory
+  ansible.builtin.file:
+    path: "{{ gods_k3s_data_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Write a non-secret marker that identifies the managed K3s state
+  ansible.builtin.copy:
+    dest: "{{ gods_k3s_data_dir }}/{{ gods_cluster_marker_name }}"
+    content: >-
+      {{ {
+        'schema_version': 1,
+        'owner': 'gods-mlops',
+        'data_root': gods_data_root,
+        'k3s_data_dir': gods_k3s_data_dir,
+        'k3s_version': gods_k3s_version
+      } | to_nice_json }}
+    owner: root
+    group: root
+    mode: "0600"
+    force: false

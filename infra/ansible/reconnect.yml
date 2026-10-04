@@ -1,0 +1,107 @@
+---
+- name: Verify the captured intent and manifest before reconnect
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    gods_lifecycle_inventory: "{{ gods_lifecycle_inventory_file | default(playbook_dir ~ '/inventory.example.yml') }}"
+  tasks:
+    - name: Require the verified cold-state manifest and exact DaemonSet snapshot
+      ansible.builtin.assert:
+        that:
+          - gods_recovery_manifest is defined
+          - gods_daemonset_snapshot is defined
+          - gods_reclaim_plan_id is match('^[0-9a-f]{64}$')
+          - gods_daemonset_snapshot_sha256 is match('^[0-9a-f]{64}$')
+        fail_msg: "Reconnect requires the matching recovery manifest and captured DaemonSet snapshot."
+
+    - name: Validate every manifest ID and node-local path without reading remote paths
+      ansible.builtin.command:
+        argv:
+          - gods-mlops
+          - lifecycle
+          - check-retained-manifest
+          - --manifest
+          - "{{ gods_recovery_manifest }}"
+          - --inventory
+          - "{{ gods_lifecycle_inventory }}"
+      register: gods_manifest_coverage
+      changed_when: false
+
+    - name: Verify snapshot object digest and reclaim plan binding
+      ansible.builtin.command:
+        argv:
+          - gods-mlops
+          - lifecycle
+          - verify-daemonset-snapshot
+          - --snapshot
+          - "{{ gods_daemonset_snapshot }}"
+          - --confirm-plan
+          - "{{ gods_reclaim_plan_id }}"
+          - --confirm-snapshot-sha256
+          - "{{ gods_daemonset_snapshot_sha256 }}"
+          - --inventory
+          - "{{ gods_lifecycle_inventory }}"
+      changed_when: false
+
+- ansible.builtin.import_playbook: verify-retained.yml
+  vars:
+    gods_recovery_operation: verify-retained
+
+- ansible.builtin.import_playbook: site.yml
+  vars:
+    gods_defer_uncordon: true
+
+- name: Restore only the captured DaemonSets, verify rollout, then uncordon nodes
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    gods_kubeconfig: "{{ gods_kubeconfig_file | default(playbook_dir ~ '/generated/kubeconfig') }}"
+    gods_lifecycle_inventory: "{{ gods_lifecycle_inventory_file | default(playbook_dir ~ '/inventory.example.yml') }}"
+  tasks:
+    - name: Verify mode and existence of the private kubeconfig produced by site.yml
+      ansible.builtin.stat:
+        path: "{{ gods_kubeconfig }}"
+        follow: false
+      register: gods_reconnect_kubeconfig
+
+    - name: Require a private kubeconfig for exact DaemonSet restore
+      ansible.builtin.assert:
+        that:
+          - gods_reconnect_kubeconfig.stat.exists
+          - gods_reconnect_kubeconfig.stat.mode == '0600'
+        fail_msg: "Reconnect cannot restore DaemonSets without the generated mode-0600 kubeconfig."
+
+    - name: Restore captured objects and wait for each rollout to become ready
+      ansible.builtin.command:
+        argv:
+          - gods-mlops
+          - lifecycle
+          - restore-daemonset-snapshot
+          - --snapshot
+          - "{{ gods_daemonset_snapshot }}"
+          - --confirm-plan
+          - "{{ gods_reclaim_plan_id }}"
+          - --confirm-snapshot-sha256
+          - "{{ gods_daemonset_snapshot_sha256 }}"
+          - --inventory
+          - "{{ gods_lifecycle_inventory }}"
+          - --kubeconfig
+          - "{{ gods_kubeconfig }}"
+      register: gods_daemonset_restore
+      changed_when: true
+
+    - name: Restore scheduling only after both owned DaemonSets report ready
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ gods_kubeconfig }}"
+          - uncordon
+          - "{{ item }}"
+      loop: "{{ groups['gods_cluster'] | sort }}"
+      loop_control:
+        label: "{{ item }}"
+      register: gods_reconnect_uncordon
+      changed_when: "'already uncordoned' not in (gods_reconnect_uncordon.stdout | default('')) and 'uncordoned' in (gods_reconnect_uncordon.stdout | default(''))"

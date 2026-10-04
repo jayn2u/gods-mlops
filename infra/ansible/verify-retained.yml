@@ -1,0 +1,155 @@
+---
+- name: Validate recovery-manifest coverage on the controller without reading remote paths
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    gods_lifecycle_inventory: "{{ gods_lifecycle_inventory_file | default(playbook_dir ~ '/inventory.example.yml') }}"
+  tasks:
+    - name: Require a manifest path
+      ansible.builtin.assert:
+        that:
+          - gods_recovery_manifest is defined
+          - gods_recovery_manifest | length > 0
+          - gods_reclaim_plan_id is defined
+          - gods_reclaim_plan_id is match('^[0-9a-f]{64}$')
+        fail_msg: "A complete per-node recovery manifest is required."
+
+    - name: Restrict the verifier to an explicit read-only operation
+      ansible.builtin.assert:
+        that:
+          - gods_recovery_operation | default('verify-retained') in ['verify-retained', 'verify-recovery-artifacts']
+
+    - name: Check exact inventory coverage and same-node backup paths
+      ansible.builtin.command:
+        argv:
+          - gods-mlops
+          - lifecycle
+          - check-retained-manifest
+          - --manifest
+          - "{{ gods_recovery_manifest }}"
+          - --inventory
+          - "{{ gods_lifecycle_inventory }}"
+      register: gods_retention_coverage
+      changed_when: false
+
+    - name: Require the manifest and current inventory to share the confirmed reclaim plan
+      ansible.builtin.assert:
+        that:
+          - (gods_retention_coverage.stdout | from_json).plan_id == gods_reclaim_plan_id
+
+- name: Verify recovery artifacts on the node that owns each source path
+  hosts: gods_cluster
+  gather_facts: false
+  become: true
+  vars:
+    gods_lifecycle_inventory: "{{ gods_lifecycle_inventory_file | default(playbook_dir ~ '/inventory.example.yml') }}"
+    gods_remote_manifest_path: "/tmp/gods-mlops-recovery-{{ inventory_hostname }}.json"
+  tasks:
+    - name: Create a node-scoped manifest containing only paths on this host
+      block:
+        - name: Render this host's validated manifest slice on the controller
+          ansible.builtin.command:
+            argv:
+              - gods-mlops
+              - lifecycle
+              - export-retained-node
+              - --manifest
+              - "{{ gods_recovery_manifest }}"
+              - --inventory
+              - "{{ gods_lifecycle_inventory }}"
+              - --node
+              - "{{ inventory_hostname }}"
+          delegate_to: localhost
+          register: gods_node_manifest
+          changed_when: false
+          no_log: true
+
+        - name: Read retained-state evidence recorded after runtime quiescence
+          ansible.builtin.slurp:
+            src: "{{ gods_data_root }}/.gods-mlops-reclaim-state.json"
+          register: gods_reclaim_state_file
+          when: (gods_recovery_operation | default('verify-retained')) == 'verify-retained'
+          no_log: true
+
+        - name: Select the role-specific K3s service for reconnect identity checks
+          ansible.builtin.set_fact:
+            gods_lifecycle_service: "{{ 'k3s' if inventory_hostname in groups['gods_server'] else 'k3s-agent' }}"
+          when: (gods_recovery_operation | default('verify-retained')) == 'verify-retained'
+
+        - name: Re-read the configured K3s service command without printing credentials
+          ansible.builtin.command:
+            argv:
+              - systemctl
+              - show
+              - --property=ExecStart
+              - --value
+              - "{{ gods_lifecycle_service }}"
+          register: gods_current_service_exec_start
+          changed_when: false
+          when: (gods_recovery_operation | default('verify-retained')) == 'verify-retained'
+
+        - name: Hash the service configuration for cold-state comparison
+          ansible.builtin.set_fact:
+            gods_service_exec_start_sha256: "{{ gods_current_service_exec_start.stdout | hash('sha256') }}"
+          when: (gods_recovery_operation | default('verify-retained')) == 'verify-retained'
+
+        - name: Require matching node and cold K3s-state evidence before reconnect verification
+          ansible.builtin.assert:
+            that:
+              - (gods_reclaim_state_file.content | b64decode | from_json).owner == 'gods-mlops'
+              - (gods_reclaim_state_file.content | b64decode | from_json).node == inventory_hostname
+              - (gods_reclaim_state_file.content | b64decode | from_json).plan_id == gods_reclaim_plan_id
+              - (gods_reclaim_state_file.content | b64decode | from_json).step in ['service_stopped', 'retained_hash_pending']
+              - (gods_reclaim_state_file.content | b64decode | from_json).cold_retained_paths is mapping
+              - (gods_reclaim_state_file.content | b64decode | from_json).cold_k3s_state is mapping
+            fail_msg: "{{ inventory_hostname }} has no matching cold retained-state evidence for reconnect."
+          when: (gods_recovery_operation | default('verify-retained')) == 'verify-retained'
+          no_log: true
+
+        - name: Add measured cold K3s hashes as expected reconnect evidence
+          ansible.builtin.set_fact:
+            gods_node_manifest_doc: >-
+              {{
+                (gods_node_manifest.stdout | from_json)
+                | combine({
+                    'cold_k3s_state_expected': true,
+                    'expected_cold_k3s_state': (gods_reclaim_state_file.content | b64decode | from_json).cold_k3s_state,
+                    'cold_retained_paths_expected': true,
+                    'expected_cold_retained_paths': (gods_reclaim_state_file.content | b64decode | from_json).cold_retained_paths,
+                    'service_exec_start_sha256': gods_service_exec_start_sha256
+                  })
+              }}
+          when: (gods_recovery_operation | default('verify-retained')) == 'verify-retained'
+          no_log: true
+
+        - name: Keep the pre-stop manifest slice without cold-state comparison
+          ansible.builtin.set_fact:
+            gods_node_manifest_doc: "{{ gods_node_manifest.stdout | from_json }}"
+          when: (gods_recovery_operation | default('verify-retained')) == 'verify-recovery-artifacts'
+          no_log: true
+
+        - name: Copy only this node's recovery paths to a private temporary manifest
+          ansible.builtin.copy:
+            dest: "{{ gods_remote_manifest_path }}"
+            content: "{{ gods_node_manifest_doc | to_nice_json }}"
+            owner: root
+            group: root
+            mode: "0600"
+          no_log: true
+
+        - name: Verify backup hashes, database restore dumps, and credentials on this host
+          ansible.builtin.script:
+            cmd: >-
+              {{ playbook_dir }}/../../src/gods_mlops/lifecycle/recovery.py
+              {{ gods_recovery_operation | default('verify-retained') }}
+              --manifest {{ gods_remote_manifest_path }}
+          register: gods_node_retention_verification
+          changed_when: false
+
+      always:
+        - name: Remove the private node-scoped manifest
+          ansible.builtin.file:
+            path: "{{ gods_remote_manifest_path }}"
+            state: absent
+          no_log: true

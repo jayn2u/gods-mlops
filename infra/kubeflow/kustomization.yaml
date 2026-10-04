@@ -19,3 +19,105 @@ patches:
       - op: replace
         path: /spec/owner/name
         value: user@example.com
+  - target:
+      version: v1
+      kind: PersistentVolumeClaim
+      name: metadata-postgres
+      namespace: kubeflow-user-example-com
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: gods-mlops
+      - op: add
+        path: /metadata/labels
+        value: {}
+      - op: add
+        path: /metadata/labels/gods.io~1managed-storage
+        value: "true"
+      - op: add
+        path: /metadata/labels/gods.io~1recovery-kind
+        value: database
+      - op: add
+        path: /spec/storageClassName
+        value: gods-mlops-local-retain
+      - op: add
+        path: /spec/volumeName
+        value: gods-mlops-kfp-metadata-postgres
+  - target:
+      version: v1
+      kind: PersistentVolumeClaim
+      name: katib-mysql
+      namespace: kubeflow
+    patch: |-
+      - op: add
+        path: /metadata/labels
+        value: {}
+      - op: add
+        path: /metadata/labels/gods.io~1managed-storage
+        value: "true"
+      - op: add
+        path: /metadata/labels/gods.io~1recovery-kind
+        value: database
+      - op: add
+        path: /spec/storageClassName
+        value: gods-mlops-local-retain
+      - op: add
+        path: /spec/volumeName
+        value: gods-mlops-katib-mysql
+  - target:
+      version: v1
+      kind: PersistentVolumeClaim
+      name: model-catalog-postgres
+      namespace: kubeflow
+    patch: |-
+      - op: add
+        path: /metadata/labels
+        value: {}
+      - op: add
+        path: /metadata/labels/gods.io~1managed-storage
+        value: "true"
+      - op: add
+        path: /metadata/labels/gods.io~1recovery-kind
+        value: database
+      - op: add
+        path: /spec/storageClassName
+        value: gods-mlops-local-retain
+      - op: add
+        path: /spec/volumeName
+        value: gods-mlops-model-catalog-postgres
+  - target:
+      version: v1
+      kind: PersistentVolumeClaim
+      name: mysql-pv-claim
+      namespace: kubeflow
+    patch: |-
+      - op: add
+        path: /metadata/labels/gods.io~1managed-storage
+        value: "true"
+      - op: add
+        path: /metadata/labels/gods.io~1recovery-kind
+        value: database
+      - op: add
+        path: /spec/storageClassName
+        value: gods-mlops-local-retain
+      - op: add
+        path: /spec/volumeName
+        value: gods-mlops-kfp-mysql
+  - target:
+      version: v1
+      kind: PersistentVolumeClaim
+      name: seaweedfs-pvc
+      namespace: kubeflow
+    patch: |-
+      - op: add
+        path: /metadata/labels/gods.io~1managed-storage
+        value: "true"
+      - op: add
+        path: /metadata/labels/gods.io~1recovery-kind
+        value: object-store
+      - op: add
+        path: /spec/storageClassName
+        value: gods-mlops-local-retain
+      - op: add
+        path: /spec/volumeName
+        value: gods-mlops-seaweedfs

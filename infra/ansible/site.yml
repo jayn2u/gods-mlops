@@ -33,29 +33,8 @@
       when: not gods_node_preflight.existing_cluster.k3s_server_active
       no_log: true
 
-    - name: Create the new Gods data root after ownership checks
-      ansible.builtin.file:
-        path: "{{ gods_data_root }}"
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: Write a non-secret marker that identifies this managed data root
-      ansible.builtin.copy:
-        dest: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
-        content: >-
-          {{ {
-            'schema_version': 1,
-            'owner': 'gods-mlops',
-            'data_root': gods_data_root,
-            'k3s_data_dir': gods_k3s_data_dir,
-            'k3s_version': gods_k3s_version
-          } | to_nice_json }}
-        owner: root
-        group: root
-        mode: "0644"
-        force: false
+    - name: Verify and mark the dedicated Gods data and K3s paths
+      ansible.builtin.import_tasks: tasks/ensure-owned-roots.yml
 
     - name: Create only the explicitly allocated Gods storage directories
       ansible.builtin.file:
@@ -139,6 +118,34 @@
       become: false
       no_log: true
 
+    - name: Wait for the Gods control-plane node to be Ready
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ playbook_dir }}/generated/kubeconfig"
+          - wait
+          - --for=condition=Ready
+          - "node/{{ inventory_hostname }}"
+          - --timeout=180s
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Restore scheduling on the Gods control-plane node after reapply
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ playbook_dir }}/generated/kubeconfig"
+          - uncordon
+          - "{{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      register: gods_server_uncordon
+      changed_when: "'already uncordoned' not in gods_server_uncordon.stdout and 'uncordoned' in gods_server_uncordon.stdout"
+      when: not (gods_defer_uncordon | default(false) | bool)
+
 - name: Join the ubuntu A6000 worker to the prepared Gods control plane
   hosts: gods_gpu_worker
   gather_facts: true
@@ -172,29 +179,8 @@
       when: not gods_node_preflight.existing_cluster.k3s_agent_active
       no_log: true
 
-    - name: Create the new Gods data root after ownership checks
-      ansible.builtin.file:
-        path: "{{ gods_data_root }}"
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-
-    - name: Write a non-secret marker that identifies this managed data root
-      ansible.builtin.copy:
-        dest: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
-        content: >-
-          {{ {
-            'schema_version': 1,
-            'owner': 'gods-mlops',
-            'data_root': gods_data_root,
-            'k3s_data_dir': gods_k3s_data_dir,
-            'k3s_version': gods_k3s_version
-          } | to_nice_json }}
-        owner: root
-        group: root
-        mode: "0644"
-        force: false
+    - name: Verify and mark the dedicated Gods data and K3s paths
+      ansible.builtin.import_tasks: tasks/ensure-owned-roots.yml
 
     - name: Create only the explicitly allocated Gods storage directories
       ansible.builtin.file:
@@ -240,6 +226,34 @@
       delay: 5
       until: gods_k3s_agent_status.stdout | trim == 'active'
       when: not gods_node_preflight.existing_cluster.k3s_agent_active
+
+    - name: Wait for the Gods GPU worker node to be Ready
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ playbook_dir }}/generated/kubeconfig"
+          - wait
+          - --for=condition=Ready
+          - "node/{{ inventory_hostname }}"
+          - --timeout=180s
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Restore scheduling on the Gods GPU worker after reapply
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - --kubeconfig
+          - "{{ playbook_dir }}/generated/kubeconfig"
+          - uncordon
+          - "{{ inventory_hostname }}"
+      delegate_to: localhost
+      become: false
+      register: gods_worker_uncordon
+      changed_when: "'already uncordoned' not in gods_worker_uncordon.stdout and 'uncordoned' in gods_worker_uncordon.stdout"
+      when: not (gods_defer_uncordon | default(false) | bool)
 
     - name: Remove the temporary K3s installer
       ansible.builtin.file:

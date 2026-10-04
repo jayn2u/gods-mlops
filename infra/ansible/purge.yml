@@ -1,0 +1,90 @@
+---
+- name: Verify the exact purge target digest before host access
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require a separately supplied target file and SHA-256 confirmation
+      ansible.builtin.assert:
+        that:
+          - gods_purge_targets_file is defined
+          - gods_purge_targets_file | length > 0
+          - gods_purge_target_digest is defined
+          - gods_purge_target_digest is match('^[0-9a-f]{64}$')
+        fail_msg: "Purge requires an explicit target list and its exact SHA-256 confirmation."
+
+    - name: Revalidate the target digest and preservation exclusions
+      ansible.builtin.command:
+        argv:
+          - gods-mlops
+          - lifecycle
+          - verify-purge-targets
+          - --targets
+          - "{{ gods_purge_targets_file }}"
+          - --confirm-targets
+          - "{{ gods_purge_target_digest }}"
+      changed_when: false
+
+- name: Permanently remove only exact confirmed children of Gods data roots
+  hosts: gods_cluster
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Verify authenticated privilege by checking the effective UID
+      ansible.builtin.command:
+        argv: [id, -u]
+      register: gods_effective_uid
+      changed_when: false
+
+    - name: Require effective root from normal Ansible become authentication
+      ansible.builtin.assert:
+        that:
+          - gods_effective_uid.stdout | trim == '0'
+        fail_msg: "Ansible become did not produce effective uid 0 on {{ inventory_hostname }}."
+
+    - name: Select the role-specific managed K3s service
+      ansible.builtin.set_fact:
+        gods_lifecycle_service: "{{ 'k3s' if inventory_hostname in groups['gods_server'] else 'k3s-agent' }}"
+
+    - name: Verify ownership marker for this host before any purge
+      ansible.builtin.slurp:
+        src: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
+      register: gods_root_marker
+      no_log: true
+
+    - name: Require the current managed root to match the confirmed target records
+      ansible.builtin.assert:
+        that:
+          - (gods_root_marker.content | b64decode | from_json).owner == 'gods-mlops'
+          - (gods_root_marker.content | b64decode | from_json).data_root == gods_data_root
+          - item.owner_marker == gods_data_root ~ '/' ~ gods_owner_marker_name
+          - item.path.startswith(gods_data_root ~ '/')
+        fail_msg: "Purge target does not belong to the marked Gods root on {{ inventory_hostname }}."
+      loop: "{{ targets | selectattr('node', 'equalto', inventory_hostname) | list }}"
+      loop_control:
+        label: "{{ item.node }} {{ item.path }}"
+      no_log: true
+
+    - name: Require the Gods K3s service to be stopped before removing persistent data
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ gods_lifecycle_service }}"
+      register: gods_purge_service_status
+      changed_when: false
+      failed_when: false
+
+    - name: Block purge while the managed service is active
+      ansible.builtin.assert:
+        that:
+          - gods_purge_service_status.stdout | trim != 'active'
+        fail_msg: "Stop the marked Gods K3s service with the data-preserving reclaim command before purge."
+
+    - name: Remove only exact confirmed target paths for this node
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ targets | selectattr('node', 'equalto', inventory_hostname) | list }}"
+      loop_control:
+        label: "{{ item.node }} {{ item.path }}"

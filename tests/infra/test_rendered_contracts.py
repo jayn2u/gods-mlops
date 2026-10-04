@@ -18,6 +18,7 @@ PRESERVED_PREFIXES = (
     "/data/jayn2u/minio",
     "/data/jayn2u/labclip-cache",
     "/data/jayn2u/labclip-k3s",
+    "/data/jayn2u/gods-mlops-model-preparation",
     "/mnt/data/gods-mlops",
     "/mnt/data/minio-code",
     "/mnt/data/labclip-cache",
@@ -170,17 +171,26 @@ def test_gods_local_volumes_are_retained_and_use_only_new_paths(
         and item.get("metadata", {}).get("labels", {}).get("gods.io/managed-storage")
         == "true"
     ]
-    assert {item["metadata"]["name"] for item in volumes} == {
-        "gods-mlops-objects",
-        "gods-mlops-cache",
-        "gods-mlops-metadata",
-        "gods-mlops-spool",
+    expected_claims = {
+        ("gods-mlops", "gods-mlops-objects"): ("gods-mlops-objects", "1Ti", "/data/jayn2u/gods-mlops/objects", "object-store"),
+        ("gods-mlops", "gods-mlops-cache"): ("gods-mlops-cache", "200Gi", "/data/jayn2u/gods-mlops/cache", "cache"),
+        ("gods-mlops", "gods-mlops-metadata"): ("gods-mlops-metadata", "50Gi", "/data/jayn2u/gods-mlops/metadata/platform", "metadata"),
+        ("gods-mlops", "gods-mlops-spool"): ("gods-mlops-spool", "20Gi", "/mnt/data/gods-mlops-runtime/spool", "spool"),
+        ("gods-mlops", "metadata-postgres"): ("gods-mlops-kfp-metadata-postgres", "10Gi", "/data/jayn2u/gods-mlops/metadata/kubeflow-user/gods-mlops/metadata-postgres", "database"),
+        ("kubeflow", "katib-mysql"): ("gods-mlops-katib-mysql", "10Gi", "/data/jayn2u/gods-mlops/metadata/kubeflow/katib-mysql", "database"),
+        ("kubeflow", "model-catalog-postgres"): ("gods-mlops-model-catalog-postgres", "5Gi", "/data/jayn2u/gods-mlops/metadata/kubeflow/model-catalog-postgres", "database"),
+        ("kubeflow", "mysql-pv-claim"): ("gods-mlops-kfp-mysql", "20Gi", "/data/jayn2u/gods-mlops/metadata/kubeflow/mysql-pv-claim", "database"),
+        ("kubeflow", "seaweedfs-pvc"): ("gods-mlops-seaweedfs", "20Gi", "/data/jayn2u/gods-mlops/metadata/kubeflow/seaweedfs-pvc", "object-store"),
     }
+    volumes_by_name = {item["metadata"]["name"]: item for item in volumes}
+    assert set(volumes_by_name) == {value[0] for value in expected_claims.values()}
     for volume in volumes:
         spec = volume["spec"]
         assert spec["persistentVolumeReclaimPolicy"] == "Retain"
         assert spec["storageClassName"] == "gods-mlops-local-retain"
         local_path = spec["local"]["path"]
+        assert local_path == next(value[2] for value in expected_claims.values() if value[0] == volume["metadata"]["name"])
+        assert volume["metadata"]["labels"]["gods.io/recovery-kind"] == next(value[3] for value in expected_claims.values() if value[0] == volume["metadata"]["name"])
         local_path_parts = Path(local_path)
         assert any(
             local_path_parts.is_relative_to(Path(root))
@@ -201,16 +211,33 @@ def test_gods_local_volumes_are_retained_and_use_only_new_paths(
         }
         assert len(hostnames) == 1, f"{volume['metadata']['name']} must have one node pin"
         assert hostnames.issubset({"ubuntu", "vis-lab"})
+        claim_ref = spec["claimRef"]
+        assert {"namespace": claim_ref["namespace"], "name": claim_ref["name"]} == next(
+            {"namespace": namespace, "name": claim_name}
+            for (namespace, claim_name), value in expected_claims.items()
+            if value[0] == volume["metadata"]["name"]
+        )
 
     claims = [
         item
         for item in rendered_objects
         if item.get("kind") == "PersistentVolumeClaim"
-        and item.get("metadata", {}).get("labels", {}).get("gods.io/managed-storage")
-        == "true"
     ]
-    assert len(claims) == 4
-    assert all(item["metadata"]["namespace"] == "gods-mlops" for item in claims)
+    claims_by_name = {
+        (item.get("metadata", {}).get("namespace", "default"), item["metadata"]["name"]): item
+        for item in claims
+    }
+    assert set(claims_by_name) == set(expected_claims), "every rendered PVC must have an explicit retained backing volume"
+    for (namespace, name), item in claims_by_name.items():
+        volume_name, expected_size, _, _ = expected_claims[(namespace, name)]
+        spec = item["spec"]
+        assert item["metadata"]["labels"]["gods.io/managed-storage"] == "true"
+        assert spec["storageClassName"] == "gods-mlops-local-retain"
+        assert spec["volumeName"] == volume_name
+        assert spec["resources"]["requests"]["storage"] == expected_size
+        assert "ReadWriteOnce" in spec["accessModes"]
+        volume_spec = volumes_by_name[volume_name]["spec"]
+        assert volume_spec["capacity"]["storage"] == expected_size
 
 
 def test_render_has_no_external_service_or_ingress_exposure(

@@ -15,6 +15,7 @@ metadata:
   name: gods-mlops-objects
   labels:
     gods.io/managed-storage: "true"
+    gods.io/recovery-kind: object-store
     gods.io/pv: gods-mlops-objects
 spec:
   capacity:
@@ -23,6 +24,9 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   storageClassName: gods-mlops-local-retain
   volumeMode: Filesystem
+  claimRef:
+    namespace: gods-mlops
+    name: gods-mlops-objects
   local:
     path: /data/jayn2u/gods-mlops/objects
   nodeAffinity:
@@ -39,6 +43,7 @@ metadata:
   name: gods-mlops-cache
   labels:
     gods.io/managed-storage: "true"
+    gods.io/recovery-kind: cache
     gods.io/pv: gods-mlops-cache
 spec:
   capacity:
@@ -47,6 +52,9 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   storageClassName: gods-mlops-local-retain
   volumeMode: Filesystem
+  claimRef:
+    namespace: gods-mlops
+    name: gods-mlops-cache
   local:
     path: /data/jayn2u/gods-mlops/cache
   nodeAffinity:
@@ -63,6 +71,7 @@ metadata:
   name: gods-mlops-metadata
   labels:
     gods.io/managed-storage: "true"
+    gods.io/recovery-kind: metadata
     gods.io/pv: gods-mlops-metadata
 spec:
   capacity:
@@ -71,8 +80,11 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   storageClassName: gods-mlops-local-retain
   volumeMode: Filesystem
+  claimRef:
+    namespace: gods-mlops
+    name: gods-mlops-metadata
   local:
-    path: /data/jayn2u/gods-mlops/metadata
+    path: /data/jayn2u/gods-mlops/metadata/platform
   nodeAffinity:
     required:
       nodeSelectorTerms:
@@ -87,6 +99,7 @@ metadata:
   name: gods-mlops-spool
   labels:
     gods.io/managed-storage: "true"
+    gods.io/recovery-kind: spool
     gods.io/pv: gods-mlops-spool
 spec:
   capacity:
@@ -95,6 +108,9 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   storageClassName: gods-mlops-local-retain
   volumeMode: Filesystem
+  claimRef:
+    namespace: gods-mlops
+    name: gods-mlops-spool
   local:
     path: /mnt/data/gods-mlops-runtime/spool
   nodeAffinity:
@@ -104,6 +120,146 @@ spec:
             - key: kubernetes.io/hostname
               operator: In
               values: [vis-lab]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gods-mlops-kfp-metadata-postgres
+  labels:
+    gods.io/managed-storage: "true"
+    gods.io/recovery-kind: database
+    gods.io/pv: gods-mlops-kfp-metadata-postgres
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gods-mlops-local-retain
+  volumeMode: Filesystem
+  claimRef:
+    namespace: gods-mlops
+    name: metadata-postgres
+  local:
+    path: /data/jayn2u/gods-mlops/metadata/kubeflow-user/gods-mlops/metadata-postgres
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [ubuntu]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gods-mlops-katib-mysql
+  labels:
+    gods.io/managed-storage: "true"
+    gods.io/recovery-kind: database
+    gods.io/pv: gods-mlops-katib-mysql
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gods-mlops-local-retain
+  volumeMode: Filesystem
+  claimRef:
+    namespace: kubeflow
+    name: katib-mysql
+  local:
+    path: /data/jayn2u/gods-mlops/metadata/kubeflow/katib-mysql
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [ubuntu]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gods-mlops-model-catalog-postgres
+  labels:
+    gods.io/managed-storage: "true"
+    gods.io/recovery-kind: database
+    gods.io/pv: gods-mlops-model-catalog-postgres
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gods-mlops-local-retain
+  volumeMode: Filesystem
+  claimRef:
+    namespace: kubeflow
+    name: model-catalog-postgres
+  local:
+    path: /data/jayn2u/gods-mlops/metadata/kubeflow/model-catalog-postgres
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [ubuntu]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gods-mlops-kfp-mysql
+  labels:
+    gods.io/managed-storage: "true"
+    gods.io/recovery-kind: database
+    gods.io/pv: gods-mlops-kfp-mysql
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gods-mlops-local-retain
+  volumeMode: Filesystem
+  claimRef:
+    namespace: kubeflow
+    name: mysql-pv-claim
+  local:
+    path: /data/jayn2u/gods-mlops/metadata/kubeflow/mysql-pv-claim
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [ubuntu]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gods-mlops-seaweedfs
+  labels:
+    gods.io/managed-storage: "true"
+    gods.io/recovery-kind: object-store
+    gods.io/pv: gods-mlops-seaweedfs
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gods-mlops-local-retain
+  volumeMode: Filesystem
+  claimRef:
+    namespace: kubeflow
+    name: seaweedfs-pvc
+  local:
+    path: /data/jayn2u/gods-mlops/metadata/kubeflow/seaweedfs-pvc
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [ubuntu]
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
