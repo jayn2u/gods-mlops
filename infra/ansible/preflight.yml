@@ -1,0 +1,398 @@
+---
+- name: Inspect Gods K3s hosts without changing remote nodes
+  hosts: gods_cluster
+  gather_facts: true
+  become: false
+  vars:
+    gods_versions_lock_document: >-
+      {{ lookup('ansible.builtin.file', playbook_dir ~ '/../versions.lock.yaml') | from_yaml }}
+  tasks:
+    - name: Validate the Gods root is new or owned by this deployment
+      ansible.builtin.assert:
+        that:
+          - gods_data_root.startswith(gods_storage_mount.rstrip('/') + '/')
+          - gods_data_root not in gods_preserve_paths
+          - not (gods_data_root | regex_search('(^|/)(minio|labclip|rtsp)(/|$)'))
+        fail_msg: "Gods storage root must be a new path beneath its declared data mount."
+
+    - name: Check non-interactive administrator permission without using it
+      ansible.builtin.command:
+        argv: [sudo, -n, true]
+      register: gods_sudo_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check the persistent mount used by the Gods data root
+      ansible.builtin.command:
+        argv:
+          - findmnt
+          - --noheadings
+          - --output
+          - TARGET
+          - --target
+          - "{{ gods_storage_mount }}"
+      register: gods_mount_check
+      changed_when: false
+      failed_when: false
+
+    - name: Read free bytes on the persistent filesystem
+      ansible.builtin.command:
+        argv:
+          - df
+          - -PB1
+          - --no-sync
+          - --output=avail
+          - "{{ gods_storage_mount }}"
+      register: gods_disk_check
+      changed_when: false
+      failed_when: false
+
+    - name: Inspect the Gods data root without following symlinks
+      ansible.builtin.stat:
+        path: "{{ gods_data_root }}"
+        follow: false
+      register: gods_root_stat
+
+    - name: Inspect the Gods ownership marker without following symlinks
+      ansible.builtin.stat:
+        path: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
+        follow: false
+      register: gods_owner_marker_stat
+
+    - name: Read the marker only when an existing Gods root needs ownership proof
+      ansible.builtin.slurp:
+        src: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
+      register: gods_owner_marker
+      failed_when: false
+      when:
+        - gods_root_stat.stat.exists
+        - gods_root_stat.stat.isdir | default(false)
+        - not (gods_root_stat.stat.islnk | default(false))
+        - gods_owner_marker_stat.stat.exists
+        - gods_owner_marker_stat.stat.isreg | default(false)
+        - not (gods_owner_marker_stat.stat.islnk | default(false))
+        - gods_owner_marker_stat.stat.uid | default(-1) == 0
+
+    - name: Parse the non-secret Gods ownership marker
+      ansible.builtin.set_fact:
+        gods_owner_marker_document: >-
+          {{ gods_owner_marker.content | b64decode | from_json
+             if gods_owner_marker is defined and gods_owner_marker.content is defined
+             else {} }}
+      changed_when: false
+
+    - name: Check which network interface routes to the peer node
+      ansible.builtin.command:
+        argv:
+          - ip
+          - route
+          - get
+          - "{{ gods_peer_ip }}"
+      register: gods_peer_route
+      changed_when: false
+      failed_when: false
+
+    - name: Record configured IPv4 addresses on the host
+      ansible.builtin.command:
+        argv: [ip, -o, -4, addr, show]
+      register: gods_ipv4_addresses
+      changed_when: false
+      failed_when: false
+
+    - name: Check existing LabCLIP and RTSP preservation paths without reading their contents
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop: "{{ gods_preserve_paths }}"
+      loop_control:
+        label: "{{ item }}"
+      register: gods_preservation_stats
+
+    - name: Inspect each new Gods storage directory without following symlinks
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        follow: false
+      loop: "{{ gods_data_directories }}"
+      loop_control:
+        label: "{{ item.role }}"
+      register: gods_data_directory_stats
+
+    - name: Record ownership and existence for each preserved path
+      ansible.builtin.set_fact:
+        gods_preservation_snapshot: >-
+          {{ gods_preservation_snapshot | default([]) + [{
+            'path': item.item,
+            'exists': item.stat.exists | default(false),
+            'owner': item.stat.pw_name | default('unknown'),
+            'uid': item.stat.uid | default(-1),
+            'group': item.stat.gr_name | default('unknown'),
+            'gid': item.stat.gid | default(-1)
+          }] }}
+      loop: "{{ gods_preservation_stats.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      changed_when: false
+
+    - name: Record the owner and existence of each new Gods storage directory
+      ansible.builtin.set_fact:
+        gods_data_directory_snapshot: >-
+          {{ gods_data_directory_snapshot | default([]) + [{
+            'path': item.item.path,
+            'role': item.item.role,
+            'capacity': item.item.capacity,
+            'exists': item.stat.exists | default(false),
+            'is_directory': item.stat.isdir | default(false),
+            'is_symlink': item.stat.islnk | default(false),
+            'uid': item.stat.uid | default(-1),
+            'gid': item.stat.gid | default(-1),
+            'owner': item.stat.pw_name | default('unknown'),
+            'group': item.stat.gr_name | default('unknown')
+          }] }}
+      loop: "{{ gods_data_directory_stats.results }}"
+      loop_control:
+        label: "{{ item.item.role }}"
+      changed_when: false
+
+    - name: Check whether an existing K3s server service is active
+      ansible.builtin.command:
+        argv: [systemctl, is-active, k3s]
+      register: gods_k3s_server_service
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether an existing K3s agent service is active
+      ansible.builtin.command:
+        argv: [systemctl, is-active, k3s-agent]
+      register: gods_k3s_agent_service
+      changed_when: false
+      failed_when: false
+
+    - name: Read the installed K3s version if present
+      ansible.builtin.command:
+        argv: [k3s, --version]
+      register: gods_k3s_version_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check for NVIDIA runtime support on GPU nodes
+      ansible.builtin.command:
+        argv: [nvidia-container-runtime, --version]
+      register: gods_nvidia_runtime_check
+      changed_when: false
+      failed_when: false
+      when: gods_gpu_model is defined
+
+    - name: Check GPU identity on GPU nodes
+      ansible.builtin.command:
+        argv: [nvidia-smi, -L]
+      register: gods_gpu_check
+      changed_when: false
+      failed_when: false
+      when: gods_gpu_model is defined
+
+    - name: Start the node readiness blocker list
+      ansible.builtin.set_fact:
+        gods_preflight_blockers: []
+        gods_root_owned: >-
+          {{ gods_root_stat.stat.exists and
+             not (gods_root_stat.stat.islnk | default(false)) and
+             gods_owner_marker_stat.stat.exists and
+             not (gods_owner_marker_stat.stat.islnk | default(false)) and
+             gods_owner_marker_stat.stat.uid | default(-1) == 0 and
+             not (gods_owner_marker.failed | default(false)) and
+             gods_owner_marker_document.owner | default('') == 'gods-mlops' and
+             gods_owner_marker_document.schema_version | default(0) == 1 and
+             gods_owner_marker_document.data_root | default('') == gods_data_root and
+             gods_owner_marker_document.k3s_data_dir | default('') == gods_k3s_data_dir and
+             gods_owner_marker_document.k3s_version | default('') == gods_versions_lock_document.platform.k3s }}
+        gods_owner_marker_valid: >-
+          {{ not gods_root_stat.stat.exists or gods_root_owned }}
+      changed_when: false
+
+    - name: Require non-interactive administrator access before any host change
+      ansible.builtin.set_fact:
+        gods_preflight_blockers: "{{ gods_preflight_blockers + ['sudo -n is unavailable; privileged K3s setup is not ready'] }}"
+      when: gods_sudo_check.rc != 0
+      changed_when: false
+
+    - name: Require the configured path to be the actual persistent mount
+      ansible.builtin.set_fact:
+        gods_preflight_blockers: "{{ gods_preflight_blockers + ['configured storage path is not the mounted filesystem'] }}"
+      when:
+        - gods_mount_check.rc != 0 or gods_mount_check.stdout | trim != gods_storage_mount
+      changed_when: false
+
+    - name: Require the approved free-space reserve
+      ansible.builtin.set_fact:
+        gods_preflight_blockers: "{{ gods_preflight_blockers + ['persistent filesystem free space is below the approved safety reserve'] }}"
+      when: >-
+        gods_disk_check.rc != 0 or
+        (gods_disk_check.stdout_lines | last | default('0') | int) <
+        (gods_min_free_gib | int * 1024 * 1024 * 1024)
+      changed_when: false
+
+    - name: Refuse to overwrite a path that is not marked as Gods-owned
+      ansible.builtin.set_fact:
+        gods_preflight_blockers: "{{ gods_preflight_blockers + ['existing Gods path lacks a valid root-owned Gods ownership marker'] }}"
+      when: gods_root_stat.stat.exists and not gods_root_owned
+      changed_when: false
+
+    - name: Refuse to initialize existing storage directories without owner proof
+      ansible.builtin.set_fact:
+        gods_preflight_blockers: "{{ gods_preflight_blockers + ['existing Gods storage directory has an unexpected type or owner'] }}"
+      when: >-
+        item.stat.exists and (
+          item.stat.islnk | default(false) or
+          not (item.stat.isdir | default(false)) or
+          item.stat.uid | default(-1) != gods_container_uid | int or
+          item.stat.gid | default(-1) != gods_container_gid | int
+        )
+      loop: "{{ gods_data_directory_stats.results }}"
+      loop_control:
+        label: "{{ item.item.role }}"
+      changed_when: false
+
+    - name: Refuse to replace a currently running non-Gods K3s service
+      ansible.builtin.set_fact:
+        gods_preflight_blockers: "{{ gods_preflight_blockers + ['existing K3s service is active; preserve and reclaim it in the separate recovery task first'] }}"
+      when: >-
+        (gods_k3s_server_service.stdout | trim == 'active' or
+         gods_k3s_agent_service.stdout | trim == 'active') and
+        not gods_root_owned
+      changed_when: false
+
+    - name: Require an active Gods K3s service to match the pinned release
+      ansible.builtin.set_fact:
+        gods_preflight_blockers: "{{ gods_preflight_blockers + ['active Gods K3s binary differs from the immutable version lock'] }}"
+      when: >-
+        gods_root_owned and
+        (gods_k3s_server_service.stdout | trim == 'active' or
+         gods_k3s_agent_service.stdout | trim == 'active') and
+        gods_versions_lock_document.platform.k3s not in gods_k3s_version_check.stdout
+      changed_when: false
+
+    - name: Require the declared GPU and runtime on the A6000 worker
+      ansible.builtin.set_fact:
+        gods_preflight_blockers: "{{ gods_preflight_blockers + ['declared GPU or NVIDIA container runtime is unavailable'] }}"
+      when:
+        - gods_gpu_model is defined
+        - gods_nvidia_runtime_check.rc != 0 or gods_gpu_check.rc != 0 or gods_gpu_model not in gods_gpu_check.stdout
+      changed_when: false
+
+    - name: Build a node-only preflight result
+      ansible.builtin.set_fact:
+        gods_preflight_result:
+          node: "{{ inventory_hostname }}"
+          node_address: "{{ k3s_node_ip }}"
+          node_role: "{{ 'gpu-worker' if gods_gpu_model is defined else 'control-plane' }}"
+          status: "{{ 'ready' if gods_preflight_blockers | length == 0 else 'blocked' }}"
+          blockers: "{{ gods_preflight_blockers }}"
+          permissions:
+            sudo_noninteractive: "{{ gods_sudo_check.rc == 0 }}"
+          storage:
+            mount: "{{ gods_storage_mount }}"
+            mounted_target: "{{ gods_mount_check.stdout | trim }}"
+            available_bytes: "{{ gods_disk_check.stdout_lines | last | default('0') | int }}"
+            min_free_gib: "{{ gods_min_free_gib }}"
+            data_root: "{{ gods_data_root }}"
+            data_root_exists: "{{ gods_root_stat.stat.exists }}"
+            data_root_owner: "{{ gods_root_stat.stat.pw_name | default('unknown') }}"
+            owner_marker_valid: >-
+              "{{ gods_owner_marker_valid }}"
+            planned_data_directories: "{{ gods_data_directory_snapshot | default([]) }}"
+          existing_cluster:
+            k3s_server_active: "{{ gods_k3s_server_service.stdout | trim == 'active' }}"
+            k3s_agent_active: "{{ gods_k3s_agent_service.stdout | trim == 'active' }}"
+            k3s_version: "{{ gods_k3s_version_check.stdout | default('') }}"
+          gpu:
+            expected_model: "{{ gods_gpu_model | default('') }}"
+            detected: "{{ gods_gpu_check.stdout | default('') }}"
+            nvidia_runtime_available: "{{ gods_nvidia_runtime_check.rc | default(127) == 0 }}"
+          network:
+            ipv4_addresses: "{{ gods_ipv4_addresses.stdout | default('') }}"
+            peer_address: "{{ gods_peer_ip }}"
+            peer_route: "{{ gods_peer_route.stdout | default('') }}"
+            peer_route_interface: >-
+              {{ (gods_peer_route.stdout | regex_search('\\bdev\\s+([^ ]+)', '\\1') | first)
+                 if gods_peer_route.rc | default(1) == 0 else '' }}
+          preserved_paths: "{{ gods_preservation_snapshot | default([]) }}"
+          preserved_patterns: "{{ gods_preserve_patterns }}"
+          preserved_services: "{{ gods_preserve_services }}"
+          locked_versions:
+            k3s: "{{ gods_versions_lock_document.platform.k3s }}"
+            kubeflow: "{{ gods_versions_lock_document.platform.kubeflow.version }}"
+            kubeflow_commit: "{{ gods_versions_lock_document.platform.kubeflow.commit }}"
+            gpu_plugin: "{{ gods_versions_lock_document.platform.nvidia_device_plugin }}"
+      changed_when: false
+
+- name: Write the local preflight input and report readiness
+  hosts: localhost
+  gather_facts: false
+  vars:
+    gods_preflight_report_path: "{{ playbook_dir }}/artifacts/preflight.json"
+  tasks:
+    - name: Initialize the node snapshot list
+      ansible.builtin.set_fact:
+        gods_preflight_nodes: []
+      changed_when: false
+
+    - name: Include a blocked snapshot for any node that could not be inspected
+      ansible.builtin.set_fact:
+        gods_preflight_nodes: >-
+          {{ gods_preflight_nodes + [
+            hostvars[item].gods_preflight_result | default({
+              'node': item,
+              'status': 'unreachable',
+              'blockers': ['host preflight did not complete'],
+              'permissions': {'sudo_noninteractive': false},
+              'preserved_paths': []
+            })
+          ] }}
+      loop: "{{ groups['gods_cluster'] }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+
+    - name: Derive overall readiness from all nodes
+      ansible.builtin.set_fact:
+        gods_preflight_status: "{{ 'ready' if gods_preflight_nodes | selectattr('status', 'ne', 'ready') | list | length == 0 else 'blocked' }}"
+        gods_preflight_blockers: "{{ gods_preflight_nodes | map(attribute='blockers') | flatten | list }}"
+      changed_when: false
+
+    - name: Create the local artifact directory
+      ansible.builtin.file:
+        path: "{{ gods_preflight_report_path | dirname }}"
+        state: directory
+        mode: "0700"
+
+    - name: Write the inspection result as JSON for installation tools
+      ansible.builtin.copy:
+        dest: "{{ gods_preflight_report_path }}"
+        content: >-
+          {{ {
+            'schema_version': 1,
+            'status': gods_preflight_status,
+            'nodes': gods_preflight_nodes,
+            'network_flows': hostvars[groups['gods_cluster'][0]].gods_network_flows,
+            'preservation_boundary': {
+              'existing_cluster_reclaim_required': true,
+              'existing_data_paths_are_read_only': true,
+              'rtsp_services_and_volumes_preserved': true
+            }
+          } | to_nice_json }}
+        mode: "0600"
+      register: gods_preflight_report_copy
+
+    - name: Print a concise readiness result without secrets
+      ansible.builtin.debug:
+        msg: >-
+          Gods host preflight is {{ gods_preflight_status }}. Report:
+          {{ gods_preflight_report_path }}. Blockers:
+          {{ gods_preflight_blockers | join('; ') if gods_preflight_blockers else 'none' }}
+
+    - name: Stop before any installation when host prerequisites are missing
+      ansible.builtin.fail:
+        msg: >-
+          Gods K3s installation is blocked. Resolve the reported host prerequisites
+          and complete the separate existing-cluster preservation/reclaim step first.
+      when: gods_preflight_status != 'ready'

@@ -1,0 +1,248 @@
+---
+- name: Gather the read-only readiness report before any installation
+  ansible.builtin.import_playbook: preflight.yml
+
+- name: Install the locked Gods-only K3s control plane on vis-lab
+  hosts: gods_server
+  gather_facts: true
+  become: true
+  vars:
+    gods_versions_lock_document: >-
+      {{ lookup('ansible.builtin.file', playbook_dir ~ '/../versions.lock.yaml') | from_yaml }}
+    gods_k3s_version: "{{ gods_versions_lock_document.platform.k3s }}"
+    gods_preflight_report: >-
+      {{ lookup('ansible.builtin.file', playbook_dir ~ '/artifacts/preflight.json') | from_json }}
+    gods_k3s_token: "{{ lookup('ansible.builtin.env', 'GODS_K3S_TOKEN') }}"
+    gods_node_preflight: >-
+      {{ gods_preflight_report.nodes | selectattr('node', 'equalto', inventory_hostname) | first }}
+    gods_existing_data_paths: >-
+      {{ gods_node_preflight.storage.planned_data_directories | selectattr('exists') | map(attribute='path') | list }}
+  tasks:
+    - name: Require ready preflight evidence for the control-plane host
+      ansible.builtin.assert:
+        that:
+          - gods_preflight_report.status == 'ready'
+          - gods_preflight_report.nodes | selectattr('node', 'equalto', inventory_hostname) | selectattr('status', 'equalto', 'ready') | list | length == 1
+        fail_msg: "The read-only preflight report does not authorize Gods K3s setup."
+
+    - name: Require a non-empty locked cluster token before bootstrap
+      ansible.builtin.assert:
+        that:
+          - gods_k3s_token | length >= 32
+        fail_msg: "Set GODS_K3S_TOKEN from the approved secret store before first K3s installation."
+      when: not gods_node_preflight.existing_cluster.k3s_server_active
+      no_log: true
+
+    - name: Create the new Gods data root after ownership checks
+      ansible.builtin.file:
+        path: "{{ gods_data_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Write a non-secret marker that identifies this managed data root
+      ansible.builtin.copy:
+        dest: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
+        content: >-
+          {{ {
+            'schema_version': 1,
+            'owner': 'gods-mlops',
+            'data_root': gods_data_root,
+            'k3s_data_dir': gods_k3s_data_dir,
+            'k3s_version': gods_k3s_version
+          } | to_nice_json }}
+        owner: root
+        group: root
+        mode: "0644"
+        force: false
+
+    - name: Create only the explicitly allocated Gods storage directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ gods_container_uid }}"
+        group: "{{ gods_container_gid }}"
+        mode: "0770"
+      loop: "{{ gods_data_directories }}"
+      loop_control:
+        label: "{{ item.role }} ({{ item.capacity }})"
+      when: item.path not in gods_existing_data_paths
+
+    - name: Download the pinned K3s installer transport script
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /tmp/gods-mlops-k3s-install.sh
+        mode: "0700"
+        validate_certs: true
+      register: gods_k3s_installer
+      when: not gods_node_preflight.existing_cluster.k3s_server_active
+
+    - name: Install K3s with the version lock and disable public default services
+      ansible.builtin.command:
+        argv: [/tmp/gods-mlops-k3s-install.sh]
+      environment:
+        INSTALL_K3S_VERSION: "{{ gods_k3s_version }}"
+        INSTALL_K3S_EXEC: >-
+          server --node-name {{ inventory_hostname }}
+          --node-ip {{ k3s_node_ip }} --tls-san {{ k3s_node_ip }}
+          --data-dir {{ gods_k3s_data_dir }}
+          --disable=traefik --disable=servicelb --disable=local-storage
+        K3S_TOKEN: "{{ gods_k3s_token }}"
+      register: gods_k3s_server_install
+      changed_when: true
+      when: not gods_node_preflight.existing_cluster.k3s_server_active
+      no_log: true
+
+    - name: Wait for the K3s API on the control plane
+      ansible.builtin.wait_for:
+        host: "{{ k3s_node_ip }}"
+        port: 6443
+        state: started
+        timeout: 180
+
+    - name: Remove the temporary K3s installer
+      ansible.builtin.file:
+        path: /tmp/gods-mlops-k3s-install.sh
+        state: absent
+      when: not gods_node_preflight.existing_cluster.k3s_server_active
+
+    - name: Create the local generated kubeconfig directory
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/generated"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: false
+
+    - name: Fetch the Gods control-plane kubeconfig to the controller
+      ansible.builtin.fetch:
+        src: "{{ gods_k3s_data_dir }}/server/cred/admin.kubeconfig"
+        dest: "{{ playbook_dir }}/generated/kubeconfig"
+        flat: true
+        validate_checksum: true
+
+    - name: Point the private kubeconfig at the configured control-plane address
+      ansible.builtin.replace:
+        path: "{{ playbook_dir }}/generated/kubeconfig"
+        regexp: "https://127\\.0\\.0\\.1:6443"
+        replace: "https://{{ k3s_node_ip }}:6443"
+      delegate_to: localhost
+      become: false
+
+    - name: Restrict the generated kubeconfig permissions
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/generated/kubeconfig"
+        state: file
+        mode: "0600"
+      delegate_to: localhost
+      become: false
+      no_log: true
+
+- name: Join the ubuntu A6000 worker to the prepared Gods control plane
+  hosts: gods_gpu_worker
+  gather_facts: true
+  become: true
+  vars:
+    gods_versions_lock_document: >-
+      {{ lookup('ansible.builtin.file', playbook_dir ~ '/../versions.lock.yaml') | from_yaml }}
+    gods_k3s_version: "{{ gods_versions_lock_document.platform.k3s }}"
+    gods_preflight_report: >-
+      {{ lookup('ansible.builtin.file', playbook_dir ~ '/artifacts/preflight.json') | from_json }}
+    gods_k3s_token: "{{ lookup('ansible.builtin.env', 'GODS_K3S_TOKEN') }}"
+    gods_server_host: "{{ groups['gods_server'][0] }}"
+    gods_server_url: "https://{{ hostvars[groups['gods_server'][0]].k3s_node_ip }}:6443"
+    gods_node_preflight: >-
+      {{ gods_preflight_report.nodes | selectattr('node', 'equalto', inventory_hostname) | first }}
+    gods_existing_data_paths: >-
+      {{ gods_node_preflight.storage.planned_data_directories | selectattr('exists') | map(attribute='path') | list }}
+  tasks:
+    - name: Require ready preflight evidence for the A6000 host
+      ansible.builtin.assert:
+        that:
+          - gods_preflight_report.status == 'ready'
+          - gods_preflight_report.nodes | selectattr('node', 'equalto', inventory_hostname) | selectattr('status', 'equalto', 'ready') | list | length == 1
+        fail_msg: "The read-only preflight report does not authorize Gods worker setup."
+
+    - name: Require a non-empty locked cluster token before joining
+      ansible.builtin.assert:
+        that:
+          - gods_k3s_token | length >= 32
+        fail_msg: "Set GODS_K3S_TOKEN from the approved secret store before joining K3s."
+      when: not gods_node_preflight.existing_cluster.k3s_agent_active
+      no_log: true
+
+    - name: Create the new Gods data root after ownership checks
+      ansible.builtin.file:
+        path: "{{ gods_data_root }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Write a non-secret marker that identifies this managed data root
+      ansible.builtin.copy:
+        dest: "{{ gods_data_root }}/{{ gods_owner_marker_name }}"
+        content: >-
+          {{ {
+            'schema_version': 1,
+            'owner': 'gods-mlops',
+            'data_root': gods_data_root,
+            'k3s_data_dir': gods_k3s_data_dir,
+            'k3s_version': gods_k3s_version
+          } | to_nice_json }}
+        owner: root
+        group: root
+        mode: "0644"
+        force: false
+
+    - name: Create only the explicitly allocated Gods storage directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ gods_container_uid }}"
+        group: "{{ gods_container_gid }}"
+        mode: "0770"
+      loop: "{{ gods_data_directories }}"
+      loop_control:
+        label: "{{ item.role }} ({{ item.capacity }})"
+      when: item.path not in gods_existing_data_paths
+
+    - name: Download the pinned K3s installer transport script
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /tmp/gods-mlops-k3s-install.sh
+        mode: "0700"
+        validate_certs: true
+      when: not gods_node_preflight.existing_cluster.k3s_agent_active
+
+    - name: Join K3s using the exact server and version from the inventory and lock
+      ansible.builtin.command:
+        argv: [/tmp/gods-mlops-k3s-install.sh]
+      environment:
+        INSTALL_K3S_VERSION: "{{ gods_k3s_version }}"
+        INSTALL_K3S_EXEC: >-
+          agent --node-name {{ inventory_hostname }}
+          --node-ip {{ k3s_node_ip }} --data-dir {{ gods_k3s_data_dir }}
+        K3S_URL: "{{ gods_server_url }}"
+        K3S_TOKEN: "{{ gods_k3s_token }}"
+      register: gods_k3s_agent_install
+      changed_when: true
+      when: not gods_node_preflight.existing_cluster.k3s_agent_active
+      no_log: true
+
+    - name: Wait for the K3s agent service to be active
+      ansible.builtin.command:
+        argv: [systemctl, is-active, k3s-agent]
+      register: gods_k3s_agent_status
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: gods_k3s_agent_status.stdout | trim == 'active'
+      when: not gods_node_preflight.existing_cluster.k3s_agent_active
+
+    - name: Remove the temporary K3s installer
+      ansible.builtin.file:
+        path: /tmp/gods-mlops-k3s-install.sh
+        state: absent
+      when: not gods_node_preflight.existing_cluster.k3s_agent_active

@@ -1,0 +1,84 @@
+all:
+  vars:
+    ansible_user: jayn2u
+    ansible_ssh_common_args: "-o BatchMode=yes"
+    gods_k3s_data_dir_name: k3s
+    gods_owner_marker_name: .gods-mlops-owner.json
+    gods_container_uid: 10001
+    gods_container_gid: 10001
+    gods_network_flows:
+      - name: K3s API
+        protocol: tcp
+        port: 6443
+        source: 203.253.21.179/32
+        destination: 203.253.25.54/32
+        interface: ubuntu eno3; vis-lab target interface is recorded by preflight
+      - name: K3s Flannel VXLAN
+        protocol: udp
+        port: 8472
+        source: 203.253.21.179/32 and 203.253.25.54/32
+        destination: peer K3s node address
+        interface: interface selected by each node's ip route get result
+      - name: Kubelet API for control-plane operations
+        protocol: tcp
+        port: 10250
+        source: 203.253.25.54/32
+        destination: 203.253.21.179/32
+        interface: target interface selected by vis-lab ip route get
+  children:
+    gods_server:
+      hosts:
+        vis-lab:
+          ansible_host: 203.253.25.54
+          k3s_node_ip: 203.253.25.54
+          gods_peer_ip: 203.253.21.179
+          gods_k3s_data_dir: "{{ gods_data_root }}/{{ gods_k3s_data_dir_name }}"
+          gods_storage_mount: /mnt/data
+          gods_data_root: /mnt/data/gods-mlops
+          gods_min_free_gib: 50
+          gods_data_directories:
+            - path: /mnt/data/gods-mlops/spool
+              capacity: 20Gi
+              role: spool
+          gods_preserve_paths:
+            - /mnt/data/minio-code
+            - /mnt/data/minio-data
+            - /mnt/data/labclip-cache
+            - /mnt/data/labclip-k3s
+          gods_preserve_patterns: []
+          gods_preserve_services: []
+    gods_gpu_worker:
+      hosts:
+        ubuntu:
+          ansible_host: jayn2u-179-pub-vis
+          k3s_node_ip: 203.253.21.179
+          gods_peer_ip: 203.253.25.54
+          gods_k3s_data_dir: "{{ gods_data_root }}/{{ gods_k3s_data_dir_name }}"
+          gods_storage_mount: /data
+          gods_data_root: /data/jayn2u/gods-mlops
+          gods_min_free_gib: 1024
+          gods_gpu_model: NVIDIA RTX A6000
+          gods_data_directories:
+            - path: /data/jayn2u/gods-mlops/objects
+              capacity: 1Ti
+              role: objects
+            - path: /data/jayn2u/gods-mlops/cache
+              capacity: 200Gi
+              role: cache
+            - path: /data/jayn2u/gods-mlops/metadata
+              capacity: 50Gi
+              role: metadata
+          gods_preserve_paths:
+            - /data/jayn2u/minio
+            - /data/jayn2u/minio-data
+            - /data/jayn2u/labclip-cache
+            - /data/jayn2u/labclip-k3s
+          gods_preserve_patterns:
+            - /data/docker/volumes/rtsp-video-loop_*
+          gods_preserve_services:
+            - rtsp-video-loop-app-1
+            - rtsp-video-loop-mediamtx-1
+    gods_cluster:
+      children:
+        gods_server:
+        gods_gpu_worker:

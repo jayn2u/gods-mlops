@@ -1,0 +1,166 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gods-mlops-local-retain
+  labels:
+    gods.io/managed-storage: "true"
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+allowVolumeExpansion: false
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gods-mlops-objects
+  labels:
+    gods.io/managed-storage: "true"
+    gods.io/pv: gods-mlops-objects
+spec:
+  capacity:
+    storage: 1Ti
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gods-mlops-local-retain
+  volumeMode: Filesystem
+  local:
+    path: /data/jayn2u/gods-mlops/objects
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [ubuntu]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gods-mlops-cache
+  labels:
+    gods.io/managed-storage: "true"
+    gods.io/pv: gods-mlops-cache
+spec:
+  capacity:
+    storage: 200Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gods-mlops-local-retain
+  volumeMode: Filesystem
+  local:
+    path: /data/jayn2u/gods-mlops/cache
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [ubuntu]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gods-mlops-metadata
+  labels:
+    gods.io/managed-storage: "true"
+    gods.io/pv: gods-mlops-metadata
+spec:
+  capacity:
+    storage: 50Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gods-mlops-local-retain
+  volumeMode: Filesystem
+  local:
+    path: /data/jayn2u/gods-mlops/metadata
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [ubuntu]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: gods-mlops-spool
+  labels:
+    gods.io/managed-storage: "true"
+    gods.io/pv: gods-mlops-spool
+spec:
+  capacity:
+    storage: 20Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gods-mlops-local-retain
+  volumeMode: Filesystem
+  local:
+    path: /mnt/data/gods-mlops/spool
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [vis-lab]
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gods-mlops-objects
+  namespace: gods-mlops
+  labels:
+    gods.io/managed-storage: "true"
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: gods-mlops-local-retain
+  volumeName: gods-mlops-objects
+  resources:
+    requests:
+      storage: 1Ti
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gods-mlops-cache
+  namespace: gods-mlops
+  labels:
+    gods.io/managed-storage: "true"
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: gods-mlops-local-retain
+  volumeName: gods-mlops-cache
+  resources:
+    requests:
+      storage: 200Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gods-mlops-metadata
+  namespace: gods-mlops
+  labels:
+    gods.io/managed-storage: "true"
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: gods-mlops-local-retain
+  volumeName: gods-mlops-metadata
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gods-mlops-spool
+  namespace: gods-mlops
+  labels:
+    gods.io/managed-storage: "true"
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: gods-mlops-local-retain
+  volumeName: gods-mlops-spool
+  resources:
+    requests:
+      storage: 20Gi
