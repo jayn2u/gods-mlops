@@ -1,0 +1,57 @@
+name: Notify gods-system of develop updates
+
+on:
+  push:
+    branches:
+      - develop
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    if: ${{ github.event.deleted == false }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Create gods-system dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.SUBMODULE_SYNC_APP_ID }}
+          private-key: ${{ secrets.SUBMODULE_SYNC_APP_PRIVATE_KEY }}
+          owner: jayn2u
+          repositories: gods-system
+          permission-contents: write
+
+      - name: Prepare dispatch payload
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
+          payload = {
+              "event_type": "submodule-develop-updated",
+              "client_payload": {
+                  "repository": event["repository"]["full_name"],
+                  "ref": event["ref"],
+                  "sha": event["after"],
+                  "run_url": (
+                      f"{os.environ['GITHUB_SERVER_URL']}/"
+                      f"{os.environ['GITHUB_REPOSITORY']}/actions/runs/"
+                      f"{os.environ['GITHUB_RUN_ID']}"
+                  ),
+              },
+          }
+          path = Path(os.environ["RUNNER_TEMP"]) / "dispatch.json"
+          path.write_text(json.dumps(payload))
+          PY
+
+      - name: Dispatch to gods-system
+        env:
+          GH_TOKEN: ${{ steps.dispatch-token.outputs.token }}
+          DISPATCH_PAYLOAD_PATH: ${{ runner.temp }}/dispatch.json
+        run: gh api --method POST repos/jayn2u/gods-system/dispatches --input "$DISPATCH_PAYLOAD_PATH"
