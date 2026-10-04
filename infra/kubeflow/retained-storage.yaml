@@ -152,6 +152,34 @@ spec:
 apiVersion: v1
 kind: PersistentVolume
 metadata:
+  name: gods-mlops-ingestion-postgres
+  labels:
+    gods.io/managed-storage: "true"
+    gods.io/recovery-kind: database
+    gods.io/pv: gods-mlops-ingestion-postgres
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gods-mlops-local-retain
+  volumeMode: Filesystem
+  claimRef:
+    namespace: gods-mlops
+    name: gods-mlops-ingestion-postgres
+  local:
+    path: /data/jayn2u/gods-mlops/metadata/ingestion-postgres
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [ubuntu]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
   name: gods-mlops-katib-mysql
   labels:
     gods.io/managed-storage: "true"
@@ -320,3 +348,18 @@ spec:
   resources:
     requests:
       storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gods-mlops-ingestion-postgres
+  namespace: gods-mlops
+  labels:
+    gods.io/managed-storage: "true"
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: gods-mlops-local-retain
+  volumeName: gods-mlops-ingestion-postgres
+  resources:
+    requests:
+      storage: 10Gi

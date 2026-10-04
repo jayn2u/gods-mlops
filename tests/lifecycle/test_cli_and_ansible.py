@@ -28,8 +28,9 @@ def test_repository_inventory_includes_external_model_staging_and_data_roots() -
         "gods-mlops-katib-mysql",
         "gods-mlops-model-catalog-postgres",
         "gods-mlops-kfp-mysql",
+        "gods-mlops-ingestion-postgres",
     }
-    assert len(inventory["required_retained_paths"]) == 9
+    assert len(inventory["required_retained_paths"]) == 10
 
 
 def test_purge_without_exact_confirmation_is_only_a_dry_run(

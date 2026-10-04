@@ -99,6 +99,7 @@ output "retained_claim_names" {
     "gods-mlops-cache",
     "gods-mlops-metadata",
     "gods-mlops-spool",
+    "gods-mlops-ingestion-postgres",
   ]
 }
 

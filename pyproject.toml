@@ -4,20 +4,26 @@ version = "0.1.0"
 description = "Reproducible preparation tools for the Gods Kubeflow MLOps platform."
 requires-python = ">=3.12,<3.13"
 dependencies = [
+    "asyncpg==0.30.0",
+    "boto3==1.40.53",
+    "fastapi==0.116.1",
     "huggingface-hub==0.36.2",
     "numpy==2.3.3",
     "pillow==12.0.0",
     "pycocotools==2.0.11",
+    "python-multipart==0.0.20",
     "pyyaml==6.0.3",
     "safetensors==0.7.0",
     "torch==2.12.0",
     "torchvision==0.27.0",
     "transformers==4.57.1",
+    "uvicorn==0.35.0",
 ]
 
 [project.scripts]
 gods-mlops = "gods_mlops.cli:main"
 gods-mlops-training-preflight = "gods_mlops.cli:training_preflight_main"
+gods-mlops-ingestion-api = "gods_mlops.ingestion.app:main"
 
 [dependency-groups]
 dev = ["pytest==8.4.2"]

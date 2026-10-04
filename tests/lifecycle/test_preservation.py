@@ -30,9 +30,21 @@ def _inventory() -> dict:
         ],
         "protected_patterns": ["/data/docker/volumes/rtsp-video-loop_*"],
         "protected_services": ["rtsp-video-loop-app-1", "rtsp-video-loop-mediamtx-1"],
-        "required_retained_paths": ["gods-mlops-objects", "gods-mlops-metadata-postgres"],
-        "required_database_restores": ["gods-mlops-metadata-postgres"],
-        "required_credentials": ["gods-k3s-token", "kubeflow-dex-operator"],
+        "required_retained_paths": [
+            "gods-mlops-objects",
+            "gods-mlops-metadata-postgres",
+            "gods-mlops-ingestion-postgres",
+        ],
+        "required_database_restores": [
+            "gods-mlops-metadata-postgres",
+            "gods-mlops-ingestion-postgres",
+        ],
+        "required_credentials": [
+            "gods-k3s-token",
+            "gods-ingestion-port-forward-kubeconfig",
+            "kubeflow-dex-operator",
+            "gods-sample-ingestion-credentials",
+        ],
         "nodes": [
             {
                 "name": "vis-lab",
@@ -56,7 +68,11 @@ def _inventory() -> dict:
                 "service": "k3s-agent",
                 "ownership": {"owner": "gods-mlops"},
                 "managed_paths": [
-                    {"id": "gods-mlops-objects", "path": "/data/jayn2u/gods-mlops/objects"}
+                    {"id": "gods-mlops-objects", "path": "/data/jayn2u/gods-mlops/objects"},
+                    {
+                        "id": "gods-mlops-ingestion-postgres",
+                        "path": "/data/jayn2u/gods-mlops/metadata/ingestion-postgres",
+                    },
                 ],
                 "completion": {"plan_id": None, "steps": []},
             },
@@ -86,6 +102,17 @@ def _retained_manifest(tmp_path: Path) -> dict:
     dump_hash = canonical_database_dump_sha256(source_dump, dump_format=dump_format)
     source_dump.chmod(0o600)
     restored_dump.chmod(0o600)
+
+    source_ingestion_dump = tmp_path / "backup" / "ingestion-metadata.sql"
+    restored_ingestion_dump = tmp_path / "restore-check" / "ingestion-metadata.sql"
+    _write(source_ingestion_dump, b"canonical ingestion pg_dump bytes")
+    _write(restored_ingestion_dump, b"canonical ingestion pg_dump bytes")
+    ingestion_dump_hash = canonical_database_dump_sha256(
+        source_ingestion_dump,
+        dump_format=dump_format,
+    )
+    source_ingestion_dump.chmod(0o600)
+    restored_ingestion_dump.chmod(0o600)
 
     credential = tmp_path / "secrets" / "dex-operator"
     credential_hash = _write(credential, b"never include this in output")
@@ -125,7 +152,25 @@ def _retained_manifest(tmp_path: Path) -> dict:
                 },
                 "expected_uid": uid,
                 "expected_mode": "0600",
-            }
+            },
+            {
+                "id": "gods-mlops-ingestion-postgres",
+                "backup_dump_path": str(source_ingestion_dump),
+                "restored_dump_path": str(restored_ingestion_dump),
+                "expected_sha256": ingestion_dump_hash,
+                "dump_format": dump_format,
+                "provenance": {
+                    "backup_tool": "pg_dump",
+                    "backup_tool_version": "17.4",
+                    "restore_tool": "psql",
+                    "restore_tool_version": "17.4",
+                    "redump_tool": "pg_dump",
+                    "redump_tool_version": "17.4",
+                    "options": ["--format=plain", "--column-inserts", "--rows-per-insert=1", "--no-owner", "--no-acl"],
+                },
+                "expected_uid": uid,
+                "expected_mode": "0600",
+            },
         ],
         "credentials": [
             {
@@ -136,7 +181,21 @@ def _retained_manifest(tmp_path: Path) -> dict:
                 "expected_mode": "0600",
             },
             {
+                "id": "gods-ingestion-port-forward-kubeconfig",
+                "path": str(credential),
+                "expected_sha256": credential_hash,
+                "expected_uid": uid,
+                "expected_mode": "0600",
+            },
+            {
                 "id": "kubeflow-dex-operator",
+                "path": str(credential),
+                "expected_sha256": credential_hash,
+                "expected_uid": uid,
+                "expected_mode": "0600",
+            },
+            {
+                "id": "gods-sample-ingestion-credentials",
                 "path": str(credential),
                 "expected_sha256": credential_hash,
                 "expected_uid": uid,
@@ -226,8 +285,13 @@ def test_verify_retained_checks_content_ownership_restore_and_secret_permissions
     manifest = _retained_manifest(tmp_path)
     required = {
         "retained_paths": ["gods-mlops-objects"],
-        "database_restores": ["gods-mlops-metadata-postgres"],
-        "credentials": ["gods-k3s-token", "kubeflow-dex-operator"],
+        "database_restores": ["gods-mlops-metadata-postgres", "gods-mlops-ingestion-postgres"],
+        "credentials": [
+            "gods-k3s-token",
+            "gods-ingestion-port-forward-kubeconfig",
+            "kubeflow-dex-operator",
+            "gods-sample-ingestion-credentials",
+        ],
     }
 
     result = verify_retained(manifest, requirements=required)
@@ -456,8 +520,13 @@ def test_pre_stop_recovery_gate_hashes_the_backup_but_checks_live_source_ownersh
     (source / "sample.bin").write_bytes(b"live database has changed before quiescence")
     required = {
         "retained_paths": ["gods-mlops-objects"],
-        "database_restores": ["gods-mlops-metadata-postgres"],
-        "credentials": ["gods-k3s-token", "kubeflow-dex-operator"],
+        "database_restores": ["gods-mlops-metadata-postgres", "gods-mlops-ingestion-postgres"],
+        "credentials": [
+            "gods-k3s-token",
+            "gods-ingestion-port-forward-kubeconfig",
+            "kubeflow-dex-operator",
+            "gods-sample-ingestion-credentials",
+        ],
     }
 
     pre_stop = verify_recovery_artifacts(manifest, requirements=required)
@@ -477,8 +546,13 @@ def test_live_database_path_uses_logical_restore_evidence_then_cold_hash(tmp_pat
     (Path(database_path["source_path"]) / "sample.bin").write_bytes(b"changed while database was live")
     required = {
         "retained_paths": ["gods-mlops-katib-mysql"],
-        "database_restores": ["gods-mlops-metadata-postgres"],
-        "credentials": ["gods-k3s-token", "kubeflow-dex-operator"],
+        "database_restores": ["gods-mlops-metadata-postgres", "gods-mlops-ingestion-postgres"],
+        "credentials": [
+            "gods-k3s-token",
+            "gods-ingestion-port-forward-kubeconfig",
+            "kubeflow-dex-operator",
+            "gods-sample-ingestion-credentials",
+        ],
     }
 
     pre_stop = verify_recovery_artifacts(manifest, requirements=required)
@@ -514,8 +588,18 @@ def test_verify_retained_requires_coverage_for_every_inventory_item(tmp_path: Pa
         manifest,
         requirements={
             "retained_paths": ["gods-mlops-objects", "gods-mlops-katib-mysql"],
-            "database_restores": ["gods-mlops-metadata-postgres", "gods-mlops-katib-mysql"],
-            "credentials": ["gods-k3s-token", "kubeflow-dex-operator", "s3-credentials"],
+            "database_restores": [
+                "gods-mlops-metadata-postgres",
+                "gods-mlops-ingestion-postgres",
+                "gods-mlops-katib-mysql",
+            ],
+            "credentials": [
+                "gods-k3s-token",
+                "gods-ingestion-port-forward-kubeconfig",
+                "kubeflow-dex-operator",
+                "gods-sample-ingestion-credentials",
+                "s3-credentials",
+            ],
         },
     )
 

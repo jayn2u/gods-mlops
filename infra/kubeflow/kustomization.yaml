@@ -5,6 +5,7 @@ resources:
   - github.com/kubeflow/community-distribution/example?ref=f09f3eeaa25cc852665f460497a42b7fc68639ac
   - gpu-placement-policy.yaml
   - retained-storage.yaml
+  - ingestion
 
 patches:
   - target:

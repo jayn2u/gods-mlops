@@ -41,6 +41,7 @@ all:
           gods_recovery_root: /mnt/data/gods-mlops-recovery
           gods_recovery_credential_ids:
             - gods-k3s-token
+            - gods-ingestion-port-forward-kubeconfig
           gods_min_free_gib: 50
           gods_data_directories:
             - path: /mnt/data/gods-mlops-runtime/spool
@@ -69,6 +70,7 @@ all:
             - kubeflow-dex-operator
             - gods-object-store-credentials
             - gods-database-credentials
+            - gods-sample-ingestion-credentials
           gods_min_free_gib: 1024
           gods_gpu_model: NVIDIA RTX A6000
           gods_data_directories:
@@ -81,6 +83,9 @@ all:
             - path: /data/jayn2u/gods-mlops/metadata/platform
               capacity: 50Gi
               role: metadata-platform
+            - path: /data/jayn2u/gods-mlops/metadata/ingestion-postgres
+              capacity: 10Gi
+              role: metadata-ingestion-postgres
             - path: /data/jayn2u/gods-mlops/metadata/kubeflow-user/gods-mlops/metadata-postgres
               capacity: 10Gi
               role: metadata-postgres

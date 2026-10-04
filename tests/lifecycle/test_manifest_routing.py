@@ -93,9 +93,12 @@ def test_manifest_routes_each_source_backup_and_restore_check_to_its_owning_node
         "gods-mlops-spool",
     }
     assert not vislab_slice["database_restores"]
-    assert {item["id"] for item in vislab_slice["credentials"]} == {"gods-k3s-token"}
-    assert len(ubuntu_slice["database_restores"]) == 4
-    assert len(ubuntu_slice["credentials"]) == 3
+    assert {item["id"] for item in vislab_slice["credentials"]} == {
+        "gods-k3s-token",
+        "gods-ingestion-port-forward-kubeconfig",
+    }
+    assert len(ubuntu_slice["database_restores"]) == 5
+    assert len(ubuntu_slice["credentials"]) == 4
     assert all(item["node"] == "ubuntu" for item in ubuntu_slice["retained_paths"])
 
 

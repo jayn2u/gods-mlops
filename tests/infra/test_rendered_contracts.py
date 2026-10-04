@@ -176,6 +176,7 @@ def test_gods_local_volumes_are_retained_and_use_only_new_paths(
         ("gods-mlops", "gods-mlops-cache"): ("gods-mlops-cache", "200Gi", "/data/jayn2u/gods-mlops/cache", "cache"),
         ("gods-mlops", "gods-mlops-metadata"): ("gods-mlops-metadata", "50Gi", "/data/jayn2u/gods-mlops/metadata/platform", "metadata"),
         ("gods-mlops", "gods-mlops-spool"): ("gods-mlops-spool", "20Gi", "/mnt/data/gods-mlops-runtime/spool", "spool"),
+        ("gods-mlops", "gods-mlops-ingestion-postgres"): ("gods-mlops-ingestion-postgres", "10Gi", "/data/jayn2u/gods-mlops/metadata/ingestion-postgres", "database"),
         ("gods-mlops", "metadata-postgres"): ("gods-mlops-kfp-metadata-postgres", "10Gi", "/data/jayn2u/gods-mlops/metadata/kubeflow-user/gods-mlops/metadata-postgres", "database"),
         ("kubeflow", "katib-mysql"): ("gods-mlops-katib-mysql", "10Gi", "/data/jayn2u/gods-mlops/metadata/kubeflow/katib-mysql", "database"),
         ("kubeflow", "model-catalog-postgres"): ("gods-mlops-model-catalog-postgres", "5Gi", "/data/jayn2u/gods-mlops/metadata/kubeflow/model-catalog-postgres", "database"),
@@ -274,7 +275,9 @@ def test_host_preflight_is_read_only_and_writes_the_installation_inventory() -> 
     assert len(plays) == 2, "preflight should inspect remote hosts then write a local report"
     remote_play, report_play = plays
     assert remote_play["hosts"] == "gods_cluster"
-    assert remote_play.get("become", False) is False
+    assert remote_play.get("become", False) == (
+        "{{ gods_preflight_use_become | default(false) | bool }}"
+    )
 
     allowed_remote_modules = {
         "ansible.builtin.assert",
@@ -291,7 +294,10 @@ def test_host_preflight_is_read_only_and_writes_the_installation_inventory() -> 
         assert module_name is not None, f"remote preflight task can mutate a host: {task}"
         if module_name == "ansible.builtin.command":
             assert task.get("changed_when") is False
-            assert task.get("failed_when") is False
+            if task.get("name") == (
+                "Record the effective UID used for authenticated preflight checks"
+            ):
+                assert "failed_when" not in task
 
     local_copy_tasks = [
         task

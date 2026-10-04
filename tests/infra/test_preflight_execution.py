@@ -510,7 +510,7 @@ def test_purge_requires_plan_bound_cold_state_and_current_quiescence(
     if state_present:
         required_by_node = load_inventory(REPO_ROOT / "infra" / "ansible" / "inventory.example.yml")["requirements_by_node"]
         assert len(required_by_node["vis-lab"]["retained_paths"]) == 1
-        assert len(required_by_node["ubuntu"]["retained_paths"]) == 8
+        assert len(required_by_node["ubuntu"]["retained_paths"]) == 9
         state = {
             "schema_version": 1,
             "owner": "gods-mlops",

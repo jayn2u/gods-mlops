@@ -1,0 +1,17 @@
+[Unit]
+Description=Local-only port forward to the Gods MLOps sample receiver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=KUBECONFIG=%h/.kube/gods-mlops.yaml
+ExecStart=/usr/bin/kubectl --kubeconfig=%h/.kube/gods-mlops.yaml --namespace gods-mlops port-forward --address 127.0.0.1 service/gods-mlops-ingestion 18081:8080
+Restart=on-failure
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

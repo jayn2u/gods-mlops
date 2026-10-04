@@ -54,3 +54,10 @@ images:
     digest: sha256:afcc516a22775a39d0d66f4c2ddc95d01be3e3d3862b21fcf4f9de34b4ad4e12
     license: Apache-2.0
     source_repository: https://github.com/HumanSignal/label-studio/tree/1.23.2
+
+  - name: ingestion-postgres-base
+    source: docker.io/pgvector/pgvector
+    tag: 0.8.1-pg17
+    digest: sha256:3e8b3adfd27b5707128f60956f62a793c3c9326ea8cfaf0eab7adccb5d700b21
+    license: PostgreSQL
+    source_repository: https://github.com/pgvector/pgvector/tree/v0.8.1
