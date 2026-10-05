@@ -44,6 +44,14 @@ async def invalidate_sample_in_repository(publisher: Any, sample_id: str) -> dic
                     "block_training": False,
                     "block_evaluation": False,
                 }
+            await connection.execute(
+                """
+                INSERT INTO dataset_source_invalidations (sample_id, reason)
+                VALUES ($1, 'sample_explicitly_invalidated')
+                ON CONFLICT (sample_id) DO NOTHING
+                """,
+                sample_uuid,
+            )
             versions = await connection.fetch(
                 """
                 SELECT version.dataset_version, version.state,
@@ -62,8 +70,8 @@ async def invalidate_sample_in_repository(publisher: Any, sample_id: str) -> dic
                     "sample_id": str(sample_uuid),
                     "datasets": [],
                     "models": [],
-                    "block_training": False,
-                    "block_evaluation": False,
+                    "block_training": True,
+                    "block_evaluation": True,
                 }
             model_rows = await connection.fetch(
                 """
@@ -89,7 +97,7 @@ async def invalidate_sample_in_repository(publisher: Any, sample_id: str) -> dic
                 SELECT lineage.model_id, lineage.dataset_version, $2, 'source_sample_explicitly_invalidated'
                 FROM dataset_model_lineage AS lineage
                 WHERE lineage.dataset_version = ANY($1::text[])
-                ON CONFLICT (model_id, dataset_version, sample_id) DO NOTHING
+                ON CONFLICT DO NOTHING
                 """,
                 version_ids,
                 sample_uuid,

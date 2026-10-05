@@ -38,6 +38,7 @@ _MIGRATIONS = (
     (9, "0009_crop_expiry_reconciliation.sql"),
     (10, "0010_relevance_review_dependencies.sql"),
     (11, "0011_immutable_datasets.sql"),
+    (12, "0012_dataset_authority_and_invalidations.sql"),
 )
 _MIGRATION_RESOURCES = files("gods_mlops.migrations")
 

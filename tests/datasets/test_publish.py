@@ -122,7 +122,13 @@ def _settings() -> dict[str, str] | None:
     return values if all(values.values()) else None
 
 
-def _seed_sources(*, target: str, count_per_day: int = 20) -> tuple[list[dict], PostgresAnnotationRepository]:
+def _seed_sources(
+    *,
+    target: str,
+    count_per_day: int = 20,
+    capture_days: tuple[int, ...] = (1, 2, 3),
+    camera_id: UUID | None = None,
+) -> tuple[list[dict], PostgresAnnotationRepository]:
     settings = _settings()
     if settings is None:
         pytest.skip("isolated PostgreSQL and S3 test endpoints are not configured")
@@ -141,20 +147,20 @@ def _seed_sources(*, target: str, count_per_day: int = 20) -> tuple[list[dict], 
             bucket=settings["GODS_MLOPS_TEST_S3_BUCKET"],
             region="us-east-1",
         )
-        camera_id = uuid4()
+        source_camera_id = camera_id or uuid4()
         task_base = uuid4().int % 100_000_000
         now = datetime.now(timezone.utc)
         records: list[dict] = []
         accounted_bytes = 0
         connection = await asyncpg.connect(database_url)
         try:
-            for day in range(1, 4):
+            for day in capture_days:
                 for offset in range(count_per_day):
                     index = (day - 1) * count_per_day + offset
                     sample_id = uuid4()
                     frame_bytes = _jpeg(index)
                     frame_sha = hashlib.sha256(frame_bytes).hexdigest()
-                    frame_key = f"samples/{camera_id}/{sample_id}/{frame_sha}.jpg"
+                    frame_key = f"samples/{source_camera_id}/{sample_id}/{frame_sha}.jpg"
                     objects.ensure_object(
                         object_key=frame_key,
                         image=frame_bytes,
@@ -173,7 +179,7 @@ def _seed_sources(*, target: str, count_per_day: int = 20) -> tuple[list[dict], 
                                   $6, $7, $8, 'received', FALSE, $4, $9)
                         """,
                         sample_id,
-                        camera_id,
+                        source_camera_id,
                         date(2026, 10, day),
                         captured_at,
                         frame_sha,
@@ -253,7 +259,7 @@ def _seed_sources(*, target: str, count_per_day: int = 20) -> tuple[list[dict], 
 
                     record = {
                         "sample_id": str(sample_id),
-                        "camera_id": str(camera_id),
+                        "camera_id": str(source_camera_id),
                         "capture_day": date(2026, 10, day),
                         "captured_at_utc": captured_at,
                         "frame_object_key": frame_key,
@@ -501,6 +507,14 @@ def test_publish_is_retryable_without_double_count_and_deletion_keeps_manifest_h
             blocked_again = await publisher.publish_dataset(late_selection, "config-v1")
             assert blocked_again == blocked
             assert await ingestion.storage_bytes() == reserved_bytes
+            await publisher.register_model_lineage(
+                model_id="model-registered-after-leak",
+                dataset_version=published["dataset_version"],
+            )
+            await publisher.register_model_lineage(
+                model_id="model-registered-after-leak",
+                dataset_version=published["dataset_version"],
+            )
 
             connection = await asyncpg.connect(settings["GODS_MLOPS_TEST_DATABASE_URL"])
             try:
@@ -516,6 +530,13 @@ def test_publish_is_retryable_without_double_count_and_deletion_keeps_manifest_h
                 ).hexdigest()
                 leak_count = await connection.fetchval(
                     "SELECT count(*) FROM dataset_split_leakage_impacts WHERE input_sha256 = $1",
+                    input_sha,
+                )
+                leak_sample_count = await connection.fetchval(
+                    """
+                    SELECT jsonb_array_length(sample_ids)
+                    FROM dataset_split_leakage_impacts WHERE input_sha256 = $1
+                    """,
                     input_sha,
                 )
                 row = await connection.fetchrow(
@@ -537,10 +558,19 @@ def test_publish_is_retryable_without_double_count_and_deletion_keeps_manifest_h
                     """,
                     published["dataset_version"],
                 )
+                late_model_impact_count = await connection.fetchval(
+                    """
+                    SELECT count(*) FROM dataset_model_impacts
+                    WHERE model_id = 'model-registered-after-leak'
+                      AND dataset_version = $1 AND reason = 'evaluation_split_leakage'
+                    """,
+                    published["dataset_version"],
+                )
                 assert current_splits == prior_splits
                 assert leak_count == 1
                 assert overlay_count == 1
                 assert model_leak_count >= 1
+                assert late_model_impact_count == leak_sample_count
                 assert row["state"] == "published"
                 assert row["training_ready"] is True
                 assert row["evaluation_eligible"] is False
@@ -552,9 +582,24 @@ def test_publish_is_retryable_without_double_count_and_deletion_keeps_manifest_h
             sample_id = records[0]["sample_id"]
             impact = await publisher.invalidate_sample(sample_id)
             assert published["dataset_version"] in impact["datasets"]
-            assert impact["models"] == ["task7-model-registration-seam"]
+            assert impact["models"] == [
+                "model-registered-after-leak",
+                "task7-model-registration-seam",
+            ]
             assert impact["block_training"] is True
             assert impact["block_evaluation"] is True
+            late_deleted_model = await publisher.register_model_lineage(
+                model_id="model-registered-after-deletion",
+                dataset_version=published["dataset_version"],
+            )
+            assert late_deleted_model["training_eligible"] is False
+            assert late_deleted_model["evaluation_eligible"] is False
+            deletion_impacts = [
+                impact
+                for impact in late_deleted_model["impacts"]
+                if impact["reason"] == "source_sample_explicitly_invalidated"
+            ]
+            assert [impact["sample_id"] for impact in deletion_impacts] == [sample_id]
             after_invalidation = await publisher.publish_dataset(selection, "config-v1")
             assert after_invalidation["state"] == "invalidated"
             assert after_invalidation["manifest_hash"] == published["manifest_hash"]
@@ -718,6 +763,326 @@ def test_new_caption_revision_gets_new_version_and_old_selection_keeps_its_manif
         finally:
             await publisher.close()
             await ingestion.close()
+            await annotations.close()
+
+    asyncio.run(exercise())
+
+
+def test_new_camera_after_authority_gets_no_new_test_assignments() -> None:
+    settings = _settings()
+    if settings is None:
+        pytest.skip("isolated PostgreSQL and S3 test endpoints are not configured")
+    module = _module("gods_mlops.datasets.publish")
+    established, established_annotations = _seed_sources(target="detr")
+    new_camera, new_annotations = _seed_sources(target="detr")
+
+    async def exercise() -> None:
+        database_url = settings["GODS_MLOPS_TEST_DATABASE_URL"]
+        first = module.DatasetPublisher(database_url=database_url, objects=_make_dataset_objects(settings))
+        try:
+            assert (await first.publish_dataset(_selection(established, "detr"), "new-camera-authority-v1"))["state"] == "published"
+        finally:
+            await first.close()
+            await established_annotations.close()
+        second = module.DatasetPublisher(database_url=database_url, objects=_make_dataset_objects(settings))
+        try:
+            new_version = await second.publish_dataset(_selection(new_camera, "detr"), "new-camera-authority-v2")
+            assert new_version["state"] == "published"
+            assert new_version["training_ready"] is True
+            connection = await asyncpg.connect(database_url)
+            try:
+                splits = await connection.fetch(
+                    "SELECT split FROM dataset_sample_splits WHERE sample_id = ANY($1::uuid[])",
+                    [UUID(item["sample_id"]) for item in new_camera],
+                )
+                assert len(splits) == len(new_camera)
+                assert {row["split"] for row in splits} <= {"train", "validation"}
+            finally:
+                await connection.close()
+            assert new_version["evaluation_eligible"] is False
+        finally:
+            await second.close()
+            await new_annotations.close()
+
+    asyncio.run(exercise())
+
+
+def test_disjoint_samples_on_historical_camera_day_inherit_without_old_ids_in_selection() -> None:
+    settings = _settings()
+    if settings is None:
+        pytest.skip("isolated PostgreSQL and S3 test endpoints are not configured")
+    module = _module("gods_mlops.datasets.publish")
+    existing, existing_annotations = _seed_sources(target="detr")
+    added, added_annotations = _seed_sources(
+        target="detr", count_per_day=20, capture_days=(1,), camera_id=UUID(existing[0]["camera_id"])
+    )
+
+    async def exercise() -> None:
+        database_url = settings["GODS_MLOPS_TEST_DATABASE_URL"]
+        first = module.DatasetPublisher(database_url=database_url, objects=_make_dataset_objects(settings))
+        try:
+            assert (await first.publish_dataset(_selection(existing, "detr"), "same-day-authority-v1"))["state"] == "published"
+        finally:
+            await first.close()
+            await existing_annotations.close()
+        second = module.DatasetPublisher(database_url=database_url, objects=_make_dataset_objects(settings))
+        try:
+            # This selection contains only new sample IDs from an already assigned camera/date.
+            result = await second.publish_dataset(_selection(added, "detr"), "same-day-authority-v2")
+            assert result["state"] == "published"
+            assert result["training_ready"] is True
+            assert result["evaluation_eligible"] is False
+            connection = await asyncpg.connect(database_url)
+            try:
+                splits = await connection.fetch(
+                    "SELECT split FROM dataset_sample_splits WHERE sample_id = ANY($1::uuid[])",
+                    [UUID(item["sample_id"]) for item in added],
+                )
+                assert len(splits) == len(added)
+                assert {row["split"] for row in splits} == {"train"}
+            finally:
+                await connection.close()
+        finally:
+            await second.close()
+            await added_annotations.close()
+
+    asyncio.run(exercise())
+
+
+def test_historical_event_edge_expands_when_old_member_and_edge_are_omitted() -> None:
+    settings = _settings()
+    if settings is None:
+        pytest.skip("isolated PostgreSQL and S3 test endpoints are not configured")
+    module = _module("gods_mlops.datasets.publish")
+    camera_a, annotations_a = _seed_sources(target="detr")
+    camera_b, annotations_b = _seed_sources(target="detr")
+    event_id = "persisted-event-edge"
+    new_day, annotations_new = _seed_sources(
+        target="detr", capture_days=(4,), camera_id=UUID(camera_b[0]["camera_id"])
+    )
+
+    async def exercise() -> None:
+        database_url = settings["GODS_MLOPS_TEST_DATABASE_URL"]
+        first = module.DatasetPublisher(database_url=database_url, objects=_make_dataset_objects(settings))
+        initial = _selection(camera_a + camera_b, "detr")
+        initial["event_links"] = [
+            {"link_id": event_id, "sample_ids": [camera_a[0]["sample_id"], camera_b[0]["sample_id"]]}
+        ]
+        try:
+            version = await first.publish_dataset(initial, "event-edge-authority-v1")
+            assert version["state"] == "published"
+            base_manifest, _ = _read_manifest(settings, version["manifest_object_key"])
+            base_member_id = camera_b[0]["sample_id"]
+            base_item = next(item for item in base_manifest["items"] if item["sample_id"] == base_member_id)
+        finally:
+            await first.close()
+            await annotations_a.close()
+            await annotations_b.close()
+
+        second = module.DatasetPublisher(database_url=database_url, objects=_make_dataset_objects(settings))
+        selection = _selection(new_day, "detr")
+        # The follow-up links the new frame to A's historical member, omitting B's historical member.
+        selection["event_links"] = [
+            {"link_id": event_id, "sample_ids": [new_day[0]["sample_id"], camera_a[0]["sample_id"]]}
+        ]
+        try:
+            result = await second.publish_dataset(selection, "event-edge-authority-v2")
+            assert result["state"] == "published"
+            manifest, raw = _read_manifest(settings, result["manifest_object_key"])
+            assert hashlib.sha256(raw).hexdigest() == result["manifest_hash"]
+            new_item = next(item for item in manifest["items"] if item["sample_id"] == new_day[0]["sample_id"])
+            assert new_item["component_id"] == base_item["component_id"]
+            assert new_item["split"] == base_item["split"] == "train"
+            connection = await asyncpg.connect(database_url)
+            try:
+                assert await connection.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM dataset_group_link_members
+                        WHERE link_kind = 'event' AND link_id = $1 AND sample_id = $2
+                    )
+                    """,
+                    event_id,
+                    UUID(base_member_id),
+                ) is True
+            finally:
+                await connection.close()
+        finally:
+            await second.close()
+            await annotations_new.close()
+
+    asyncio.run(exercise())
+
+
+def test_explicit_source_invalidation_before_first_publication_is_a_durable_tombstone() -> None:
+    settings = _settings()
+    if settings is None:
+        pytest.skip("isolated PostgreSQL and S3 test endpoints are not configured")
+    module = _module("gods_mlops.datasets.publish")
+    records, annotations = _seed_sources(target="detr")
+
+    async def exercise() -> None:
+        database_url = settings["GODS_MLOPS_TEST_DATABASE_URL"]
+        publisher = module.DatasetPublisher(database_url=database_url, objects=_make_dataset_objects(settings))
+        sample_id = records[0]["sample_id"]
+        try:
+            result = await publisher.invalidate_sample(sample_id)
+            assert result["datasets"] == []
+            assert result["models"] == []
+            assert result["block_training"] is True
+            assert result["block_evaluation"] is True
+
+            for config_version in ("config-before-delete", "config-after-delete"):
+                blocked = await publisher.publish_dataset(_selection(records, "detr"), config_version)
+                assert blocked["state"] == "blocked"
+                assert "source_explicitly_invalidated" in blocked["training_reasons"]
+            connection = await asyncpg.connect(database_url)
+            try:
+                tombstone = await connection.fetchrow(
+                    "SELECT reason FROM dataset_source_invalidations WHERE sample_id = $1",
+                    UUID(sample_id),
+                )
+                assert tombstone["reason"] == "sample_explicitly_invalidated"
+                assert await connection.fetchval("SELECT count(*) FROM dataset_versions") == 0
+            finally:
+                await connection.close()
+        finally:
+            await publisher.close()
+            await annotations.close()
+
+    asyncio.run(exercise())
+
+
+def test_inflight_publication_rechecks_source_tombstone_before_ready_state() -> None:
+    settings = _settings()
+    if settings is None:
+        pytest.skip("isolated PostgreSQL and S3 test endpoints are not configured")
+    module = _module("gods_mlops.datasets.publish")
+    records, annotations = _seed_sources(target="detr")
+
+    class PauseFirstWrite(module.DatasetObjectStore):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.paused = False
+
+        def write_immutable(self, **kwargs) -> None:
+            if not self.paused:
+                self.paused = True
+                self.entered.set()
+                if not self.release.wait(timeout=15):
+                    raise TimeoutError("test did not release the dataset upload")
+            super().write_immutable(**kwargs)
+
+    async def exercise() -> None:
+        store = _make_dataset_objects(settings, PauseFirstWrite)
+        database_url = settings["GODS_MLOPS_TEST_DATABASE_URL"]
+        publisher = module.DatasetPublisher(database_url=database_url, objects=store)
+        selection = _selection(records, "detr")
+        try:
+            pending = asyncio.create_task(publisher.publish_dataset(selection, "inflight-delete-v1"))
+            assert await asyncio.to_thread(store.entered.wait, 10) is True
+            invalidation = await publisher.invalidate_sample(records[0]["sample_id"])
+            assert invalidation["block_training"] is True
+            store.release.set()
+
+            finished = await pending
+            assert finished["state"] == "invalidated"
+            assert finished["training_ready"] is False
+            assert finished["evaluation_eligible"] is False
+            assert finished["manifest_hash"] is None
+
+            changed_selection = _selection(records, "detr")
+            blocked = await publisher.publish_dataset(changed_selection, "inflight-delete-v2")
+            assert blocked["state"] == "blocked"
+            assert "source_explicitly_invalidated" in blocked["training_reasons"]
+        finally:
+            store.release.set()
+            await publisher.close()
+            await annotations.close()
+
+    asyncio.run(exercise())
+
+
+def test_late_cross_split_link_during_upload_overlay_survives_finalize() -> None:
+    settings = _settings()
+    if settings is None:
+        pytest.skip("isolated PostgreSQL and S3 test endpoints are not configured")
+    module = _module("gods_mlops.datasets.publish")
+    records, annotations = _seed_sources(target="detr")
+
+    class PauseFirstWrite(module.DatasetObjectStore):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.paused = False
+
+        def write_immutable(self, **kwargs) -> None:
+            if not self.paused:
+                self.paused = True
+                self.entered.set()
+                if not self.release.wait(timeout=15):
+                    raise TimeoutError("test did not release the pending dataset upload")
+            super().write_immutable(**kwargs)
+
+    async def exercise() -> None:
+        database_url = settings["GODS_MLOPS_TEST_DATABASE_URL"]
+        store = _make_dataset_objects(settings, PauseFirstWrite)
+        publisher = module.DatasetPublisher(database_url=database_url, objects=store)
+        other_publisher = module.DatasetPublisher(
+            database_url=database_url,
+            objects=_make_dataset_objects(settings),
+        )
+        selection = _selection(records, "detr")
+        pending_task = None
+        try:
+            pending_task = asyncio.create_task(publisher.publish_dataset(selection, "link-race-v1"))
+            assert await asyncio.to_thread(store.entered.wait, 10) is True
+            late_selection = {
+                **selection,
+                "event_links": [{
+                    "link_id": "late-link-during-upload",
+                    "sample_ids": [records[0]["sample_id"], records[-1]["sample_id"]],
+                }],
+            }
+            blocked = await other_publisher.publish_dataset(late_selection, "link-race-v2")
+            assert blocked["state"] == "blocked"
+            store.release.set()
+
+            finalized = await pending_task
+            assert finalized["state"] == "published"
+            assert finalized["training_ready"] is True
+            assert finalized["evaluation_eligible"] is False
+            assert finalized["manifest_hash"]
+            connection = await asyncpg.connect(database_url)
+            try:
+                row = await connection.fetchrow(
+                    """
+                    SELECT state, training_ready, evaluation_eligible, evaluation_reasons, manifest_sha256
+                    FROM dataset_versions WHERE dataset_version = $1
+                    """,
+                    finalized["dataset_version"],
+                )
+                overlay_count = await connection.fetchval(
+                    "SELECT count(*) FROM dataset_version_leakage_impacts WHERE dataset_version = $1",
+                    finalized["dataset_version"],
+                )
+                assert row["state"] == "published"
+                assert row["training_ready"] is True
+                assert row["evaluation_eligible"] is False
+                assert "late_cross_boundary_link" in json.loads(row["evaluation_reasons"])
+                assert row["manifest_sha256"].strip() == finalized["manifest_hash"]
+                assert overlay_count == 1
+            finally:
+                await connection.close()
+        finally:
+            store.release.set()
+            if pending_task is not None and not pending_task.done():
+                await pending_task
+            await publisher.close()
+            await other_publisher.close()
             await annotations.close()
 
     asyncio.run(exercise())

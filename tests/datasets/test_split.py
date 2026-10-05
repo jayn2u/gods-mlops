@@ -14,10 +14,17 @@ def _plan_splits(*args, **kwargs):
     return plan_splits(*args, **kwargs)
 
 
-def _sample(sample_id: str, day: int, *, hour: int = 12, minute: int = 0) -> dict:
+def _sample(
+    sample_id: str,
+    day: int,
+    *,
+    hour: int = 12,
+    minute: int = 0,
+    camera_id: str = "camera-a",
+) -> dict:
     return {
         "sample_id": sample_id,
-        "camera_id": "camera-a",
+        "camera_id": camera_id,
         "capture_day": date(2026, 10, day),
         # Seoul is UTC+9. The local time is used for the midnight exclusion window.
         "captured_at_utc": datetime(
@@ -119,3 +126,62 @@ def test_initial_split_blocks_before_three_independent_day_groups() -> None:
 
     with pytest.raises(ValueError, match="at least three independent camera/date groups"):
         _plan_splits(samples, event_links=[], clip_links=[])
+
+
+def test_initial_partitions_are_allocated_per_camera() -> None:
+    samples = [
+        _sample(f"{camera}-d{day}", day, camera_id=camera)
+        for camera in ("camera-a", "camera-b")
+        for day in (1, 2, 3)
+    ]
+
+    plan = _plan_splits(samples, event_links=[], clip_links=[])
+
+    for camera in ("camera-a", "camera-b"):
+        camera_splits = {
+            plan["assignments"][sample["sample_id"]]["split"]
+            for sample in samples
+            if sample["camera_id"] == camera
+        }
+        assert camera_splits == {"train", "validation", "test"}
+
+
+def test_cross_camera_component_that_breaks_a_camera_partition_is_blocked() -> None:
+    samples = [
+        _sample(f"{camera}-d{day}", day, camera_id=camera)
+        for camera in ("camera-a", "camera-b")
+        for day in (1, 2, 3)
+    ]
+
+    plan = _plan_splits(
+        samples,
+        event_links=[{"link_id": "cross-camera-incident", "sample_ids": ["camera-a-d3", "camera-b-d1"]}],
+        clip_links=[],
+    )
+
+    assert plan["blocked"] is True
+    assert plan["block_reasons"] == ["cross_camera_component_prevents_independent_partitions"]
+
+
+def test_late_cross_split_component_with_new_member_keeps_fixed_rows_without_stopiteration() -> None:
+    samples = [
+        _sample("train-old", 1),
+        _sample("test-old", 2),
+        _sample("new-member", 3),
+    ]
+    existing = {
+        "train-old": {"split": "train", "group_id": "train-group"},
+        "test-old": {"split": "test", "group_id": "test-group"},
+    }
+
+    plan = _plan_splits(
+        samples,
+        event_links=[{"link_id": "late-link-with-new-member", "sample_ids": ["train-old", "test-old", "new-member"]}],
+        clip_links=[],
+        prior_assignments=existing,
+    )
+
+    assert plan["blocked"] is True
+    assert plan["assignments"]["train-old"] == existing["train-old"]
+    assert plan["assignments"]["test-old"] == existing["test-old"]
+    assert "new-member" not in plan["assignments"]

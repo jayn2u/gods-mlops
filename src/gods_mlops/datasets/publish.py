@@ -176,8 +176,8 @@ class DatasetPublisher:
 
         return await self._finish_publication(dataset_version)
 
-    async def register_model_lineage(self, *, model_id: str, dataset_version: str) -> None:
-        """Record a Task 7/8 model's consumed dataset identity without creating model artifacts."""
+    async def register_model_lineage(self, *, model_id: str, dataset_version: str) -> dict[str, Any]:
+        """Record model lineage and backfill any durable impacts without creating artifacts."""
         if not model_id.strip() or len(model_id) > 255:
             raise ValueError("model_id must contain 1 to 255 characters")
         await self.ensure_schema()
@@ -185,11 +185,11 @@ class DatasetPublisher:
         async with pool.acquire() as connection:
             async with connection.transaction():
                 version_row = await connection.fetchrow(
-                    "SELECT state, training_ready FROM dataset_versions WHERE dataset_version = $1 FOR UPDATE",
+                    "SELECT state, training_ready, evaluation_eligible, published_at FROM dataset_versions WHERE dataset_version = $1 FOR UPDATE",
                     dataset_version,
                 )
-                if version_row is None or version_row["state"] != "published" or not version_row["training_ready"]:
-                    raise DatasetPublicationError("model lineage requires a published training-ready dataset")
+                if version_row is None or version_row["published_at"] is None:
+                    raise DatasetPublicationError("model lineage requires a previously published dataset")
                 await connection.execute(
                     """
                     INSERT INTO dataset_model_lineage (model_id, dataset_version)
@@ -198,6 +198,53 @@ class DatasetPublisher:
                     model_id,
                     dataset_version,
                 )
+                await connection.execute(
+                    """
+                    INSERT INTO dataset_model_impacts (model_id, dataset_version, sample_id, reason)
+                    SELECT $1, invalidation.dataset_version, invalidation.sample_id,
+                           'source_sample_explicitly_invalidated'
+                    FROM dataset_invalidations AS invalidation
+                    WHERE invalidation.dataset_version = $2
+                    ON CONFLICT DO NOTHING
+                    """,
+                    model_id,
+                    dataset_version,
+                )
+                await connection.execute(
+                    """
+                    INSERT INTO dataset_model_impacts (model_id, dataset_version, sample_id, reason)
+                    SELECT DISTINCT $1, $2, item.sample_id, 'evaluation_split_leakage'
+                    FROM dataset_version_leakage_impacts AS version_impact
+                    JOIN dataset_split_leakage_impacts AS impact USING (impact_id)
+                    JOIN dataset_items AS item ON item.dataset_version = version_impact.dataset_version
+                      AND item.sample_id::text IN (
+                          SELECT jsonb_array_elements_text(impact.sample_ids)
+                      )
+                    WHERE version_impact.dataset_version = $2
+                    ON CONFLICT DO NOTHING
+                    """,
+                    model_id,
+                    dataset_version,
+                )
+                impact_rows = await connection.fetch(
+                    """
+                    SELECT sample_id, reason FROM dataset_model_impacts
+                    WHERE model_id = $1 AND dataset_version = $2
+                    ORDER BY reason, sample_id
+                    """,
+                    model_id,
+                    dataset_version,
+                )
+                return {
+                    "model_id": model_id,
+                    "dataset_version": dataset_version,
+                    "training_eligible": bool(version_row["training_ready"]),
+                    "evaluation_eligible": bool(version_row["evaluation_eligible"]),
+                    "impacts": [
+                        {"sample_id": str(row["sample_id"]), "reason": row["reason"]}
+                        for row in impact_rows
+                    ],
+                }
 
     async def invalidate_sample(self, sample_id: str) -> dict[str, Any]:
         from .deletion import invalidate_sample_in_repository
@@ -284,6 +331,15 @@ class DatasetPublisher:
 
                 source_sample_ids = candidate["source_sample_ids"]
                 review_context = await self._load_review_context(connection, selection)
+                authority = await self._load_split_authority_context(
+                    connection,
+                    candidate=candidate,
+                    selection=selection,
+                )
+                candidate["samples_by_id"].update(authority["samples_by_id"])
+                candidate["context_sample_ids"].update(
+                    set(authority["samples_by_id"]) - set(candidate["source_sample_ids"])
+                )
                 lock_sample_ids = {UUID(value) for value in source_sample_ids}
                 lock_sample_ids.update(review_context["sample_ids"])
                 lock_sample_ids.update(UUID(value) for value in candidate["context_sample_ids"])
@@ -329,7 +385,52 @@ class DatasetPublisher:
                         reasons=candidate["reasons"],
                         details=candidate["details"],
                     )
-                split_plan = await self._assign_splits(connection, candidate, selection)
+                authority = await self._load_split_authority_context(
+                    connection,
+                    candidate=candidate,
+                    selection=selection,
+                )
+                authority_sample_ids = set(authority["samples_by_id"])
+                authority_lock_ids = {UUID(value) for value in authority_sample_ids}
+                already_locked_ids = lock_sample_ids
+                missing_lock_ids = authority_lock_ids - already_locked_ids
+                if missing_lock_ids:
+                    lock_rows = await connection.fetch(
+                        """
+                        SELECT sample_id FROM ingestion_samples
+                        WHERE sample_id = ANY($1::uuid[]) ORDER BY sample_id FOR UPDATE
+                        """,
+                        sorted(missing_lock_ids, key=str),
+                    )
+                    if {row["sample_id"] for row in lock_rows} != missing_lock_ids:
+                        return await self._persist_block(
+                            connection,
+                            dataset_version=dataset_version,
+                            input_sha=input_sha,
+                            reasons=["required_source_unavailable"],
+                            details={"missing_sample_ids": sorted(map(str, missing_lock_ids - {row["sample_id"] for row in lock_rows}))},
+                        )
+                candidate["samples_by_id"].update(authority["samples_by_id"])
+                candidate["context_sample_ids"].update(
+                    authority_sample_ids - set(candidate["source_sample_ids"])
+                )
+                invalidated_sources = await connection.fetch(
+                    """
+                    SELECT sample_id FROM dataset_source_invalidations
+                    WHERE sample_id = ANY($1::uuid[]) ORDER BY sample_id
+                    """,
+                    [UUID(sample_id) for sample_id in sorted(candidate["source_sample_ids"])],
+                )
+                if invalidated_sources:
+                    return await self._persist_block(
+                        connection,
+                        dataset_version=dataset_version,
+                        input_sha=input_sha,
+                        reasons=["source_explicitly_invalidated"],
+                        details={"sample_ids": [str(row["sample_id"]) for row in invalidated_sources]},
+                    )
+                await self._persist_group_link_members(connection, selection)
+                split_plan = await self._assign_splits(connection, candidate, selection, authority)
                 if split_plan["blocked"]:
                     return await self._persist_block(
                         connection,
@@ -338,10 +439,11 @@ class DatasetPublisher:
                         reasons=(
                             ["late_cross_boundary_link"]
                             if split_plan["leakage_impacts"]
-                            else ["invalid_independent_split_structure"]
+                            else split_plan.get("block_reasons") or ["invalid_independent_split_structure"]
                         ),
                         details={
                             "leakage_impacts": split_plan["leakage_impacts"],
+                            "block_reasons": split_plan.get("block_reasons", []),
                             "split_error": split_plan.get("error"),
                         },
                     )
@@ -351,7 +453,12 @@ class DatasetPublisher:
                 training_reasons, evaluation_reasons = _readiness_reasons(
                     selection["target"], split_counts
                 )
-                structural_error = _structural_split_error(items, split_counts, candidate)
+                structural_error = _structural_split_error(
+                    items,
+                    split_counts,
+                    candidate,
+                    has_authority=split_plan["has_authority"],
+                )
                 if structural_error:
                     return await self._persist_block(
                         connection,
@@ -496,8 +603,6 @@ class DatasetPublisher:
                     json.dumps(relevance["revision_ids"]),
                 )
                 for sample_id, split in split_plan["assignments"].items():
-                    if sample_id not in candidate["source_sample_ids"]:
-                        continue
                     sample = candidate["samples_by_id"][sample_id]
                     await connection.execute(
                         """
@@ -700,17 +805,90 @@ class DatasetPublisher:
             "annotations_by_id": annotations_by_id,
         }
 
-    async def _assign_splits(
+    async def _load_split_authority_context(
         self,
         connection: asyncpg.Connection,
+        *,
         candidate: dict[str, Any],
         selection: dict[str, Any],
     ) -> dict[str, Any]:
-        sample_ids = sorted(candidate["samples_by_id"])
+        """Expand current samples through persisted camera/day and event/clip edges."""
+        samples_by_id = dict(candidate["samples_by_id"])
+        links_by_key: dict[tuple[str, str], set[str]] = {}
+        for kind, selection_key in (("event", "event_links"), ("clip", "clip_links")):
+            for link in selection[selection_key]:
+                links_by_key[(kind, link["link_id"])] = set(link["sample_ids"])
+
+        while True:
+            known_ids = {UUID(sample_id) for sample_id in samples_by_id}
+            if known_ids:
+                day_rows = await connection.fetch(
+                    """
+                    SELECT related.sample_id, related.camera_id, related.capture_day,
+                           related.captured_at_utc, related.sha256, related.model_revision,
+                           related.processor_revision, related.object_key, related.object_size_bytes,
+                           related.state
+                    FROM ingestion_samples AS related
+                    WHERE EXISTS (
+                        SELECT 1 FROM ingestion_samples AS seed
+                        WHERE seed.sample_id = ANY($1::uuid[])
+                          AND seed.camera_id = related.camera_id
+                          AND seed.capture_day = related.capture_day
+                    )
+                    ORDER BY related.sample_id
+                    """,
+                    sorted(known_ids, key=str),
+                )
+                for row in day_rows:
+                    samples_by_id[str(row["sample_id"])] = row
+
+            known_ids = {UUID(sample_id) for sample_id in samples_by_id}
+            link_keys = sorted(links_by_key)
+            kind_ids = [key[0] for key in link_keys]
+            link_ids = [key[1] for key in link_keys]
+            edge_rows = await connection.fetch(
+                """
+                SELECT link_kind, link_id, sample_id FROM dataset_group_link_members
+                WHERE sample_id = ANY($1::uuid[])
+                   OR EXISTS (
+                       SELECT 1 FROM unnest($2::text[], $3::text[]) AS wanted(kind, id)
+                       WHERE wanted.kind = dataset_group_link_members.link_kind
+                         AND wanted.id = dataset_group_link_members.link_id
+                   )
+                ORDER BY link_kind, link_id, sample_id
+                """,
+                sorted(known_ids, key=str),
+                kind_ids,
+                link_ids,
+            )
+            before = (len(samples_by_id), sum(len(members) for members in links_by_key.values()))
+            for row in edge_rows:
+                links_by_key.setdefault((row["link_kind"], row["link_id"]), set()).add(str(row["sample_id"]))
+            linked_ids = {
+                sample_id
+                for members in links_by_key.values()
+                for sample_id in members
+            }
+            missing_link_ids = sorted(linked_ids - set(samples_by_id))
+            if missing_link_ids:
+                member_rows = await connection.fetch(
+                    """
+                    SELECT sample_id, camera_id, capture_day, captured_at_utc, sha256,
+                           model_revision, processor_revision, object_key, object_size_bytes, state
+                    FROM ingestion_samples WHERE sample_id = ANY($1::uuid[]) ORDER BY sample_id
+                    """,
+                    [UUID(sample_id) for sample_id in missing_link_ids],
+                )
+                samples_by_id.update({str(row["sample_id"]): row for row in member_rows})
+            after = (len(samples_by_id), sum(len(members) for members in links_by_key.values()))
+            if after == before:
+                break
+
+        sample_ids = sorted(samples_by_id)
         prior_rows = await connection.fetch(
             """
             SELECT sample_id, split, group_id FROM dataset_sample_splits
-            WHERE sample_id = ANY($1::uuid[])
+            WHERE sample_id = ANY($1::uuid[]) ORDER BY sample_id
             """,
             [UUID(sample_id) for sample_id in sample_ids],
         )
@@ -718,6 +896,51 @@ class DatasetPublisher:
             str(row["sample_id"]): {"split": row["split"], "group_id": row["group_id"]}
             for row in prior_rows
         }
+        has_authority = bool(
+            await connection.fetchval("SELECT EXISTS (SELECT 1 FROM dataset_sample_splits)")
+        )
+        return {
+            "samples_by_id": samples_by_id,
+            "prior": prior,
+            "has_authority": has_authority,
+            "event_links": [
+                {"link_id": link_id, "sample_ids": sorted(members)}
+                for (kind, link_id), members in sorted(links_by_key.items())
+                if kind == "event"
+            ],
+            "clip_links": [
+                {"link_id": link_id, "sample_ids": sorted(members)}
+                for (kind, link_id), members in sorted(links_by_key.items())
+                if kind == "clip"
+            ],
+        }
+
+    async def _persist_group_link_members(
+        self,
+        connection: asyncpg.Connection,
+        selection: dict[str, Any],
+    ) -> None:
+        for kind, selection_key in (("event", "event_links"), ("clip", "clip_links")):
+            for link in selection[selection_key]:
+                for sample_id in link["sample_ids"]:
+                    await connection.execute(
+                        """
+                        INSERT INTO dataset_group_link_members (link_kind, link_id, sample_id)
+                        VALUES ($1, $2, $3) ON CONFLICT DO NOTHING
+                        """,
+                        kind,
+                        link["link_id"],
+                        UUID(sample_id),
+                    )
+
+    async def _assign_splits(
+        self,
+        connection: asyncpg.Connection,
+        candidate: dict[str, Any],
+        selection: dict[str, Any],
+        authority: dict[str, Any],
+    ) -> dict[str, Any]:
+        prior = authority["prior"]
         samples = [
             {
                 "sample_id": sample_id,
@@ -728,21 +951,27 @@ class DatasetPublisher:
             for sample_id, row in candidate["samples_by_id"].items()
         ]
         try:
-            return plan_splits(
+            split_plan = plan_splits(
                 samples,
-                event_links=selection["event_links"],
-                clip_links=selection["clip_links"],
+                event_links=authority["event_links"],
+                clip_links=authority["clip_links"],
                 prior_assignments=prior,
+                has_authority=authority["has_authority"],
             )
+            split_plan["event_links"] = authority["event_links"]
+            split_plan["clip_links"] = authority["clip_links"]
+            return split_plan
         except ValueError as error:
             return {
                 "blocked": True,
+                "block_reasons": ["invalid_independent_split_structure"],
                 "leakage_impacts": [],
                 "error": str(error),
                 "assignments": {},
                 "excluded": [],
                 "group_counts": {"train": 0, "validation": 0, "test": 0},
                 "prior": prior,
+                "has_authority": authority["has_authority"],
             }
 
     def _build_items(
@@ -1147,8 +1376,8 @@ class DatasetPublisher:
             "split_policy": {
                 "target_ratio": {"train": 0.6, "validation": 0.2, "test": 0.2},
                 "grouping": ["camera_capture_day", "event_links", "clip_links"],
-                "event_links": selection["event_links"],
-                "clip_links": selection["clip_links"],
+                "event_links": split_plan.get("event_links", selection["event_links"]),
+                "clip_links": split_plan.get("clip_links", selection["clip_links"]),
                 "midnight_boundary_exclusion_seconds": 300,
                 "new_groups": ["train", "validation"],
                 "assignments": [
@@ -1297,7 +1526,7 @@ class DatasetPublisher:
         async with pool.acquire() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow(
-                    "SELECT state FROM dataset_versions WHERE dataset_version = $1 FOR UPDATE",
+                    "SELECT state, training_reasons, evaluation_reasons FROM dataset_versions WHERE dataset_version = $1 FOR UPDATE",
                     dataset_version,
                 )
                 if row is None:
@@ -1306,6 +1535,67 @@ class DatasetPublisher:
                     return await self._result_with_connection(connection, dataset_version)
                 if row["state"] != "publishing":
                     return await self._result_with_connection(connection, dataset_version)
+                invalidated_samples = await connection.fetch(
+                    """
+                    SELECT DISTINCT item.sample_id
+                    FROM dataset_items AS item
+                    JOIN dataset_source_invalidations AS source_invalidation USING (sample_id)
+                    WHERE item.dataset_version = $1 ORDER BY item.sample_id
+                    """,
+                    dataset_version,
+                )
+                if invalidated_samples:
+                    sample_ids = [row["sample_id"] for row in invalidated_samples]
+                    training_reasons = sorted(
+                        set([*_json_value(row["training_reasons"]), "sample_explicitly_invalidated"])
+                    )
+                    evaluation_reasons = sorted(
+                        set([*_json_value(row["evaluation_reasons"]), "sample_explicitly_invalidated"])
+                    )
+                    await connection.execute(
+                        """
+                        INSERT INTO dataset_invalidations (dataset_version, sample_id, reason)
+                        SELECT $1, sample_id, 'sample_explicitly_invalidated'
+                        FROM unnest($2::uuid[]) AS source(sample_id)
+                        ON CONFLICT DO NOTHING
+                        """,
+                        dataset_version,
+                        sample_ids,
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE dataset_versions SET state = 'invalidated', training_ready = FALSE,
+                            evaluation_eligible = FALSE, training_reasons = $2::jsonb,
+                            evaluation_reasons = $3::jsonb, invalidated_at = now()
+                        WHERE dataset_version = $1 AND state = 'publishing'
+                        """,
+                        dataset_version,
+                        json.dumps(training_reasons),
+                        json.dumps(evaluation_reasons),
+                    )
+                    return await self._result_with_connection(connection, dataset_version)
+                leakage_overlay = await connection.fetchval(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1 FROM dataset_version_leakage_impacts
+                        WHERE dataset_version = $1
+                    )
+                    """,
+                    dataset_version,
+                )
+                if leakage_overlay:
+                    evaluation_reasons = sorted(
+                        set([*_json_value(row["evaluation_reasons"]), "late_cross_boundary_link"])
+                    )
+                    await connection.execute(
+                        """
+                        UPDATE dataset_versions SET evaluation_eligible = FALSE,
+                            evaluation_reasons = $2::jsonb
+                        WHERE dataset_version = $1 AND state = 'publishing'
+                        """,
+                        dataset_version,
+                        json.dumps(evaluation_reasons),
+                    )
                 await connection.execute(
                     """
                     UPDATE dataset_objects SET state = 'verified', verified_at = now()
@@ -1435,7 +1725,7 @@ class DatasetPublisher:
             JOIN dataset_items AS item USING (dataset_version)
             JOIN dataset_sample_splits AS split USING (sample_id)
             WHERE item.sample_id = ANY($1::uuid[])
-              AND version.state IN ('published', 'invalidated')
+              AND version.state IN ('publishing', 'published', 'invalidated')
             GROUP BY version.dataset_version, version.evaluation_reasons
             HAVING count(DISTINCT item.sample_id) > 1
                AND count(DISTINCT split.split) > 1
@@ -1450,7 +1740,7 @@ class DatasetPublisher:
                 """
                 UPDATE dataset_versions SET evaluation_eligible = FALSE,
                     evaluation_reasons = $2::jsonb
-                WHERE dataset_version = $1 AND state IN ('published', 'invalidated')
+                WHERE dataset_version = $1 AND state IN ('publishing', 'published', 'invalidated')
                 """,
                 version_id,
                 json.dumps(reasons),
@@ -1472,7 +1762,7 @@ class DatasetPublisher:
                 JOIN dataset_items AS item USING (dataset_version)
                 WHERE lineage.dataset_version = $1
                   AND item.sample_id = ANY($2::uuid[])
-                ON CONFLICT (model_id, dataset_version, sample_id) DO NOTHING
+                ON CONFLICT DO NOTHING
                 """,
                 version_id,
                 sample_ids,
@@ -1730,9 +2020,13 @@ def _structural_split_error(
     items: list[dict[str, Any]],
     split_counts: dict[str, Any],
     candidate: dict[str, Any],
+    *,
+    has_authority: bool = False,
 ) -> str | None:
     if not items:
         return "no_samples_after_midnight_boundary_exclusion"
+    if has_authority:
+        return None
     if any(split_counts[split]["groups"] == 0 for split in ("train", "validation", "test")):
         return "invalid_independent_split_structure"
     groups_by_camera: dict[str, set[str]] = {}

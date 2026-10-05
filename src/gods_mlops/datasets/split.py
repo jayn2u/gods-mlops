@@ -19,6 +19,7 @@ def plan_splits(
     event_links: list[dict[str, Any]],
     clip_links: list[dict[str, Any]],
     prior_assignments: dict[str, dict[str, str]] | None = None,
+    has_authority: bool | None = None,
 ) -> dict[str, Any]:
     """Assign camera/date connected components while preserving historical splits.
 
@@ -59,7 +60,7 @@ def plan_splits(
     ]
     selected_components.sort(key=lambda group: _component_order(group, normalized))
 
-    has_history = bool(prior)
+    has_history = bool(prior) if has_authority is None else (has_authority or bool(prior))
     fixed_by_root: dict[str, dict[str, str]] = {}
     component_split: dict[str, str] = {}
     component_group_id: dict[str, str] = {}
@@ -114,8 +115,35 @@ def plan_splits(
         if not any(sample_id in prior for sample_id in component)
     ]
     if not has_history:
-        initial_splits = _initial_split_sequence(len(new_roots))
-        component_split.update(zip(new_roots, initial_splits, strict=True))
+        camera_roots: dict[str, list[str]] = defaultdict(list)
+        for (camera_id, _capture_day), sample_ids in camera_dates.items():
+            roots = {_find(parent, sample_id) for sample_id in sample_ids}
+            camera_roots[camera_id].extend(roots)
+        for camera_id, roots in camera_roots.items():
+            camera_roots[camera_id] = sorted(
+                set(roots),
+                key=lambda root: min(
+                    (normalized[sample_id]["capture_day"], _group_id(components[root]))
+                    for sample_id in components[root]
+                    if sample_id in normalized and normalized[sample_id]["camera_id"] == camera_id
+                ),
+            )
+            if len(camera_roots[camera_id]) < 3:
+                raise ValueError("initial split requires at least three independent camera/date groups")
+        initial_assignments = _initial_per_camera_assignments(camera_roots)
+        if initial_assignments is None:
+            return {
+                "assignments": {},
+                "component_by_sample": {},
+                "excluded": [],
+                "group_counts": {split_name: 0 for split_name in _SPLITS},
+                "blocked": True,
+                "block_reasons": ["cross_camera_component_prevents_independent_partitions"],
+                "leakage_impacts": [],
+                "timezone": "Asia/Seoul",
+                "target_ratio": {"train": 0.6, "validation": 0.2, "test": 0.2},
+            }
+        component_split.update(initial_assignments)
     else:
         train_count = (3 * len(new_roots) + 3) // 4
         new_splits = ["train"] * train_count + ["validation"] * (len(new_roots) - train_count)
@@ -129,7 +157,11 @@ def plan_splits(
 
     exclusions: list[dict[str, str]] = []
     assignments: dict[str, dict[str, str]] = {}
-    blocked_roots = {next(root for root, values in fixed_by_root.items() if sample_id in values) for impact in leakage_impacts for sample_id in impact["sample_ids"] if sample_id in normalized}
+    blocked_roots = {
+        root
+        for root, fixed_assignments in fixed_by_root.items()
+        if fixed_assignments
+    }
 
     for sample_id, sample in normalized.items():
         root = sample_component[sample_id]
@@ -156,19 +188,21 @@ def plan_splits(
     group_counts = {split_name: 0 for split_name in _SPLITS}
     groups_by_split: dict[str, set[str]] = {split_name: set() for split_name in _SPLITS}
     for sample_id, assignment in assignments.items():
-        groups_by_split[assignment["split"]].add(_group_id(components[sample_component[sample_id]]))
+        groups_by_split[assignment["split"]].add(component_group_id[sample_component[sample_id]])
     for split_name in _SPLITS:
         group_counts[split_name] = len(groups_by_split[split_name])
 
     return {
         "assignments": assignments,
         "component_by_sample": {
-            sample_id: _group_id(components[sample_component[sample_id]])
+            sample_id: component_group_id[sample_component[sample_id]]
             for sample_id in assignments
         },
         "excluded": sorted(exclusions, key=lambda item: item["sample_id"]),
         "group_counts": group_counts,
         "blocked": bool(leakage_impacts),
+        "block_reasons": ["late_cross_boundary_link"] if leakage_impacts else [],
+        "has_authority": has_history,
         "leakage_impacts": leakage_impacts,
         "timezone": "Asia/Seoul",
         "target_ratio": {"train": 0.6, "validation": 0.2, "test": 0.2},
@@ -221,27 +255,90 @@ def _normalize_links(links: list[dict[str, Any]], kind: str) -> list[dict[str, A
     return normalized
 
 
-def _initial_split_sequence(group_count: int) -> list[str]:
-    if group_count < 3:
-        raise ValueError("initial split requires at least three independent camera/date groups")
-    possible: list[tuple[float, int, int, int]] = []
-    for train_count in range(1, group_count - 1):
-        for validation_count in range(1, group_count - train_count):
-            test_count = group_count - train_count - validation_count
-            if test_count < 1:
-                continue
-            score = sum(
-                (observed - target) ** 2
-                for observed, target in zip(
-                    (train_count / group_count, validation_count / group_count, test_count / group_count),
-                    (0.6, 0.2, 0.2),
-                    strict=True,
+def _initial_per_camera_assignments(camera_roots: dict[str, list[str]]) -> dict[str, str] | None:
+    """Find chronological, non-empty per-camera partitions consistent across links."""
+    cameras_by_root: dict[str, set[str]] = defaultdict(set)
+    for camera_id, roots in camera_roots.items():
+        for root in roots:
+            cameras_by_root[root].add(camera_id)
+
+    shared_roots = {
+        camera_id: sorted(root for root in roots if len(cameras_by_root[root]) > 1)
+        for camera_id, roots in camera_roots.items()
+    }
+    options: dict[str, list[tuple[float, dict[str, str]]]] = {}
+    best_counts: dict[str, dict[tuple[str, ...], tuple[int, int]]] = {}
+    for camera_id, roots in camera_roots.items():
+        camera_options: dict[tuple[str, ...], tuple[float, int, int]] = {}
+        group_count = len(roots)
+        root_positions = {root: index for index, root in enumerate(roots)}
+        for train_count in range(1, group_count - 1):
+            for validation_count in range(1, group_count - train_count):
+                test_count = group_count - train_count - validation_count
+                if test_count < 1:
+                    continue
+                labels = (
+                    ["train"] * train_count
+                    + ["validation"] * validation_count
+                    + ["test"] * test_count
                 )
-            )
-            possible.append((score, -train_count, -validation_count, test_count))
-    _, neg_train, neg_validation, test_count = min(possible)
-    train_count, validation_count = -neg_train, -neg_validation
-    return ["train"] * train_count + ["validation"] * validation_count + ["test"] * test_count
+                score = sum(
+                    (observed - target) ** 2
+                    for observed, target in zip(
+                        (train_count / group_count, validation_count / group_count, test_count / group_count),
+                        (0.6, 0.2, 0.2),
+                        strict=True,
+                    )
+                )
+                signature = tuple(labels[root_positions[root]] for root in shared_roots[camera_id])
+                previous = camera_options.get(signature)
+                if previous is None or score < previous[0]:
+                    camera_options[signature] = (score, train_count, validation_count)
+        best_counts[camera_id] = {
+            signature: (train_count, validation_count)
+            for signature, (_score, train_count, validation_count) in camera_options.items()
+        }
+        options[camera_id] = sorted(
+            (
+                (score, dict(zip(shared_roots[camera_id], signature, strict=True)))
+                for signature, (score, _train_count, _validation_count) in camera_options.items()
+            ),
+            key=lambda item: item[0],
+        )
+
+    camera_order = sorted(
+        camera_roots,
+        key=lambda camera_id: sum(
+            len(option) for _, option in options[camera_id]
+        ),
+    )
+
+    def choose(index: int, chosen: dict[str, str]) -> dict[str, str] | None:
+        if index == len(camera_order):
+            return chosen
+        camera_id = camera_order[index]
+        for _, assignment in options[camera_id]:
+            if any(root in chosen and chosen[root] != split for root, split in assignment.items()):
+                continue
+            result = choose(index + 1, {**chosen, **assignment})
+            if result is not None:
+                return result
+        return None
+
+    chosen = choose(0, {})
+    if chosen is None:
+        return None
+    assignments: dict[str, str] = {}
+    for camera_id, roots in camera_roots.items():
+        signature = tuple(chosen[root] for root in shared_roots[camera_id])
+        train_count, validation_count = best_counts[camera_id][signature]
+        labels = (
+            ["train"] * train_count
+            + ["validation"] * validation_count
+            + ["test"] * (len(roots) - train_count - validation_count)
+        )
+        assignments.update(dict(zip(roots, labels, strict=True)))
+    return assignments
 
 
 def _component_order(group: list[str], samples: dict[str, dict[str, Any]]) -> tuple[Any, ...]:
