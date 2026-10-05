@@ -381,7 +381,8 @@ def test_public_invalid_snapshot_resets_history_and_requires_a_new_idle_window(
 ) -> None:
     async def exercise() -> None:
         repository, queue, job_id = await _queue_with_probe(task7_database_url)
-        now = [BASE_TIME]
+        base_time = datetime.now(UTC)
+        now = [base_time]
 
         class FreshObserver:
             async def observe(self) -> dict:
@@ -389,13 +390,13 @@ def test_public_invalid_snapshot_resets_history_and_requires_a_new_idle_window(
 
         admission = _admission(repository, queue, now, observer=FreshObserver())
         for offset in (0, 5, 10, 15):
-            now[0] = BASE_TIME + timedelta(seconds=offset)
+            now[0] = base_time + timedelta(seconds=offset)
             waiting = await admission.admit(job_id, _observation(now[0]))
         assert waiting["reason_code"] == "idle_observation_window"
         prior = await repository.get_observation_state("ubuntu")
         assert prior["idle_observation_count"] == 4
 
-        now[0] = BASE_TIME + timedelta(seconds=20)
+        now[0] = base_time + timedelta(seconds=20)
         invalid: dict
         if invalid_kind == "missing":
             invalid = {}
@@ -420,7 +421,7 @@ def test_public_invalid_snapshot_resets_history_and_requires_a_new_idle_window(
         assert durable["idle_observation_count"] == 0
         await restarted.close()
 
-        now[0] = BASE_TIME + timedelta(seconds=25)
+        now[0] = base_time + timedelta(seconds=25)
         next_valid = _observation(now[0])
         waiting = await admission.admit(job_id, next_valid)
         assert waiting["reason_code"] == "idle_observation_window"
@@ -430,13 +431,13 @@ def test_public_invalid_snapshot_resets_history_and_requires_a_new_idle_window(
         assert restarted_window["idle_observation_count"] == 1
 
         for offset in (30, 35, 40, 45, 50):
-            now[0] = BASE_TIME + timedelta(seconds=offset)
+            now[0] = base_time + timedelta(seconds=offset)
             waiting = await admission.admit(job_id, _observation(now[0]))
         assert waiting["reason_code"] == "idle_observation_window"
         assert (await repository.get_observation_state("ubuntu"))["idle_observation_count"] == 6
         assert await repository.get_active_lease(GPU_UUID) is None
 
-        now[0] = BASE_TIME + timedelta(seconds=55)
+        now[0] = base_time + timedelta(seconds=55)
         acquired = await admission.admit(job_id, _observation(now[0]))
         assert acquired["state"] == "running"
         assert (await repository.get_active_lease(GPU_UUID))["job_id"] == job_id
@@ -453,7 +454,8 @@ def test_failed_normal_observer_read_resets_history_before_returning(
 ) -> None:
     async def exercise() -> None:
         repository, queue, job_id = await _queue_with_probe(task7_database_url)
-        now = [BASE_TIME]
+        base_time = datetime.now(UTC)
+        now = [base_time]
 
         class Observer:
             async def observe(self):
@@ -468,7 +470,7 @@ def test_failed_normal_observer_read_resets_history_before_returning(
                 return _observation(now[0])
 
         for offset in (0, 5, 10):
-            now[0] = BASE_TIME + timedelta(seconds=offset)
+            now[0] = base_time + timedelta(seconds=offset)
             await _admission(repository, queue, now).admit(job_id, _observation(now[0]))
         assert (await repository.get_observation_state("ubuntu"))["idle_observation_count"] == 3
 
@@ -485,7 +487,7 @@ def test_failed_normal_observer_read_resets_history_before_returning(
         assert failed["idle_since"] is None
         assert failed["idle_observation_count"] == 0
 
-        now[0] = BASE_TIME + timedelta(seconds=15)
+        now[0] = base_time + timedelta(seconds=15)
         result = await admission.admit(job_id, _observation(now[0]))
         assert result["reason_code"] == "idle_observation_window"
         restarted = await repository.get_observation_state("ubuntu")
@@ -504,7 +506,8 @@ def test_failed_prelaunch_observer_read_resets_history_before_waiting(
 ) -> None:
     async def exercise() -> None:
         repository, queue, job_id = await _queue_with_probe(task7_database_url)
-        now = [BASE_TIME]
+        base_time = datetime.now(UTC)
+        now = [base_time]
 
         class Observer:
             async def observe(self):
@@ -525,7 +528,7 @@ def test_failed_prelaunch_observer_read_resets_history_before_waiting(
             observer=None if prelaunch_failure == "missing" else Observer(),
         )
         for offset in range(0, 31, 5):
-            now[0] = BASE_TIME + timedelta(seconds=offset)
+            now[0] = base_time + timedelta(seconds=offset)
             waiting = await admission.admit(job_id, _observation(now[0]))
         assert waiting["state"] == "waiting_gpu"
         failed = await repository.get_observation_state("ubuntu")
@@ -534,7 +537,7 @@ def test_failed_prelaunch_observer_read_resets_history_before_waiting(
         assert failed["idle_observation_count"] == 0
         assert await repository.get_active_lease(GPU_UUID) is None
 
-        now[0] = BASE_TIME + timedelta(seconds=35)
+        now[0] = base_time + timedelta(seconds=35)
         fresh = _observation(now[0])
         waiting = await admission.admit(job_id, fresh)
         assert waiting["reason_code"] == "idle_observation_window"

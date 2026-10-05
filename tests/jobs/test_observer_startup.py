@@ -7,6 +7,7 @@ from uuid import uuid4
 from gods_mlops.ingestion.collection_gate import CollectionStorageGate
 from gods_mlops.jobs import observer as observer_module
 from gods_mlops.jobs.models import ResourceObservation
+from gods_mlops.jobs.queue import PostgresJobQueueRepository
 
 NODE_ID = "ubuntu"
 HOST_IDENTITY = "machine-sha256:task7-test-ubuntu"
@@ -59,6 +60,15 @@ def test_observer_main_persists_its_pinned_sample_for_the_receiver_gate(
     monkeypatch,
 ) -> None:
     _set_observer_environment(monkeypatch, task7_database_url)
+
+    async def initialize_owned_schema() -> None:
+        repository = PostgresJobQueueRepository(database_url=task7_database_url)
+        try:
+            await repository.ensure_schema()
+        finally:
+            await repository.close()
+
+    asyncio.run(initialize_owned_schema())
     sample = _observation()
     construction: list[dict[str, object]] = []
     consumed: list[ResourceObservation] = []
