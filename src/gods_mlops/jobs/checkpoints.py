@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 CHECKPOINT_INTERVAL_SECONDS = 300
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
@@ -113,6 +114,7 @@ class PreparedCheckpoint:
     previous_uri: str | None = None
     previous_sha256: str | None = None
     previous_size_bytes: int | None = None
+    previous_metadata_size_bytes: int | None = None
 
 
 class FileCheckpointStore:
@@ -132,10 +134,20 @@ class FileCheckpointStore:
             raise ValueError("checkpoint payload must contain bytes")
         if reservation_bytes <= 0:
             raise ValueError("checkpoint artifact reservation must be positive")
+        previous = self.load(identity.job_id, expected_identity=identity)
+        previous_uri = previous.path.resolve().as_uri() if previous and previous.path else None
+        previous_metadata = previous.path.with_suffix(".json") if previous and previous.path else None
         prepared = self.prepare(
             identity=identity,
             payload=payload,
             reservation_bytes=reservation_bytes,
+            replacement_reservation_bytes=2 * reservation_bytes,
+            previous_uri=previous_uri,
+            previous_sha256=previous.sha256 if previous else None,
+            previous_size_bytes=previous.size_bytes if previous else None,
+            previous_metadata_size_bytes=(
+                previous_metadata.stat().st_size if previous_metadata and previous_metadata.is_file() else None
+            ),
         )
         result = self.commit(prepared)
         self.prune_previous(prepared)
@@ -151,6 +163,7 @@ class FileCheckpointStore:
         previous_uri: str | None = None,
         previous_sha256: str | None = None,
         previous_size_bytes: int | None = None,
+        previous_metadata_size_bytes: int | None = None,
     ) -> PreparedCheckpoint:
         """Write and verify payload bytes without publishing a resume marker."""
         if not isinstance(payload, bytes) or not payload:
@@ -209,6 +222,7 @@ class FileCheckpointStore:
             previous_uri=previous_uri,
             previous_sha256=previous_sha256,
             previous_size_bytes=previous_size_bytes,
+            previous_metadata_size_bytes=previous_metadata_size_bytes,
         )
 
     def commit(self, prepared: PreparedCheckpoint) -> VerifiedCheckpoint:
@@ -223,13 +237,69 @@ class FileCheckpointStore:
         return result
 
     def prune_previous(self, prepared: PreparedCheckpoint) -> None:
-        """Remove older same-identity checkpoints only after the replacement is committed."""
-        directory = prepared.data_path.parent
-        identity_prefix = prepared.data_path.name.split("-", 1)[0]
-        for pattern in (f"{identity_prefix}-*.checkpoint", f"{identity_prefix}-*.json"):
-            for path in directory.glob(pattern):
-                if path not in {prepared.data_path, prepared.metadata_path}:
-                    path.unlink(missing_ok=True)
+        """Remove only the exact previous committed file checkpoint after replacement."""
+        if (
+            not prepared.previous_uri
+            or prepared.previous_uri == prepared.data_path.resolve().as_uri()
+        ):
+            return
+        if prepared.previous_sha256 is None or prepared.previous_size_bytes is None:
+            raise CheckpointIntegrityError("previous checkpoint deletion has no verified size and SHA-256")
+        self.prune_uri(
+            prepared.previous_uri,
+            sha256_digest=prepared.previous_sha256,
+            size_bytes=prepared.previous_size_bytes,
+            job_id=prepared.identity.job_id,
+            identity=prepared.identity,
+            metadata_size_bytes=prepared.previous_metadata_size_bytes or 0,
+        )
+
+    def prune_uri(
+        self,
+        uri: str,
+        *,
+        sha256_digest: str,
+        size_bytes: int,
+        job_id: str,
+        identity: CheckpointIdentity | dict[str, Any],
+        metadata_size_bytes: int = 0,
+    ) -> None:
+        """Verify and delete one exact previous file checkpoint and its commit marker."""
+        parsed = urlsplit(uri)
+        if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+            raise CheckpointIntegrityError("previous file checkpoint URI is invalid")
+        target = Path(unquote(parsed.path)).resolve()
+        directory = self._job_directory(job_id)
+        identity_value = identity.as_dict() if isinstance(identity, CheckpointIdentity) else identity
+        if identity_value.get("job_id") != job_id or target.parent != directory:
+            raise CheckpointIntegrityError("previous file checkpoint is outside its immutable job directory")
+        identity_hash = sha256(_canonical_json(identity_value).encode("utf-8")).hexdigest()
+        expected_name = f"{identity_hash}-{sha256_digest}.checkpoint"
+        if target.name != expected_name or not _SHA256.fullmatch(sha256_digest) or size_bytes <= 0:
+            raise CheckpointIntegrityError("previous file checkpoint key does not match its identity")
+        metadata_path = target.with_suffix(".json")
+        if target.exists():
+            payload = target.read_bytes()
+            if len(payload) != size_bytes or sha256(payload).hexdigest() != sha256_digest:
+                raise CheckpointIntegrityError("previous file checkpoint bytes differ from their commit marker")
+        if metadata_path.exists():
+            if metadata_size_bytes and metadata_path.stat().st_size != metadata_size_bytes:
+                raise CheckpointIntegrityError("previous file checkpoint metadata size differs from its commit marker")
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise CheckpointIntegrityError("previous file checkpoint metadata is unreadable") from error
+            if (
+                metadata.get("identity") != identity_value
+                or metadata.get("checkpoint_file") != target.name
+                or metadata.get("sha256") != sha256_digest
+                or int(metadata.get("size_bytes", -1)) != size_bytes
+            ):
+                raise CheckpointIntegrityError("previous file checkpoint metadata differs from its commit marker")
+        target.unlink(missing_ok=True)
+        metadata_path.unlink(missing_ok=True)
+        if target.exists() or metadata_path.exists():
+            raise CheckpointIntegrityError("previous file checkpoint remains after deletion")
 
     def checkpoint_identity_hash(self, identity: CheckpointIdentity) -> str:
         return sha256(_canonical_json(identity.as_dict()).encode("utf-8")).hexdigest()

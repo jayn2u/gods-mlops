@@ -1030,6 +1030,198 @@ def test_new_fence_recovers_committed_probe_result_without_retraining_or_double_
     asyncio.run(exercise())
 
 
+def test_s3_checkpoint_aba_replacement_recharges_pruned_object_lifetime(
+    task7_database_url: str,
+) -> None:
+    required = (
+        "GODS_MLOPS_TEST_S3_ENDPOINT",
+        "GODS_MLOPS_TEST_S3_ACCESS_KEY",
+        "GODS_MLOPS_TEST_S3_SECRET_KEY",
+        "GODS_MLOPS_TEST_S3_BUCKET",
+    )
+    if any(not os.environ.get(name) for name in required):
+        pytest.skip("loopback-only Task 8 S3 endpoint is not configured")
+
+    async def exercise() -> None:
+        endpoint = os.environ["GODS_MLOPS_TEST_S3_ENDPOINT"]
+        access = os.environ["GODS_MLOPS_TEST_S3_ACCESS_KEY"]
+        secret = os.environ["GODS_MLOPS_TEST_S3_SECRET_KEY"]
+        bucket = os.environ["GODS_MLOPS_TEST_S3_BUCKET"]
+        objects = DatasetObjectStore(
+            endpoint_url=endpoint, access_key=access, secret_key=secret, bucket=bucket, region="us-east-1"
+        )
+        repository, queue, sources, admission, job_id, now = await _probe_run(task7_database_url)
+        baseline = await _storage_bytes(task7_database_url)
+        await _admit_probe(queue, admission, job_id, now)
+        lease = await repository.get_active_lease(GPU_UUID)
+        identity = await repository.checkpoint_identity(job_id)
+        store = S3CheckpointStore(objects=objects, bucket=bucket, prefix=f"task8-aba/{uuid4()}")
+        payload_a = b"checkpoint-A-retained-after-its-recreated-lifetime"
+        payload_b = b"checkpoint-B-temporary-version-with-distinct-content"
+
+        first_a = await queue.save_checkpoint(
+            store=store,
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            identity=identity,
+            payload=payload_a,
+        )
+        await queue.save_checkpoint(
+            store=store,
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            identity=identity,
+            payload=payload_b,
+        )
+        after_b = await repository.artifact_reservation_for(job_id)
+        assert after_b["consumed_bytes"] == len(payload_b)
+        with pytest.raises(FileNotFoundError):
+            objects.read_source(
+                object_key=first_a.uri.removeprefix(f"s3://{bucket}/"),
+                sha256_digest=first_a.sha256,
+                size_bytes=first_a.size_bytes,
+            )
+
+        recreated_a = await queue.save_checkpoint(
+            store=store,
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            identity=identity,
+            payload=payload_a,
+        )
+        reservation = await repository.artifact_reservation_for(job_id)
+        assert recreated_a.uri == first_a.uri
+        assert reservation["consumed_bytes"] == recreated_a.size_bytes
+        assert (await queue.load_checkpoint(store=store, job_id=job_id)).payload == payload_a
+
+        failed = await queue.record_probe_measurement(
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            exit_code=1,
+            peak_allocated_mib=None,
+            peak_reserved_mib=None,
+            optimizer_steps=0,
+            checkpoint_resumed=False,
+            checkpoint_sha256=None,
+            inference_steps=0,
+            verification_details={"passed": False, "failure": "test_checkpoint_aba_settlement"},
+        )
+        assert failed["result_state"] == "failed"
+        assert await _storage_bytes(task7_database_url) == baseline + len(payload_a)
+        assert objects.read_source(
+            object_key=recreated_a.uri.removeprefix(f"s3://{bucket}/"),
+            sha256_digest=recreated_a.sha256,
+            size_bytes=recreated_a.size_bytes,
+        ) == payload_a
+        objects.delete_object(object_key=recreated_a.uri.removeprefix(f"s3://{bucket}/"))
+        await queue.close()
+        await repository.close()
+        await sources.close()
+
+    asyncio.run(exercise())
+
+
+def test_file_checkpoint_replacements_account_only_retained_bytes_and_keep_replacing(
+    task7_database_url: str, tmp_path: Path
+) -> None:
+    async def exercise() -> None:
+        from gods_mlops.jobs.checkpoints import FileCheckpointStore
+
+        repository = PostgresJobQueueRepository(database_url=task7_database_url)
+        await repository.ensure_schema()
+        sources = DatasetSourceRegistry(database_url=task7_database_url)
+        queue = JobQueue(repository=repository, sources=sources)
+        model = importlib.import_module("gods_mlops.training.contracts").locked_model("detr")
+        config_version = f"task8-file-checkpoint-{uuid4().hex}"
+        await queue.register_profile(
+            ExecutionProfile(
+                model_kind="detr",
+                config_version=config_version,
+                phase="probe",
+                target_phase="training",
+                memory_requirement_mib=8_192,
+                artifact_reservation_bytes=9 * 1024**2,
+                config={
+                    "model_id": model.model_id,
+                    "model_revision": model.revision,
+                    "input_size": 640,
+                    "micro_batch": 1,
+                },
+                candidate=True,
+            )
+        )
+        job_id = await queue.submit_probe(
+            model_kind="detr",
+            config_version=config_version,
+            probe_input_id=f"task8-file-checkpoint-{uuid4().hex}",
+            input_sha256="5" * 64,
+        )
+        baseline = await _storage_bytes(task7_database_url)
+        now = [datetime.now(UTC)]
+
+        class Observer:
+            async def observe(self):
+                return _observation(now[0] + timedelta(milliseconds=100))
+
+        admission = GpuAdmission(
+            repository=repository,
+            queue=queue,
+            expected_node_id="ubuntu",
+            expected_host_identity=HOST_IDENTITY,
+            expected_gpu_uuid=GPU_UUID,
+            expected_filesystem_identity=FILESYSTEM_IDENTITY,
+            expected_storage_path=STORAGE_PATH,
+            observer=Observer(),
+            clock=lambda: now[0],
+        )
+        await _admit_probe(queue, admission, job_id, now)
+        lease = await repository.get_active_lease(GPU_UUID)
+        identity = await repository.checkpoint_identity(job_id)
+        store = FileCheckpointStore(root=tmp_path)
+        checkpoint_directory = tmp_path / job_id
+        payload_size = 2 * 1024**2
+        latest = None
+        for generation in range(5):
+            payload = bytes([generation + 1]) * payload_size
+            latest = await queue.save_checkpoint(
+                store=store,
+                job_id=job_id,
+                lease_token=lease["lease_token"],
+                identity=identity,
+                payload=payload,
+            )
+            retained_bytes = sum(path.stat().st_size for path in checkpoint_directory.iterdir())
+            reservation = await repository.artifact_reservation_for(job_id)
+            assert reservation["consumed_bytes"] == retained_bytes
+            assert len(list(checkpoint_directory.glob("*.checkpoint"))) == 1
+            assert len(list(checkpoint_directory.glob("*.json"))) == 1
+        assert latest is not None
+
+        failed = await queue.record_probe_measurement(
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            exit_code=1,
+            peak_allocated_mib=None,
+            peak_reserved_mib=None,
+            optimizer_steps=0,
+            checkpoint_resumed=False,
+            checkpoint_sha256=None,
+            inference_steps=0,
+            verification_details={"passed": False, "failure": "test_file_checkpoint_quota"},
+        )
+        assert failed["result_state"] == "failed"
+        retained_bytes = sum(path.stat().st_size for path in checkpoint_directory.iterdir())
+        reservation = await repository.artifact_reservation_for(job_id)
+        assert reservation["state"] == "settled"
+        assert reservation["consumed_bytes"] == retained_bytes
+        assert await _storage_bytes(task7_database_url) == baseline + retained_bytes
+        await queue.close()
+        await repository.close()
+        await sources.close()
+
+    asyncio.run(exercise())
+
+
 def test_s3_checkpoint_delete_failure_keeps_both_versions_charged_until_retry(
     task7_database_url: str,
 ) -> None:

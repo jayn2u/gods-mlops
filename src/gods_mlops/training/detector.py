@@ -356,8 +356,10 @@ def _draft_detections(
     }
     encoded = write_json(output_path / "draft-detections.json", output)
     digest = sha256(encoded).hexdigest()
-    measurements = resource_measurements(started, optimizer_steps=0, inference_steps=len(images))
-    measurements.update({"input_size": 640, "micro_batch": 1})
+    measurements = _draft_resource_measurements(
+        resource_measurements(started, optimizer_steps=0, inference_steps=len(images)),
+        identity=identity,
+    )
     result_uri = None
     commit_result = config.get("_commit_result_artifact")
     if callable(commit_result):
@@ -393,6 +395,23 @@ def _detector_items(manifest: dict[str, Any], config: dict[str, Any]) -> list[di
         if len(selected) > limit:
             raise ValueError("DETR preparation input exceeds its versioned max_draft_frames bound")
     return selected
+
+
+def _draft_resource_measurements(
+    measurements: dict[str, Any], *, identity: dict[str, Any]
+) -> dict[str, Any]:
+    """Persist the same locked model identity used by the DETR draft document."""
+    model_id = identity.get("model_id")
+    model_revision = identity.get("model_revision")
+    if not isinstance(model_id, str) or not model_id or not isinstance(model_revision, str) or not model_revision:
+        raise ValueError("DETR draft measurements require the locked model identity")
+    return {
+        **measurements,
+        "input_size": 640,
+        "micro_batch": 1,
+        "model_id": model_id,
+        "model_revision": model_revision,
+    }
 
 
 def _processor_inputs(

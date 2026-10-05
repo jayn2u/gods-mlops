@@ -120,10 +120,12 @@ def test_published_clip_batches_cover_examples_and_resume_from_optimizer_cursor(
 
     assert object_store is None
     assert len(pairs) == 5
+    assert sum(len(pair["negative_texts"]) for pair in pairs) == 0
     batches = [batch_for_step(pairs, micro_batch=2, optimizer_step=step) for step in range(3)]
     consumed = {pair["image_id"] for batch in batches for pair in batch}
     assert consumed == {item["item_id"] for item in items}
     assert all(validate_pairs({"contrastive_config_version": "test-v1", "pairs": batch}) == 2 for batch in batches)
+    assert all(len(pair["negative_texts"]) == 1 for batch in batches for pair in batch)
     assert [pair["image_id"] for pair in batch_for_step(pairs, micro_batch=2, optimizer_step=3)] == [
         "crop-1",
         "crop-2",
@@ -154,6 +156,214 @@ def test_detr_preparation_probe_enforces_its_measured_frame_bound() -> None:
     with pytest.raises(ValueError, match="exceeds its versioned max_draft_frames bound"):
         detector_items({"items": frames}, config)
     assert detector_items({"items": frames[:1]}, config) == frames[:1]
+
+
+@pytest.mark.parametrize("phase", ["preparation", "probe"])
+def test_detr_draft_result_recovery_uses_the_runner_measurement_shape_without_cuda(
+    phase: str, monkeypatch, tmp_path
+) -> None:
+    from types import SimpleNamespace
+
+    worker = _require("gods_mlops.training.worker", "_recover_committed_result")
+    claim_type = _require("gods_mlops.training.claims", "WorkerClaim")
+    identity_type = _require("gods_mlops.jobs.checkpoints", "CheckpointIdentity")
+    contracts = importlib.import_module("gods_mlops.training.contracts")
+    model = contracts.locked_model("detr")
+    job_id = "detr-draft-recovery-v1"
+    config_version = "detr-preparation-recovery-v1"
+    if phase == "preparation":
+        input_id = "annotation-batch-detr-recovery-v1"
+        input_kind = "annotation_batch"
+        items = [
+            {
+                "item_kind": "frame",
+                "item_id": "frame-recovery-v1",
+                "sample_id": "sample-recovery-v1",
+                "sha256": "3" * 64,
+                "object_key": "samples/frame-recovery-v1.jpg",
+                "object_size_bytes": 512,
+                "revision_id": None,
+            }
+        ]
+        input_sha256 = sha256(
+            __import__("gods_mlops.datasets.manifest", fromlist=["canonical_json"]).canonical_json(
+                {"schema": "annotation-preparation-input-v1", "items": items}
+            )
+        ).hexdigest()
+        manifest = {
+            "schema_version": 1,
+            "batch_id": input_id,
+            "input_id": input_id,
+            "input_sha256": input_sha256,
+            "model_kind": "detr",
+            "config_version": config_version,
+            "items": items,
+        }
+        dataset_version = None
+    else:
+        input_id = "task8-detr-preparation-synthetic-probe-v1"
+        input_kind = "probe_input"
+        manifest = {
+            "schema_version": 1,
+            "fixture": True,
+            "phase": "probe",
+            "model_kind": "detr",
+            "input_kind": "probe_input",
+            "input_id": input_id,
+            "config_version": config_version,
+            "model_id": model.model_id,
+            "model_revision": model.revision,
+            "items": [
+                {
+                    "kind": "frame",
+                    "item_kind": "frame",
+                    "item_id": "task8-probe-frame-1",
+                    "sample_id": "task8-probe-frame-1",
+                    "object": {"key": "probe-inputs/frame.jpg", "sha256": "3" * 64, "size_bytes": 512},
+                    "snapshot": {"bbox_annotation": {"result": []}},
+                }
+            ],
+        }
+        input_sha256 = sha256(
+            __import__("gods_mlops.datasets.manifest", fromlist=["canonical_json"]).canonical_json(manifest)
+        ).hexdigest()
+        dataset_version = None
+
+    identity = identity_type(
+        job_id=job_id,
+        input_kind=input_kind,
+        input_id=input_id,
+        input_sha256=input_sha256,
+        phase=phase,
+        model_kind="detr",
+        config_version=config_version,
+        config_sha256="4" * 64,
+        dataset_version=dataset_version,
+    )
+    claim = claim_type(
+        job_id=job_id,
+        lease_token="d" * 36,
+        fence=2,
+        gpu_uuid="GPU-e5fd41ed-1688-8aca-3cd4-7904d53d764e",
+        phase=phase,
+        target_phase="preparation",
+        input_kind=input_kind,
+        input_id=input_id,
+        input_sha256=input_sha256,
+        dataset_version=None,
+        model_kind="detr",
+        config_version=config_version,
+        config_sha256="4" * 64,
+        image_id="sha256:" + "a" * 64,
+    )
+    config = {
+        **identity.as_dict(),
+        "phase": phase,
+        "target_phase": "preparation",
+        "model_kind": "detr",
+        "model_id": model.model_id,
+        "model_revision": model.revision,
+    }
+    result_document = {
+        "schema_version": 1,
+        "model_kind": "detr",
+        "model_id": model.model_id,
+        "model_revision": model.revision,
+        "config_version": config_version,
+        "input_id": input_id,
+        "input_sha256": input_sha256,
+        "score_threshold": 0.3,
+        "drafts": [
+            {"item_id": "frame-recovery-v1", "image_width": 640, "image_height": 640, "detections": []}
+        ],
+    }
+    from gods_mlops.datasets.manifest import canonical_json
+
+    payload = canonical_json(result_document)
+    digest = sha256(payload).hexdigest()
+    draft_measurements = _require("gods_mlops.training.detector", "_draft_resource_measurements")
+    measurements = draft_measurements(
+        {
+            "peak_vram_allocated_mib": 4_000,
+            "peak_vram_reserved_mib": 5_000,
+            "elapsed_seconds": 1.2,
+            "optimizer_steps": 0,
+            "inference_steps": 1,
+            "precision": "float16-autocast",
+        },
+        identity={"model_id": model.model_id, "model_revision": model.revision},
+    )
+    artifact_details = {
+        "kind": "drafts",
+        "uri": "s3://task8-test/jobs/detr-draft-recovery-v1/result.artifact",
+        "sha256": digest,
+        "size_bytes": len(payload),
+        "identity": identity.as_dict(),
+        "object_key": "jobs/detr-draft-recovery-v1/result.artifact",
+        "operation_id": "e" * 36,
+        "runtime_measurements": measurements,
+    }
+
+    class Repository:
+        async def result_artifacts_for(self, requested_job_id):
+            assert requested_job_id == job_id
+            return [artifact_details]
+
+    class Queue:
+        repository = Repository()
+
+        async def complete_owned_job(self, **kwargs):
+            self.completed = kwargs
+
+        async def record_probe_measurement(self, **kwargs):
+            self.probe_measurement = kwargs
+            return {"result_state": "succeeded"}
+
+    queue = Queue()
+
+    class ResultStore:
+        def verify_committed(self, details, *, expected_identity):
+            assert details is artifact_details
+            assert expected_identity == identity
+            assert sha256(payload).hexdigest() == details["sha256"]
+            return SimpleNamespace(
+                identity=identity,
+                kind="drafts",
+                sha256=digest,
+                size_bytes=len(payload),
+                uri=details["uri"],
+            )
+
+    async def manifest_for_job(_job, _queue, _objects, *, root):
+        path = root / "frozen-detr-preparation-manifest.json"
+        path.write_bytes(canonical_json(manifest))
+        return path.resolve().as_uri(), {}
+
+    async def current_claim(_queue, _claim, *, object_store=None):
+        return {}, {}
+
+    monkeypatch.setattr(importlib.import_module("gods_mlops.training.worker"), "_worker_manifest", manifest_for_job)
+    monkeypatch.setattr(importlib.import_module("gods_mlops.training.worker"), "validate_current_worker_claim", current_claim)
+
+    async def recover():
+        return await worker(
+            job={"job_id": job_id},
+            queue=queue,
+            claim=claim,
+            identity=identity,
+            objects=object(),
+            checkpoint_store=object(),
+            result_store=ResultStore(),
+            model=model,
+            contracts=contracts,
+            config=config,
+        )
+
+    assert asyncio.run(recover()) == 0
+    if phase == "probe":
+        assert queue.probe_measurement["inference_steps"] == 1
+    else:
+        assert queue.completed["details"]["result_uri"] == artifact_details["uri"]
 
 
 def test_kubernetes_worker_process_requires_owned_pod_and_exact_cgroup_identity() -> None:

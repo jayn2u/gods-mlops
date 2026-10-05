@@ -10,8 +10,10 @@ from .contracts import load_manifest, locked_model, validate_manifest_identity
 from .data import load_rgb_image
 
 
-def validate_contrastive_pairs(manifest: dict[str, Any]) -> int:
-    """Require versioned, distinct positives and explicit in-batch negatives."""
+def validate_contrastive_pairs(
+    manifest: dict[str, Any], *, require_negatives: bool = True
+) -> int:
+    """Validate distinct positives and optionally require their in-batch negatives."""
     version = manifest.get("contrastive_config_version")
     pairs = manifest.get("pairs")
     if not isinstance(version, str) or not version.strip():
@@ -32,19 +34,24 @@ def validate_contrastive_pairs(manifest: dict[str, Any]) -> int:
             raise ValueError("CLIP contrastive pairs need distinct image IDs and positive text")
         if image_id in image_ids or text in positive_texts:
             raise ValueError("CLIP positive pairs must use distinct images and texts")
-        if not isinstance(negative_texts, list) or not negative_texts:
+        if require_negatives and (not isinstance(negative_texts, list) or not negative_texts):
             raise ValueError("CLIP training requires explicit negative examples for each pair")
-        negatives = {str(item).strip() for item in negative_texts if str(item).strip()}
+        negatives = (
+            {str(item).strip() for item in negative_texts if str(item).strip()}
+            if isinstance(negative_texts, list)
+            else set()
+        )
         if text in negatives:
             raise ValueError("a CLIP negative example cannot equal its positive text")
         image_ids.add(image_id)
         positive_texts.add(text)
         negatives_by_image[image_id] = negatives
         positive_by_image[image_id] = text
-    for image_id, negatives in negatives_by_image.items():
-        positive = positive_by_image[image_id]
-        if not any(text in positive_texts and text != positive for text in negatives):
-            raise ValueError(f"CLIP pair {image_id} has no explicit cross-example negative")
+    if require_negatives:
+        for image_id, negatives in negatives_by_image.items():
+            positive = positive_by_image[image_id]
+            if not any(text in positive_texts and text != positive for text in negatives):
+                raise ValueError(f"CLIP pair {image_id} has no explicit cross-example negative")
     return len(pairs)
 
 
@@ -89,7 +96,8 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         {
             "contrastive_config_version": config.get("contrastive_config_version"),
             "pairs": pairs,
-        }
+        },
+        require_negatives=config.get("phase") == "probe",
     )
     started = perf_counter()
     model_lock = locked_model("clip")
@@ -321,12 +329,11 @@ def _pairs_from_manifest(
                 seen_texts.add(text)
         if len(unique) < micro_batch:
             raise ValueError("published CLIP input is smaller than its complete contrastive micro-batch")
-        positive_texts = [text for _item, text in unique]
         raw_pairs = [
             {
                 "image_id": str(item["item_id"]),
                 "text": text,
-                "negative_texts": [other for other in positive_texts if other != text],
+                "negative_texts": [],
                 "media": item,
             }
             for item, text in unique
@@ -357,7 +364,12 @@ def _contrastive_batch(
     if micro_batch < 2 or optimizer_step < 0 or len(pairs) < micro_batch:
         raise ValueError("CLIP batch cursor requires a complete positive micro-batch")
     start = (optimizer_step * micro_batch) % len(pairs)
-    return [pairs[(start + offset) % len(pairs)] for offset in range(micro_batch)]
+    selected = [pairs[(start + offset) % len(pairs)] for offset in range(micro_batch)]
+    batch_texts = [pair["text"] for pair in selected]
+    return [
+        {**pair, "negative_texts": [text for text in batch_texts if text != pair["text"]]}
+        for pair in selected
+    ]
 
 
 def _encode_contrastive_batch(

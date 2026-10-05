@@ -1497,18 +1497,24 @@ class PostgresJobQueueRepository:
                     """SELECT event_type,details FROM gods_mlops_job_events
                        WHERE job_id=$1::uuid AND event_type IN
                          ('artifact_write_pending','result_artifact_committed','checkpoint_committed',
-                          'artifact_write_deleted')
+                          'artifact_write_deleted','checkpoint_pruned')
                        ORDER BY event_id""",
                     job_id,
                 )
                 same_kind_commits = []
                 active_pending = []
                 deleted_intents: set[str] = set()
+                pruned_checkpoint_lifetimes: set[str] = set()
                 for row in events:
                     details = _json_value(row["details"])
                     event_type = row["event_type"]
                     if event_type == "artifact_write_deleted":
                         deleted_intents.add(str(details.get("operation_id", "")))
+                        continue
+                    if event_type == "checkpoint_pruned":
+                        lifetime_id = details.get("write_lifetime_id") or details.get("operation_id")
+                        if lifetime_id:
+                            pruned_checkpoint_lifetimes.add(str(lifetime_id))
                         continue
                     event_uri = details.get("uri") or details.get("checkpoint_uri")
                     if operation == "result" and event_type == "result_artifact_committed":
@@ -1536,7 +1542,10 @@ class PostgresJobQueueRepository:
                         )
                 for details in active_pending:
                     operation_id = str(details.get("operation_id", ""))
-                    if operation_id in deleted_intents:
+                    lifetime_id = str(details.get("write_lifetime_id") or operation_id)
+                    if operation_id in deleted_intents or (
+                        operation == "checkpoint" and lifetime_id in pruned_checkpoint_lifetimes
+                    ):
                         continue
                     if (
                         details.get("uri") == uri
@@ -1583,6 +1592,7 @@ class PostgresJobQueueRepository:
                 if operation == "checkpoint":
                     details.update(
                         {
+                            "write_lifetime_id": operation_id,
                             "previous_uri": getattr(prepared, "previous_uri", None),
                             "previous_sha256": getattr(prepared, "previous_sha256", None),
                             "previous_size_bytes": getattr(prepared, "previous_size_bytes", None),
@@ -1621,6 +1631,7 @@ class PostgresJobQueueRepository:
             StaleCheckpointOwnerError,
         )
 
+        write_lifetime_id = operation_id or str(uuid4())
         await self.ensure_schema()
         pool = await self._get_pool()
         async with pool.acquire() as connection:
@@ -1680,6 +1691,9 @@ class PostgresJobQueueRepository:
                         "sha256": str(job["checkpoint_sha256"]).strip(),
                         "size_bytes": int(prior_details["size_bytes"]),
                         "metadata_size_bytes": int(prior_details.get("metadata_size_bytes", 0)),
+                        "operation_id": prior_details.get("operation_id"),
+                        "write_lifetime_id": _checkpoint_lifetime_id(prior_details),
+                        "identity": prior_details.get("identity"),
                     }
                 result_exists = await connection.fetchval(
                     """SELECT EXISTS(SELECT 1 FROM gods_mlops_job_events
@@ -1759,10 +1773,11 @@ class PostgresJobQueueRepository:
                         "metadata_size_bytes": prepared.metadata_size_bytes,
                         "object_key": getattr(prepared, "object_key", None),
                         "operation_id": operation_id,
+                        "write_lifetime_id": write_lifetime_id,
                         "identity": identity.as_dict(),
                     }),
                 )
-                if precharged and prior_checkpoint is not None and prior_checkpoint["uri"] != checkpoint_uri:
+                if prior_checkpoint is not None and prior_checkpoint["uri"] != checkpoint_uri:
                     prior_uri = getattr(prepared, "previous_uri", None)
                     if prior_uri != prior_checkpoint["uri"]:
                         raise CheckpointIdentityError("checkpoint replacement lost its previous object identity")
@@ -1776,10 +1791,9 @@ class PostgresJobQueueRepository:
                     existing_prune = await connection.fetchval(
                         """SELECT EXISTS(SELECT 1 FROM gods_mlops_job_events
                            WHERE job_id=$1::uuid AND event_type='checkpoint_prune_pending'
-                             AND details->>'uri'=$2 AND details->>'sha256'=$3)""",
+                             AND details->>'write_lifetime_id'=$2)""",
                         job_id,
-                        prior_checkpoint["uri"],
-                        prior_checkpoint["sha256"],
+                        prior_checkpoint["write_lifetime_id"],
                     )
                     if not existing_prune:
                         await connection.execute(
@@ -1793,6 +1807,7 @@ class PostgresJobQueueRepository:
                                 {
                                     **prior_checkpoint,
                                     "identity": identity.as_dict(),
+                                    "write_lifetime_id": prior_checkpoint["write_lifetime_id"],
                                     "replacement_uri": checkpoint_uri,
                                     "replacement_sha256": verified.sha256,
                                 }
@@ -1812,11 +1827,11 @@ class PostgresJobQueueRepository:
                    ORDER BY event_id""",
                 job_id,
             )
-        pending: dict[tuple[str, str], dict[str, Any]] = {}
-        resolved: set[tuple[str, str]] = set()
+        pending: dict[str, dict[str, Any]] = {}
+        resolved: set[str] = set()
         for row in rows:
             details = _json_value(row["details"])
-            key = (str(details.get("uri", "")), str(details.get("sha256", "")))
+            key = _checkpoint_lifetime_id(details)
             if row["event_type"] == "checkpoint_prune_pending":
                 pending[key] = details
             else:
@@ -1994,11 +2009,12 @@ class PostgresJobQueueRepository:
                 )
                 uri = str(previous.get("uri", ""))
                 digest = str(previous.get("sha256", ""))
+                lifetime_id = _checkpoint_lifetime_id(previous)
                 has_pending = False
                 already_pruned = False
                 for row in rows:
                     details = _json_value(row["details"])
-                    if details.get("uri") == uri and details.get("sha256") == digest:
+                    if _checkpoint_lifetime_id(details) == lifetime_id:
                         has_pending |= row["event_type"] == "checkpoint_prune_pending"
                         already_pruned |= row["event_type"] == "checkpoint_pruned"
                 if not has_pending or already_pruned:
@@ -2036,6 +2052,8 @@ class PostgresJobQueueRepository:
                             "size_bytes": int(previous["size_bytes"]),
                             "metadata_size_bytes": int(previous.get("metadata_size_bytes", 0)),
                             "identity": previous.get("identity"),
+                            "operation_id": previous.get("operation_id"),
+                            "write_lifetime_id": lifetime_id,
                         }
                     ),
                 )
@@ -2074,6 +2092,9 @@ class PostgresJobQueueRepository:
             "uri": uri,
             "sha256": str(digest).strip(),
             "size_bytes": int(details["size_bytes"]),
+            "metadata_size_bytes": int(details.get("metadata_size_bytes", 0)),
+            "operation_id": details.get("operation_id"),
+            "write_lifetime_id": _checkpoint_lifetime_id(details),
             "identity": identity,
         }
 
@@ -3362,6 +3383,7 @@ class JobQueue:
             previous_uri=previous["uri"] if previous else None,
             previous_sha256=previous["sha256"] if previous else None,
             previous_size_bytes=previous["size_bytes"] if previous else None,
+            previous_metadata_size_bytes=previous["metadata_size_bytes"] if previous else None,
         )
         precharged = getattr(prepared, "object_key", None) is not None
         operation_id = None
@@ -3385,8 +3407,7 @@ class JobQueue:
         )
         if previous is not None and previous["uri"] != _verified_checkpoint_uri(verified):
             store.prune_previous(prepared)
-            if precharged:
-                await self._repository.complete_checkpoint_prune(job_id=job_id, previous=previous)
+            await self._repository.complete_checkpoint_prune(job_id=job_id, previous=previous)
         return verified
 
     async def save_result_artifact(
@@ -3507,6 +3528,8 @@ class JobQueue:
                 sha256_digest=previous["sha256"],
                 size_bytes=int(previous["size_bytes"]),
                 job_id=job_id,
+                identity=previous.get("identity"),
+                metadata_size_bytes=int(previous.get("metadata_size_bytes", 0)),
             )
             if await self._repository.complete_checkpoint_prune(job_id=job_id, previous=previous):
                 completed.append(previous["uri"])
@@ -3658,6 +3681,18 @@ class JobQueue:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _checkpoint_lifetime_id(details: dict[str, Any]) -> str:
+    """Identify one committed checkpoint object lifetime, not only its reusable URI/hash."""
+    lifetime_id = details.get("write_lifetime_id") or details.get("operation_id")
+    if lifetime_id:
+        return str(lifetime_id)
+    legacy_identity = {
+        "uri": str(details.get("uri", "")),
+        "sha256": str(details.get("sha256", "")),
+    }
+    return "legacy-" + sha256(_canonical_json(legacy_identity).encode("utf-8")).hexdigest()
 
 
 def _verified_checkpoint_uri(verified: Any) -> str:

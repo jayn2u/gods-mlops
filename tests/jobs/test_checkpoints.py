@@ -55,6 +55,28 @@ def test_partial_files_are_not_resumeable_and_identity_mismatch_is_rejected(tmp_
     assert store.load(identity.job_id, expected_identity=changed_input) is None
 
 
+def test_file_checkpoint_store_save_replaces_only_the_prior_committed_lifetime(tmp_path) -> None:
+    store = FileCheckpointStore(root=tmp_path)
+    identity = _identity()
+
+    first = store.save(
+        identity=identity,
+        payload=b"first committed local checkpoint",
+        reservation_bytes=1024,
+    )
+    second = store.save(
+        identity=identity,
+        payload=b"second committed local checkpoint",
+        reservation_bytes=1024,
+    )
+
+    assert second.payload == b"second committed local checkpoint"
+    assert first.sha256 != second.sha256
+    checkpoint_directory = tmp_path / identity.job_id
+    assert len(list(checkpoint_directory.glob("*.checkpoint"))) == 1
+    assert len(list(checkpoint_directory.glob("*.json"))) == 1
+
+
 def test_checkpoint_hash_mismatch_is_never_returned_as_resumable(tmp_path) -> None:
     store = FileCheckpointStore(root=tmp_path)
     identity = _identity()

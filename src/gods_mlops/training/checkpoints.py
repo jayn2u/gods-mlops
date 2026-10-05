@@ -25,6 +25,7 @@ class PreparedS3Checkpoint:
     previous_uri: str | None
     previous_sha256: str | None
     previous_size_bytes: int | None
+    previous_metadata_size_bytes: int | None
 
     @property
     def uri(self) -> str:
@@ -56,6 +57,7 @@ class S3CheckpointStore:
         previous_uri: str | None = None,
         previous_sha256: str | None = None,
         previous_size_bytes: int | None = None,
+        previous_metadata_size_bytes: int | None = None,
     ) -> PreparedS3Checkpoint:
         if not isinstance(payload, bytes) or not payload:
             raise ValueError("checkpoint payload must contain bytes")
@@ -77,6 +79,7 @@ class S3CheckpointStore:
             previous_uri=previous_uri,
             previous_sha256=previous_sha256,
             previous_size_bytes=previous_size_bytes,
+            previous_metadata_size_bytes=previous_metadata_size_bytes,
         )
 
     def commit(self, prepared: PreparedS3Checkpoint) -> VerifiedCheckpoint:
@@ -145,9 +148,20 @@ class S3CheckpointStore:
             sha256_digest=prepared.previous_sha256,
             size_bytes=prepared.previous_size_bytes,
             job_id=prepared.identity.job_id,
+            identity=prepared.identity,
+            metadata_size_bytes=prepared.previous_metadata_size_bytes or 0,
         )
 
-    def prune_uri(self, uri: str, *, sha256_digest: str, size_bytes: int, job_id: str) -> None:
+    def prune_uri(
+        self,
+        uri: str,
+        *,
+        sha256_digest: str,
+        size_bytes: int,
+        job_id: str,
+        identity: CheckpointIdentity | dict[str, Any] | None = None,
+        metadata_size_bytes: int = 0,
+    ) -> None:
         bucket, key = _parse_uri(uri)
         allowed_prefix = f"{self._prefix}/{job_id}/checkpoints/"
         if bucket != self._bucket or not key.startswith(allowed_prefix):
@@ -156,6 +170,16 @@ class S3CheckpointStore:
             raise CheckpointIntegrityError("previous checkpoint deletion identity is invalid")
         if not key.endswith(f"/{sha256_digest}.checkpoint"):
             raise CheckpointIntegrityError("previous checkpoint key does not match its content identity")
+        if identity is not None:
+            identity_value = identity.as_dict() if isinstance(identity, CheckpointIdentity) else identity
+            if identity_value.get("job_id") != job_id:
+                raise CheckpointIntegrityError("previous checkpoint identity belongs to another job")
+            identity_hash = sha256(canonical_json(identity_value)).hexdigest()
+            expected_key = f"{allowed_prefix}{identity_hash}/{sha256_digest}.checkpoint"
+            if key != expected_key:
+                raise CheckpointIntegrityError("previous checkpoint key differs from its immutable identity")
+        elif metadata_size_bytes != 0:
+            raise CheckpointIntegrityError("S3 checkpoint metadata must be held in the durable queue ledger")
         try:
             self._objects.read_source(
                 object_key=key,
