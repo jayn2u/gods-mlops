@@ -30,3 +30,11 @@ def test_proc_start_ticks_handles_spaces_and_parentheses_in_the_process_name() -
 def test_proc_start_ticks_rejects_incomplete_process_records() -> None:
     with pytest.raises(ValueError, match="start time"):
         _live_probe_api().proc_start_ticks("123 (python) S 1 2")
+
+
+def test_cached_training_image_runs_the_requested_python_command() -> None:
+    module = _live_probe_api()
+    assert hasattr(module, "python_entrypoint_command"), "the image entrypoint override is missing"
+    assert module.python_entrypoint_command(
+        "gods-mlops-training:task1", ["-m", "gods_mlops.jobs.live_probe", "worker"]
+    ) == ["--entrypoint", "python", "gods-mlops-training:task1", "-m", "gods_mlops.jobs.live_probe", "worker"]

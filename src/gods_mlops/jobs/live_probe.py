@@ -66,6 +66,11 @@ def proc_start_ticks(stat_record: str) -> int:
     return result
 
 
+def python_entrypoint_command(image: str, command: list[str]) -> list[str]:
+    """Override the cached training image's gods-mlops entrypoint for Python probes."""
+    return ["--entrypoint", "python", image, *command]
+
+
 def _source_revision() -> str:
     root = Path(__file__).resolve().parents[3]
     status = subprocess.run(
@@ -326,7 +331,7 @@ async def _run(args: argparse.Namespace) -> None:
             raise RuntimeError("cached training image does not match its pinned ID")
         remote(["docker", "run", "--rm", "--pull=never", "--network=host", "--user", f"{uid}:{gid}",
                 "--mount", f"type=bind,source={root}/source,target=/probe/source,readonly", "--env", "PYTHONPATH=/probe/source",
-                args.training_image, "python", "-c", "import asyncpg, torch"], timeout=60)
+                *python_entrypoint_command(args.training_image, ["-c", "import asyncpg, torch"])], timeout=60)
 
         forwarded_port = random.randint(51_000, 61_000)
         tunnel = await asyncio.create_subprocess_exec(*ssh_base, "-N", "-o", "ExitOnForwardFailure=yes", "-R",
@@ -342,7 +347,7 @@ async def _run(args: argparse.Namespace) -> None:
         first_lease_seconds = time.monotonic() - started
         owner_id = str(lease["lease_token"])
         first_generation = int(lease["fencing_token"])
-        base_command = ["python", "-m", "gods_mlops.jobs.live_probe"]
+        base_command = ["-m", "gods_mlops.jobs.live_probe"]
         first_worker = _ssh_container(args, run_id, root, uid, gid, args.training_image, args.gpu_uuid,
             f"gods-task7-{run_id[:10]}-first", [*base_command, "worker", "--job-id", job_id, "--lease-token", owner_id,
             "--checkpoint-root", f"{root}/work/checkpoints", "--max-seconds", str(args.worker_timeout_seconds)], worker_dsn)
@@ -484,7 +489,7 @@ def _ssh_container(args: argparse.Namespace, run_id: str, root: str, uid: str, g
              f"type=bind,source={root}/work,target={root}/work", "--env", "PYTHONPATH=/probe/source"]
     if dsn:
         parts += ["--env", f"GODS_MLOPS_DATABASE_URL={dsn}"]
-    output = _ssh(args, [*parts, image, *command], timeout=60).splitlines()[-1]
+    output = _ssh(args, [*parts, *python_entrypoint_command(image, command)], timeout=60).splitlines()[-1]
     if not re.fullmatch(r"[0-9a-f]{12,64}", output):
         raise RuntimeError("Docker did not return a container ID")
     return output
