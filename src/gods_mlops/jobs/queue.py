@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import posixpath
+from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
 from uuid import UUID, uuid4
@@ -40,14 +42,108 @@ class ResourceProfileConflictError(ValueError):
 class ObservationReplayError(ValueError):
     """An observation ID or timestamp was repeated and cannot extend the idle window."""
 
+    def __init__(self, message: str, *, idle_window_reset: bool = False) -> None:
+        super().__init__(message)
+        self.idle_window_reset = idle_window_reset
+
+
+class ResourceObservationRejectedError(ValueError):
+    """A producer sample failed its persisted resource trust or completeness checks."""
+
+    def __init__(self, reason_code: str) -> None:
+        super().__init__(reason_code)
+        self.reason_code = reason_code
+
 
 class PostgresJobQueueRepository:
     """Persist queue identities, profiles, and the shared lease state in PostgreSQL."""
 
-    def __init__(self, *, database_url: str) -> None:
+    def __init__(
+        self,
+        *,
+        database_url: str,
+        expected_host_identity: str | None = None,
+        expected_gpu_uuid: str | None = None,
+        expected_filesystem_identity: str | None = None,
+        expected_storage_path: str | None = None,
+        observation_max_age_seconds: int = 10,
+    ) -> None:
         self._database_url = database_url
         self._pool: asyncpg.Pool | None = None
         self._schema_ready = False
+        self._expected_observation_identity: tuple[str, ...] | None = None
+        self._observation_max_age_seconds = observation_max_age_seconds
+        supplied = (
+            expected_host_identity,
+            expected_gpu_uuid,
+            expected_filesystem_identity,
+            expected_storage_path,
+        )
+        if any(value is not None for value in supplied):
+            if not all(value for value in supplied):
+                raise ValueError("trusted Ubuntu observation identity must be configured completely")
+            self.configure_observation_identity(
+                expected_host_identity=expected_host_identity,
+                expected_gpu_uuid=expected_gpu_uuid,
+                expected_filesystem_identity=expected_filesystem_identity,
+                expected_storage_path=expected_storage_path,
+            )
+        if observation_max_age_seconds <= 0:
+            raise ValueError("maximum observation age must be positive")
+
+    def configure_observation_identity(
+        self,
+        *,
+        expected_host_identity: str | None,
+        expected_gpu_uuid: str | None,
+        expected_filesystem_identity: str | None,
+        expected_storage_path: str | None,
+    ) -> None:
+        """Pin the trusted observer identity before either admission or producer writes."""
+        values = (
+            expected_host_identity,
+            expected_gpu_uuid,
+            expected_filesystem_identity,
+            expected_storage_path,
+        )
+        if not all(isinstance(value, str) and value.strip() for value in values):
+            raise ValueError("trusted Ubuntu observation identity must be configured completely")
+        identity = (
+            "ubuntu",
+            "ubuntu",
+            "NVIDIA RTX A6000",
+            expected_host_identity,
+            expected_gpu_uuid,
+            expected_filesystem_identity,
+            posixpath.normpath(expected_storage_path),
+        )
+        if self._expected_observation_identity is not None and self._expected_observation_identity != identity:
+            raise ValueError("repository is already pinned to another Ubuntu observation identity")
+        self._expected_observation_identity = identity
+
+    @staticmethod
+    async def _lock_job_then_lease(
+        connection: asyncpg.Connection,
+        *,
+        job_id: str,
+        lease_token: str,
+    ) -> tuple[asyncpg.Record | None, asyncpg.Record | None]:
+        """Lock the job row before its lease row in every fenced lease transaction."""
+        job = await connection.fetchrow(
+            "SELECT * FROM gods_mlops_jobs WHERE job_id = $1::uuid FOR UPDATE",
+            job_id,
+        )
+        if job is None:
+            return None, None
+        lease = await connection.fetchrow(
+            """
+            SELECT * FROM gods_mlops_gpu_leases
+            WHERE job_id = $1::uuid AND lease_token = $2::uuid FOR UPDATE
+            """,
+            job_id,
+            lease_token,
+        )
+        return job, lease
 
     async def ensure_schema(self) -> None:
         if self._schema_ready:
@@ -314,69 +410,153 @@ class PostgresJobQueueRepository:
         observation: ResourceObservation,
         *,
         max_gap_seconds: int = 10,
+        received_at: datetime | None = None,
     ) -> dict[str, Any]:
-        """Persist a fresh Ubuntu snapshot and advance only its contiguous idle window."""
+        """Persist only complete, trusted producer samples and advance a contiguous idle window."""
         await self.ensure_schema()
+        received_at = received_at or datetime.now(UTC)
+        reason = self._observation_rejection_reason(observation, received_at)
+        if reason is not None:
+            await self.record_observation_failure(node_id="ubuntu", failure_code=reason)
+            raise ResourceObservationRejectedError(reason)
         pool = await self._get_pool()
         payload = _canonical_json(observation.to_dict())
+        rejected: ObservationReplayError | ResourceObservationRejectedError | None = None
+        state: dict[str, Any] | None = None
         async with pool.acquire() as connection:
             async with connection.transaction():
                 current = await connection.fetchrow(
-                    "SELECT * FROM gods_mlops_gpu_observation_current WHERE node_id = $1 FOR UPDATE",
-                    observation.node_id,
+                    "SELECT * FROM gods_mlops_gpu_observation_current WHERE node_id = 'ubuntu' FOR UPDATE"
                 )
                 if current is not None:
                     if str(current["observation_id"]) == observation.observation_id:
-                        raise ObservationReplayError("observation ID was already recorded")
-                    if observation.observed_at <= current["observed_at"]:
-                        raise ObservationReplayError("observation timestamp did not advance")
-                has_gpu_processes = bool(observation.gpu_processes)
-                if has_gpu_processes:
-                    idle_since = None
-                    idle_count = 0
-                elif current is not None and current["failure_code"] is None:
-                    previous = _json_value(current["observation"])
-                    gap = (observation.observed_at - current["last_observed_at"]).total_seconds()
-                    if (
-                        current["idle_since"] is not None
-                        and previous
-                        and 0 < gap <= max_gap_seconds
-                    ):
-                        idle_since = current["idle_since"]
-                        idle_count = current["idle_observation_count"] + 1
+                        rejected = ObservationReplayError(
+                            "observation ID was already recorded", idle_window_reset=True
+                        )
+                    elif observation.observed_at <= current["observed_at"]:
+                        rejected = ObservationReplayError(
+                            "observation timestamp did not advance", idle_window_reset=True
+                        )
+                    elif current["failure_code"] is None and current["observation"] is not None:
+                        previous = ResourceObservation.from_dict(_json_value(current["observation"]))
+                        if self._observation_identity(previous) != self._expected_observation_identity:
+                            rejected = ResourceObservationRejectedError(
+                                "ubuntu_observation_history_identity_mismatch"
+                            )
+                if rejected is not None:
+                    await self._record_observation_failure_in_transaction(
+                        connection,
+                        failure_code=str(rejected),
+                    )
+                else:
+                    has_gpu_processes = bool(observation.gpu_processes)
+                    if has_gpu_processes:
+                        idle_since = None
+                        idle_count = 0
+                    elif current is not None and current["failure_code"] is None:
+                        gap = (observation.observed_at - current["last_observed_at"]).total_seconds()
+                        if current["idle_since"] is not None and 0 < gap <= max_gap_seconds:
+                            idle_since = current["idle_since"]
+                            idle_count = current["idle_observation_count"] + 1
+                        else:
+                            idle_since = observation.observed_at
+                            idle_count = 1
                     else:
                         idle_since = observation.observed_at
                         idle_count = 1
-                else:
-                    idle_since = observation.observed_at
-                    idle_count = 1
-                row = await connection.fetchrow(
-                    """
-                    INSERT INTO gods_mlops_gpu_observation_current (
-                        node_id, observation_id, observed_at, received_at, observation,
-                        failure_code, failure_count, idle_since, idle_observation_count,
-                        last_observed_at
-                    ) VALUES ($1, $2::uuid, $3, now(), $4::jsonb, NULL, 0, $5, $6, $3)
-                    ON CONFLICT (node_id) DO UPDATE SET
-                        observation_id = EXCLUDED.observation_id,
-                        observed_at = EXCLUDED.observed_at,
-                        received_at = now(),
-                        observation = EXCLUDED.observation,
-                        failure_code = NULL,
-                        failure_count = 0,
-                        idle_since = EXCLUDED.idle_since,
-                        idle_observation_count = EXCLUDED.idle_observation_count,
-                        last_observed_at = EXCLUDED.last_observed_at
-                    RETURNING *
-                    """,
-                    observation.node_id,
-                    observation.observation_id,
-                    observation.observed_at,
-                    payload,
-                    idle_since,
-                    idle_count,
-                )
-                return _observation_state_dict(row)
+                    row = await connection.fetchrow(
+                        """
+                        INSERT INTO gods_mlops_gpu_observation_current (
+                            node_id, observation_id, observed_at, received_at, observation,
+                            failure_code, failure_count, idle_since, idle_observation_count,
+                            last_observed_at
+                        ) VALUES ('ubuntu', $1::uuid, $2, now(), $3::jsonb, NULL, 0, $4, $5, $2)
+                        ON CONFLICT (node_id) DO UPDATE SET
+                            observation_id = EXCLUDED.observation_id,
+                            observed_at = EXCLUDED.observed_at,
+                            received_at = now(),
+                            observation = EXCLUDED.observation,
+                            failure_code = NULL,
+                            failure_count = 0,
+                            idle_since = EXCLUDED.idle_since,
+                            idle_observation_count = EXCLUDED.idle_observation_count,
+                            last_observed_at = EXCLUDED.last_observed_at
+                        RETURNING *
+                        """,
+                        observation.observation_id,
+                        observation.observed_at,
+                        payload,
+                        idle_since,
+                        idle_count,
+                    )
+                    state = _observation_state_dict(row)
+        if rejected is not None:
+            raise rejected
+        assert state is not None
+        return state
+
+    def _observation_rejection_reason(
+        self,
+        observation: ResourceObservation,
+        received_at: datetime,
+    ) -> str | None:
+        if self._expected_observation_identity is None:
+            return "ubuntu_observer_identity_not_configured"
+        if received_at.tzinfo is None or observation.observed_at.tzinfo is None:
+            return "ubuntu_observation_incomplete"
+        age = (received_at - observation.observed_at).total_seconds()
+        if age < -2 or age > self._observation_max_age_seconds:
+            return "ubuntu_observation_stale"
+        if self._observation_identity(observation) != self._expected_observation_identity:
+            return "ubuntu_observation_identity_mismatch"
+        if (
+            not observation.gpu_process_list_complete
+            or not observation.process_table_complete
+            or observation.total_mib <= 0
+            or observation.free_mib < 0
+            or observation.free_mib > observation.total_mib
+            or observation.filesystem_available_bytes < 0
+        ):
+            return "ubuntu_observation_incomplete"
+        try:
+            UUID(observation.observation_id)
+        except ValueError:
+            return "ubuntu_observation_incomplete"
+        return None
+
+    @staticmethod
+    def _observation_identity(observation: ResourceObservation) -> tuple[str, ...]:
+        return (
+            observation.node_id,
+            observation.hostname.lower(),
+            observation.gpu_name,
+            observation.host_identity,
+            observation.gpu_uuid,
+            observation.filesystem_identity,
+            posixpath.normpath(observation.storage_path),
+        )
+
+    async def _record_observation_failure_in_transaction(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        failure_code: str,
+    ) -> None:
+        await connection.execute(
+            """
+            INSERT INTO gods_mlops_gpu_observation_current (
+                node_id, observation_id, observed_at, received_at, observation,
+                failure_code, failure_count, idle_since, idle_observation_count, last_observed_at
+            ) VALUES ('ubuntu', $1::uuid, now(), now(), NULL, $2, 1, NULL, 0, NULL)
+            ON CONFLICT (node_id) DO UPDATE SET
+                observation_id=EXCLUDED.observation_id, observed_at=EXCLUDED.observed_at,
+                received_at=now(), observation=NULL, failure_code=EXCLUDED.failure_code,
+                failure_count=gods_mlops_gpu_observation_current.failure_count+1,
+                idle_since=NULL, idle_observation_count=0, last_observed_at=NULL
+            """,
+            uuid4(),
+            failure_code[:128],
+        )
 
     async def record_observation_failure(self, *, node_id: str, failure_code: str) -> None:
         await self.ensure_schema()
@@ -435,7 +615,7 @@ class PostgresJobQueueRepository:
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
-                await connection.execute(
+                updated = await connection.fetchrow(
                     """
                     UPDATE gods_mlops_jobs SET state = $2, reason_code = $3,
                         reason_detail = $4::jsonb, retryable = TRUE, updated_at = now()
@@ -443,12 +623,19 @@ class PostgresJobQueueRepository:
                         'queued', 'waiting_profile', 'waiting_gpu', 'waiting_storage',
                         'waiting_capacity', 'yield_requested'
                     )
+                      AND lease_token IS NULL
+                    RETURNING job_id
                     """,
                     job_id,
                     state,
                     reason_code,
                     _canonical_json(details or {}),
                 )
+                if updated is None:
+                    row = await connection.fetchrow("SELECT * FROM gods_mlops_jobs WHERE job_id = $1::uuid", job_id)
+                    if row is None:
+                        raise KeyError(f"GPU job {job_id} does not exist")
+                    return _job_dict(row)
                 await connection.execute(
                     """
                     INSERT INTO gods_mlops_job_events (
@@ -505,15 +692,15 @@ class PostgresJobQueueRepository:
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
-                lease = await connection.fetchrow(
-                    """
-                    SELECT * FROM gods_mlops_gpu_leases
-                    WHERE job_id = $1::uuid AND lease_token = $2::uuid FOR UPDATE
-                    """,
-                    job_id,
-                    lease_token,
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
                 )
-                if lease is None:
+                if (
+                    job is None
+                    or lease is None
+                    or str(job["lease_token"]) != str(lease_token)
+                    or job["state"] not in {"running", "yield_requested"}
+                ):
                     return False
                 if lease["owner_pid"] is not None and (
                     lease["owner_pid"] != owner.pid
@@ -614,22 +801,15 @@ class PostgresJobQueueRepository:
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
-                lease = await connection.fetchrow(
-                    """
-                    SELECT lease_token FROM gods_mlops_gpu_leases
-                    WHERE job_id = $1::uuid AND lease_token = $2::uuid FOR UPDATE
-                    """,
-                    job_id,
-                    lease_token,
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
                 )
-                if lease is None:
-                    return False
-                row = await connection.fetchrow(
-                    "SELECT state FROM gods_mlops_jobs WHERE job_id = $1::uuid AND lease_token = $2::uuid FOR UPDATE",
-                    job_id,
-                    lease_token,
-                )
-                if row is None or row["state"] != "running":
+                if (
+                    job is None
+                    or lease is None
+                    or str(job["lease_token"]) != str(lease_token)
+                    or job["state"] != "running"
+                ):
                     return False
                 await connection.execute(
                     "UPDATE gods_mlops_gpu_leases SET expires_at = $3 WHERE job_id = $1::uuid AND lease_token = $2::uuid",
@@ -739,17 +919,8 @@ class PostgresJobQueueRepository:
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
-                job = await connection.fetchrow(
-                    "SELECT * FROM gods_mlops_jobs WHERE job_id = $1::uuid FOR UPDATE",
-                    job_id,
-                )
-                lease = await connection.fetchrow(
-                    """
-                    SELECT * FROM gods_mlops_gpu_leases
-                    WHERE job_id = $1::uuid AND lease_token = $2::uuid FOR UPDATE
-                    """,
-                    job_id,
-                    lease_token,
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
                 )
                 if (
                     job is None
@@ -957,22 +1128,20 @@ class PostgresJobQueueRepository:
         job_id: str,
         lease_token: str,
         observation: ResourceObservation,
+        terminal_reason: str | None = None,
     ) -> bool:
         """Release only after complete process and CUDA listings prove this owner exited."""
+        if terminal_reason is not None and not 1 <= len(terminal_reason) <= 128:
+            raise ValueError("terminal release reason must contain 1 to 128 characters")
         if not observation.gpu_process_list_complete or not observation.process_table_complete:
             return False
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
-                lease = await connection.fetchrow(
-                    """
-                    SELECT * FROM gods_mlops_gpu_leases
-                    WHERE job_id = $1::uuid AND lease_token = $2::uuid FOR UPDATE
-                    """,
-                    job_id,
-                    lease_token,
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
                 )
-                if lease is None:
+                if job is None or lease is None or str(job["lease_token"]) != str(lease_token):
                     return False
                 if lease["owner_pid"] is not None:
                     owner_pid = lease["owner_pid"]
@@ -991,34 +1160,188 @@ class PostgresJobQueueRepository:
                     observation.gpu_uuid,
                     lease_token,
                 )
-                await connection.execute(
+                released_job = await connection.fetchrow(
                     """
                     UPDATE gods_mlops_jobs SET
-                        state = CASE WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN state ELSE 'waiting_gpu' END,
-                        reason_code = CASE WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN reason_code ELSE 'yielded_checkpoint' END,
-                        reason_detail = CASE WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN reason_detail ELSE $3::jsonb END,
-                        retryable = CASE WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN retryable ELSE TRUE END,
+                        state = CASE
+                            WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN state
+                            WHEN $4::text IS NOT NULL THEN 'failed'
+                            ELSE 'waiting_gpu'
+                        END,
+                        reason_code = CASE
+                            WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN reason_code
+                            WHEN $4::text IS NOT NULL THEN $4
+                            ELSE 'yielded_checkpoint'
+                        END,
+                        reason_detail = CASE
+                            WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN reason_detail
+                            WHEN $4::text IS NOT NULL THEN $3::jsonb
+                            ELSE $3::jsonb
+                        END,
+                        retryable = CASE
+                            WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN retryable
+                            WHEN $4::text IS NOT NULL THEN FALSE
+                            ELSE TRUE
+                        END,
+                        completed_at = CASE
+                            WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN completed_at
+                            WHEN $4::text IS NOT NULL THEN now()
+                            ELSE completed_at
+                        END,
                         lease_token = NULL, lease_expires_at = NULL,
                         owner_pid = NULL, owner_start_ticks = NULL, owner_uid = NULL,
                         updated_at = now()
                     WHERE job_id = $1::uuid AND lease_token = $2::uuid
+                    RETURNING state, reason_code
                     """,
                     job_id,
                     lease_token,
-                    _canonical_json({"owner_process_exited": True, "gpu_release_observed": True}),
+                    _canonical_json({
+                        "owner_process_exited": True,
+                        "gpu_release_observed": True,
+                        "source_blocked": terminal_reason,
+                    }),
+                    terminal_reason,
                 )
+                if released_job is None:
+                    return False
                 await connection.execute(
                     """
                     INSERT INTO gods_mlops_job_events (
                         job_id, event_type, state, reason_code, observation_id,
                         fencing_token, details
-                    ) VALUES ($1::uuid, 'lease_owner_released', 'waiting_gpu', 'yielded_checkpoint',
-                        $2::uuid, $3, $4::jsonb)
+                    ) VALUES ($1::uuid, 'lease_owner_released', $2, $3,
+                        $4::uuid, $5, $6::jsonb)
                     """,
                     job_id,
+                    released_job["state"],
+                    released_job["reason_code"],
                     observation.observation_id,
                     lease["fencing_token"],
                     _canonical_json({"owner_pid": lease["owner_pid"], "owner_start_ticks": lease["owner_start_ticks"]}),
+                )
+                return True
+
+    async def release_unbound_expired_lease(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        observation: ResourceObservation,
+        terminal_reason: str | None = None,
+        min_idle_seconds: int = 30,
+        min_idle_observations: int = 7,
+    ) -> bool:
+        """Release only an expired unbound lease after a persisted complete idle proof."""
+        if terminal_reason is not None and not 1 <= len(terminal_reason) <= 128:
+            raise ValueError("terminal release reason must contain 1 to 128 characters")
+        if min_idle_seconds < 30 or min_idle_observations < 7:
+            raise ValueError("unbound lease recovery requires the full 30-second idle proof")
+        if (
+            not observation.gpu_process_list_complete
+            or not observation.process_table_complete
+            or observation.gpu_processes
+        ):
+            return False
+        from datetime import datetime
+
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                current = await connection.fetchrow(
+                    "SELECT * FROM gods_mlops_gpu_observation_current WHERE node_id = $1 FOR UPDATE",
+                    observation.node_id,
+                )
+                if (
+                    current is None
+                    or current["failure_code"] is not None
+                    or current["observation"] is None
+                    or str(current["observation_id"]) != observation.observation_id
+                ):
+                    return False
+                persisted = ResourceObservation.from_dict(_json_value(current["observation"]))
+                idle_since = current["idle_since"]
+                if isinstance(idle_since, str):
+                    idle_since = datetime.fromisoformat(idle_since)
+                if (
+                    persisted.gpu_processes
+                    or persisted.gpu_uuid != observation.gpu_uuid
+                    or idle_since is None
+                    or current["idle_observation_count"] < min_idle_observations
+                    or (observation.observed_at - idle_since).total_seconds() < min_idle_seconds
+                ):
+                    return False
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
+                )
+                if (
+                    job is None
+                    or lease is None
+                    or str(job["lease_token"]) != str(lease_token)
+                    or lease["gpu_uuid"] != observation.gpu_uuid
+                    or lease["owner_pid"] is not None
+                    or lease["owner_start_ticks"] is not None
+                    or lease["owner_uid"] is not None
+                    or lease["expires_at"] > observation.observed_at
+                ):
+                    return False
+                await connection.execute(
+                    "DELETE FROM gods_mlops_gpu_leases WHERE gpu_uuid=$1 AND lease_token=$2::uuid",
+                    observation.gpu_uuid,
+                    lease_token,
+                )
+                released_job = await connection.fetchrow(
+                    """
+                    UPDATE gods_mlops_jobs SET
+                        state = CASE
+                            WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN state
+                            WHEN $3::text IS NOT NULL THEN 'failed'
+                            ELSE 'waiting_gpu'
+                        END,
+                        reason_code = CASE
+                            WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN reason_code
+                            WHEN $3::text IS NOT NULL THEN $3
+                            ELSE 'expired_unbound_lease_released'
+                        END,
+                        reason_detail = $4::jsonb,
+                        retryable = CASE
+                            WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN retryable
+                            WHEN $3::text IS NOT NULL THEN FALSE
+                            ELSE TRUE
+                        END,
+                        completed_at = CASE
+                            WHEN state IN ('completed', 'failed', 'cancelled', 'retrying') THEN completed_at
+                            WHEN $3::text IS NOT NULL THEN now()
+                            ELSE completed_at
+                        END,
+                        lease_token = NULL, lease_expires_at = NULL,
+                        owner_pid = NULL, owner_start_ticks = NULL, owner_uid = NULL,
+                        updated_at = now()
+                    WHERE job_id = $1::uuid AND lease_token = $2::uuid
+                    RETURNING state, reason_code
+                    """,
+                    job_id,
+                    lease_token,
+                    terminal_reason,
+                    _canonical_json({"unbound_lease_expired": True, "complete_gpu_idle_observed": True,
+                                     "source_blocked": terminal_reason}),
+                )
+                if released_job is None:
+                    return False
+                await connection.execute(
+                    """
+                    INSERT INTO gods_mlops_job_events (
+                        job_id,event_type,state,reason_code,observation_id,fencing_token,details
+                    ) VALUES ($1::uuid,'lease_owner_released',$2,$3,$4::uuid,$5,$6::jsonb)
+                    """,
+                    job_id,
+                    released_job["state"],
+                    released_job["reason_code"],
+                    observation.observation_id,
+                    lease["fencing_token"],
+                    _canonical_json({"owner_pid": None, "owner_start_ticks": None,
+                                     "idle_since": idle_since, "idle_observation_count": current["idle_observation_count"]}),
                 )
                 return True
 
@@ -1076,22 +1399,13 @@ class PostgresJobQueueRepository:
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
-                job = await connection.fetchrow(
-                    "SELECT * FROM gods_mlops_jobs WHERE job_id = $1::uuid FOR UPDATE",
-                    job_id,
-                )
-                lease = await connection.fetchrow(
-                    """
-                    SELECT * FROM gods_mlops_gpu_leases
-                    WHERE job_id = $1::uuid AND lease_token = $2::uuid FOR UPDATE
-                    """,
-                    job_id,
-                    lease_token,
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
                 )
                 if (
                     job is None
                     or lease is None
-                    or job["lease_token"] != lease["lease_token"]
+                    or str(job["lease_token"]) != str(lease["lease_token"])
                     or job["state"] not in {"running", "yield_requested"}
                 ):
                     raise StaleCheckpointOwnerError("checkpoint writer no longer owns the active GPU lease")
@@ -1180,22 +1494,13 @@ class PostgresJobQueueRepository:
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
-                job = await connection.fetchrow(
-                    "SELECT * FROM gods_mlops_jobs WHERE job_id = $1::uuid FOR UPDATE",
-                    job_id,
-                )
-                lease = await connection.fetchrow(
-                    """
-                    SELECT * FROM gods_mlops_gpu_leases
-                    WHERE job_id = $1::uuid AND lease_token = $2::uuid FOR UPDATE
-                    """,
-                    job_id,
-                    lease_token,
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
                 )
                 if (
                     job is None
                     or lease is None
-                    or job["lease_token"] != lease["lease_token"]
+                    or str(job["lease_token"]) != str(lease["lease_token"])
                     or job["phase"] != "probe"
                 ):
                     raise ValueError("probe measurement does not own a current probe lease")
@@ -1421,6 +1726,7 @@ class PostgresJobQueueRepository:
         job_id: str,
         observation: ResourceObservation,
         profile: dict[str, Any],
+        source_registry: DatasetSourceRegistry,
         now,
         lease_seconds: int,
         min_idle_seconds: int,
@@ -1535,16 +1841,62 @@ class PostgresJobQueueRepository:
                         observation.observation_id,
                         {"owner_job_id": str(existing["job_id"]), "expires_at": existing["expires_at"].isoformat()},
                     )
+                # Admission follows the shared-ledger-before-source lock order used by
+                # the Task 4/5 quota writers. The dataset row stays SHARE-locked until
+                # the lease and reservation commit, so sample invalidation cannot pass
+                # this check and commit ahead of the lease.
+                usage = await connection.fetchrow(
+                    "SELECT used_bytes FROM ingestion_storage_usage WHERE singleton = TRUE FOR UPDATE"
+                )
+                if usage is None:
+                    raise RuntimeError("the shared object-storage ledger is not initialized")
+                if job["phase"] == "training":
+                    source_reasons = await source_registry.training_block_reasons_in_transaction(
+                        connection,
+                        dataset_version=job["dataset_version"],
+                        model_kind=job["model_kind"],
+                    )
+                    if source_reasons:
+                        priority = (
+                            "source_sample_explicitly_invalidated",
+                            "dataset_source_unavailable",
+                            "dataset_not_training_ready",
+                        )
+                        reason = next((item for item in priority if item in source_reasons), source_reasons[0])
+                        updated = await connection.fetchrow(
+                            """
+                            UPDATE gods_mlops_jobs SET state='failed', reason_code=$2,
+                                reason_detail=$3::jsonb, retryable=FALSE,
+                                completed_at=now(), updated_at=now()
+                            WHERE job_id=$1::uuid AND lease_token IS NULL
+                            RETURNING *
+                            """,
+                            job_id,
+                            reason,
+                            _canonical_json({"training_block_reasons": list(source_reasons)}),
+                        )
+                        if updated is None:
+                            current_job = await connection.fetchrow(
+                                "SELECT * FROM gods_mlops_jobs WHERE job_id=$1::uuid", job_id
+                            )
+                            if current_job is None:
+                                raise KeyError(f"GPU job {job_id} does not exist")
+                            return _job_dict(current_job)
+                        await connection.execute(
+                            """
+                            INSERT INTO gods_mlops_job_events(job_id,event_type,state,reason_code,details)
+                            VALUES($1::uuid,'source_readiness_failed','failed',$2,$3::jsonb)
+                            """,
+                            job_id,
+                            reason,
+                            _canonical_json({"training_block_reasons": list(source_reasons), "lease_not_granted": True}),
+                        )
+                        return _job_dict(updated)
                 reservation = await connection.fetchrow(
                     "SELECT * FROM gods_mlops_artifact_reservations WHERE job_id = $1::uuid FOR UPDATE",
                     job_id,
                 )
                 if reservation is None:
-                    usage = await connection.fetchrow(
-                        "SELECT used_bytes FROM ingestion_storage_usage WHERE singleton = TRUE FOR UPDATE"
-                    )
-                    if usage is None:
-                        raise RuntimeError("the shared object-storage ledger is not initialized")
                     amount = profile["artifact_reservation_bytes"]
                     if usage["used_bytes"] + amount > 1024**4:
                         return await self._wait_in_transaction(
@@ -1635,7 +1987,7 @@ class PostgresJobQueueRepository:
         observation_id: str | None,
         details: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        await connection.execute(
+        updated = await connection.fetchrow(
             """
             UPDATE gods_mlops_jobs SET state = $2, reason_code = $3,
                 reason_detail = $4::jsonb, retryable = TRUE, updated_at = now()
@@ -1643,12 +1995,19 @@ class PostgresJobQueueRepository:
                 'queued', 'waiting_profile', 'waiting_gpu', 'waiting_storage',
                 'waiting_capacity', 'yield_requested'
             )
+              AND lease_token IS NULL
+            RETURNING job_id
             """,
             job_id,
             state,
             reason_code,
             _canonical_json(details or {}),
         )
+        if updated is None:
+            row = await connection.fetchrow("SELECT * FROM gods_mlops_jobs WHERE job_id = $1::uuid", job_id)
+            if row is None:
+                raise KeyError(f"GPU job {job_id} does not exist")
+            return _job_dict(row)
         await connection.execute(
             """
             INSERT INTO gods_mlops_job_events (
@@ -1945,6 +2304,11 @@ class JobQueue:
 
     async def close(self) -> None:
         """Close facade-owned integrations; the repository remains caller-owned."""
+
+    @property
+    def source_registry(self) -> DatasetSourceRegistry:
+        """Expose the shared Task 6 source seam to the acquisition transaction."""
+        return self._sources
 
     @property
     def repository(self) -> PostgresJobQueueRepository:

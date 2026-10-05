@@ -56,6 +56,12 @@ class GpuAdmission:
         self._observation_max_age_seconds = observation_max_age_seconds
         self._min_filesystem_bytes = min_filesystem_bytes
         self._safety_mib = safety_mib
+        self._repository.configure_observation_identity(
+            expected_host_identity=expected_host_identity,
+            expected_gpu_uuid=expected_gpu_uuid,
+            expected_filesystem_identity=expected_filesystem_identity,
+            expected_storage_path=expected_storage_path,
+        )
 
     @property
     def expected_gpu_uuid(self) -> str:
@@ -93,6 +99,7 @@ class GpuAdmission:
             state = await self._repository.record_observation(
                 parsed,
                 max_gap_seconds=_MAX_OBSERVATION_GAP_SECONDS,
+                received_at=now,
             )
         except ObservationReplayError:
             return await self._wait(
@@ -114,12 +121,14 @@ class GpuAdmission:
             )
         except (KeyError, TypeError, ValueError, OverflowError) as error:
             raise ValueError("ubuntu_observation_unavailable") from error
-        reason = self._observation_reason(observation, self._now())
+        now = self._now()
+        reason = self._observation_reason(observation, now)
         if reason is not None:
             raise ValueError(reason)
         state = await self._repository.record_observation(
             observation,
             max_gap_seconds=_MAX_OBSERVATION_GAP_SECONDS,
+            received_at=now,
         )
         return observation, state
 
@@ -240,8 +249,20 @@ class GpuAdmission:
         if not prelaunch:
             fresh = await self._read_prelaunch_observation(job_id, observation.observation_id)
             if isinstance(fresh, dict):
+                current_job = await self._queue.get(job_id)
+                if (
+                    current_job.get("lease_token") is not None
+                    or current_job["state"] in {"running", "yield_requested", "completed", "failed", "cancelled", "retrying"}
+                ):
+                    return current_job
                 return fresh
             observation, state = fresh
+            current_job = await self._queue.get(job_id)
+            if (
+                current_job.get("lease_token") is not None
+                or current_job["state"] in {"running", "yield_requested", "completed", "failed", "cancelled", "retrying"}
+            ):
+                return current_job
             reason = self._capacity_reason(observation, profile)
             if reason is not None:
                 state_name = (
@@ -276,6 +297,7 @@ class GpuAdmission:
             job_id=job_id,
             observation=observation,
             profile=profile,
+            source_registry=self._queue.source_registry,
             now=self._now(),
             lease_seconds=self._lease_seconds,
             min_idle_seconds=self._idle_window_seconds,
@@ -313,7 +335,8 @@ class GpuAdmission:
                 "ubuntu_prelaunch_observation_unavailable",
                 observation_id=previous_observation_id,
             )
-        reason = self._observation_reason(observation, self._now())
+        now = self._now()
+        reason = self._observation_reason(observation, now)
         if reason is not None:
             if reason == "ubuntu_observation_identity_mismatch":
                 return await self._wait(
@@ -333,6 +356,7 @@ class GpuAdmission:
             state = await self._repository.record_observation(
                 observation,
                 max_gap_seconds=_MAX_OBSERVATION_GAP_SECONDS,
+                received_at=now,
             )
         except ObservationReplayError:
             return await self._wait(

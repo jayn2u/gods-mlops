@@ -5,8 +5,10 @@ import hashlib
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
+import asyncpg
 from conftest import seed_training_ready_dataset
 from gods_mlops.jobs.admission import GpuAdmission
+from gods_mlops.jobs.checkpoints import FileCheckpointStore
 from gods_mlops.jobs.models import ExecutionProfile, ProcessIdentity, ResourceObservation
 from gods_mlops.jobs.monitor import GpuJobMonitor
 from gods_mlops.jobs.queue import JobQueue, PostgresJobQueueRepository
@@ -17,7 +19,7 @@ HOST_IDENTITY = "machine-sha256:task7-test-ubuntu"
 FILESYSTEM_IDENTITY = "ext4:uuid=task7-test-data"
 STORAGE_PATH = "/data/jayn2u/gods-mlops"
 MIN_FREE_BYTES = 1024**4
-BASE_TIME = datetime(2026, 10, 5, 15, tzinfo=UTC)
+BASE_TIME = datetime.now(UTC)
 OWNER = ProcessIdentity(pid=43122, start_ticks=89123, uid=1009)
 EXTERNAL = ProcessIdentity(pid=52111, start_ticks=99113, uid=1009)
 
@@ -43,7 +45,7 @@ def _observation(when: datetime, *, gpu=(), processes=()) -> dict:
     ).to_dict()
 
 
-async def _running_probe(database_url: str):
+async def _running_probe(database_url: str, *, bind_owner: bool = True):
     await seed_training_ready_dataset(database_url)
     repository = PostgresJobQueueRepository(database_url=database_url)
     await repository.ensure_schema()
@@ -88,7 +90,8 @@ async def _running_probe(database_url: str):
         result = await admission.admit(job_id, _observation(now[0]))
     assert result["state"] == "running"
     lease_token = result["lease_token"]
-    await queue.bind_process(job_id, lease_token, OWNER)
+    if bind_owner:
+        await queue.bind_process(job_id, lease_token, OWNER)
     monitor = GpuJobMonitor(repository=repository, queue=queue, admission=admission)
     return repository, queue, admission, monitor, job_id, lease_token, now
 
@@ -159,5 +162,134 @@ def test_pid_reuse_does_not_release_vram_and_observed_exit_allows_fenced_resume(
         assert await queue.renew_lease(job_id, old_token) is False
         await queue.close()
         await repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_expired_unbound_lease_releases_only_after_a_fresh_complete_idle_window(
+    task7_database_url: str,
+) -> None:
+    async def exercise() -> None:
+        repository, queue, _admission, monitor, job_id, token, now = await _running_probe(
+            task7_database_url, bind_owner=False
+        )
+        lease = await repository.get_active_lease(GPU_UUID)
+        assert lease["lease_token"] == token
+        assert lease["owner_pid"] is None
+
+        # An unbound lease remains owned before expiration even with idle samples.
+        for offset in (40,):
+            now[0] = BASE_TIME + timedelta(seconds=offset)
+            await monitor.observe(_observation(now[0]))
+        assert (await repository.get_active_lease(GPU_UUID))["lease_token"] == token
+
+        # At expiry, a fresh complete idle series is proof that no CUDA allocation remains.
+        for offset in range(45, 76, 5):
+            now[0] = BASE_TIME + timedelta(seconds=offset)
+            await monitor.observe(_observation(now[0]))
+        assert await repository.get_active_lease(GPU_UUID) is None
+        job = await queue.get(job_id)
+        assert job["state"] == "waiting_gpu"
+        assert job["reason_code"] == "expired_unbound_lease_released"
+        await queue.close()
+        await repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_public_yield_renew_checkpoint_and_release_share_the_job_lease_lock_order(
+    task7_database_url: str,
+    tmp_path,
+) -> None:
+    async def exercise() -> None:
+        repository, queue, admission, monitor, job_id, token, now = await _running_probe(task7_database_url)
+        admin = await asyncpg.connect(task7_database_url)
+        first_pid = None
+        yield_task = renew_task = None
+        try:
+            await admin.execute(
+                """
+                CREATE FUNCTION task7_review_pause_yield() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF NEW.state = 'yield_requested' AND OLD.state = 'running' THEN
+                        PERFORM pg_advisory_xact_lock(7319, 2405);
+                    END IF;
+                    RETURN NEW;
+                END
+                $$
+                """
+            )
+            await admin.execute(
+                """
+                CREATE TRIGGER task7_review_pause_yield BEFORE UPDATE OF state ON gods_mlops_jobs
+                FOR EACH ROW EXECUTE FUNCTION task7_review_pause_yield()
+                """
+            )
+            await admin.execute("SELECT pg_advisory_lock(7319, 2405)")
+            yield_task = asyncio.create_task(queue.request_yield(job_id, reason="external_gpu_process_started"))
+
+            async def waiting_advisory_lock():
+                for _ in range(100):
+                    pid = await admin.fetchval(
+                        """SELECT pid FROM pg_locks WHERE locktype='advisory' AND classid=7319
+                           AND objid=2405 AND NOT granted LIMIT 1"""
+                    )
+                    if pid is not None:
+                        return pid
+                    await asyncio.sleep(0.02)
+                raise TimeoutError("yield transaction did not pause after locking the job row")
+
+            first_pid = await waiting_advisory_lock()
+            renew_task = asyncio.create_task(queue.renew_lease(job_id, token, now=now[0]))
+
+            async def both_waiters_present():
+                for _ in range(100):
+                    rows = await admin.fetch(
+                        """SELECT pid,query FROM pg_stat_activity
+                           WHERE datname=current_database() AND state='active' AND wait_event_type='Lock'
+                             AND query ILIKE '%gods_mlops_jobs%'"""
+                    )
+                    if len({row["pid"] for row in rows}) >= 2:
+                        return
+                    await asyncio.sleep(0.02)
+                raise TimeoutError("public renew and yield operations did not reach the conflicting lock boundary")
+
+            await both_waiters_present()
+            await admin.execute("SELECT pg_advisory_unlock(7319, 2405)")
+            results = await asyncio.wait_for(
+                asyncio.gather(yield_task, renew_task, return_exceptions=True), timeout=5
+            )
+            assert not any(isinstance(result, BaseException) for result in results), results
+            assert results[1] is False
+            job = await queue.get(job_id)
+            assert job["state"] == "yield_requested"
+            assert job["lease_token"] == token
+
+            identity = await repository.checkpoint_identity(job_id)
+            checkpoint = await queue.save_checkpoint(
+                store=FileCheckpointStore(root=tmp_path),
+                job_id=job_id,
+                lease_token=token,
+                identity=identity,
+                payload=b"checkpoint committed after the concurrent monitor request",
+            )
+            now[0] += timedelta(seconds=5)
+            await monitor.observe(_observation(now[0]))
+            released = await queue.get(job_id)
+            assert released["state"] == "waiting_gpu"
+            assert released["checkpoint_sha256"] == checkpoint.sha256
+            assert await repository.get_active_lease(GPU_UUID) is None
+        finally:
+            if first_pid is not None:
+                await admin.execute("SELECT pg_advisory_unlock(7319, 2405)")
+            if yield_task is not None and not yield_task.done():
+                yield_task.cancel()
+            if renew_task is not None and not renew_task.done():
+                renew_task.cancel()
+            await admin.execute("DROP TRIGGER IF EXISTS task7_review_pause_yield ON gods_mlops_jobs")
+            await admin.execute("DROP FUNCTION IF EXISTS task7_review_pause_yield()")
+            await admin.close()
+            await queue.close()
+            await repository.close()
 
     asyncio.run(exercise())

@@ -17,6 +17,7 @@ HOST_IDENTITY = "machine-sha256:task7-test-ubuntu"
 FILESYSTEM_IDENTITY = "ext4:uuid=task7-test-data"
 STORAGE_PATH = "/data/jayn2u/gods-mlops"
 EXTERNAL_PROCESS = ProcessIdentity(pid=52111, start_ticks=99113, uid=1009)
+OWNER = ProcessIdentity(pid=43122, start_ticks=89123, uid=1009)
 MIN_FREE_BYTES = 1024**4
 BASE_TIME = datetime(2026, 10, 5, 15, tzinfo=UTC)
 
@@ -178,7 +179,114 @@ def test_typed_resource_observation_can_complete_the_fresh_prelaunch_check(
     asyncio.run(exercise())
 
 
-def test_replayed_observation_does_not_advance_the_persisted_idle_window(
+def test_stale_prelaunch_wait_preserves_an_owner_yield_requested_after_the_read_started(
+    task7_database_url: str,
+) -> None:
+    async def exercise() -> None:
+        repository, queue, job_id = await _queue_with_probe(task7_database_url)
+        now = [BASE_TIME]
+
+        class PausedObserver:
+            def __init__(self) -> None:
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def observe(self) -> dict:
+                self.entered.set()
+                await self.release.wait()
+                return _observation(
+                    now[0] + timedelta(milliseconds=100),
+                    gpu_processes=(OWNER, EXTERNAL_PROCESS),
+                    process_table=(OWNER, EXTERNAL_PROCESS),
+                )
+
+        paused = PausedObserver()
+        stale_admission = _admission(repository, queue, now, observer=paused)
+        for offset in range(0, 26, 5):
+            now[0] = BASE_TIME + timedelta(seconds=offset)
+            wait = await stale_admission.admit(job_id, _observation(now[0]))
+        assert wait["reason_code"] == "idle_observation_window"
+
+        now[0] = BASE_TIME + timedelta(seconds=30)
+        stale_task = asyncio.create_task(stale_admission.admit(job_id, _observation(now[0])))
+        await asyncio.wait_for(paused.entered.wait(), timeout=3)
+
+        now[0] = BASE_TIME + timedelta(seconds=35)
+
+        class FreshObserver:
+            async def observe(self) -> dict:
+                return _observation(now[0] + timedelta(milliseconds=100))
+
+        owner_admission = _admission(repository, queue, now, observer=FreshObserver())
+        granted = await owner_admission.admit(job_id, _observation(now[0]))
+        assert granted["state"] == "running"
+        token = granted["lease_token"]
+        assert await queue.bind_process(job_id, token, OWNER)
+        await queue.request_yield(job_id, reason="external_gpu_process_started")
+
+        paused.release.set()
+        stale_result = await stale_task
+        current = await queue.get(job_id)
+        active = await repository.get_active_lease(GPU_UUID)
+        assert stale_result["state"] == "yield_requested"
+        assert current["state"] == "yield_requested"
+        assert current["lease_token"] == token
+        assert current["owner_pid"] == OWNER.pid
+        assert current["owner_start_ticks"] == OWNER.start_ticks
+        assert active["lease_token"] == token
+        await queue.close()
+        await repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_transactional_wait_does_not_mutate_a_yield_requested_job_with_a_live_lease(
+    task7_database_url: str,
+) -> None:
+    async def exercise() -> None:
+        repository, queue, job_id = await _queue_with_probe(task7_database_url)
+        now = [BASE_TIME]
+
+        class FreshObserver:
+            async def observe(self) -> dict:
+                return _observation(now[0] + timedelta(milliseconds=100))
+
+        admission = _admission(repository, queue, now, observer=FreshObserver())
+        for offset in range(0, 31, 5):
+            now[0] = BASE_TIME + timedelta(seconds=offset)
+            running = await admission.admit(job_id, _observation(now[0]))
+        assert running["state"] == "running"
+        token = running["lease_token"]
+        assert await queue.bind_process(job_id, token, OWNER)
+        await queue.request_yield(job_id, reason="external_gpu_process_started")
+        observation = await repository.latest_observation("ubuntu")
+        profile = await repository.get_profile(
+            phase="probe", model_kind="detr", config_version="detr-probe-candidate-v1"
+        )
+
+        waited = await repository.acquire_gpu_lease(
+            job_id=job_id,
+            observation=observation,
+            profile=profile,
+            source_registry=queue.source_registry,
+            now=now[0],
+            lease_seconds=15,
+            min_idle_seconds=30,
+            min_idle_observations=7,
+            min_filesystem_bytes=MIN_FREE_BYTES,
+            safety_mib=4096,
+        )
+        assert waited["state"] == "yield_requested"
+        assert waited["lease_token"] == token
+        assert waited["owner_pid"] == OWNER.pid
+        assert (await repository.get_active_lease(GPU_UUID))["lease_token"] == token
+        await queue.close()
+        await repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_replayed_observation_resets_the_persisted_idle_window(
     task7_database_url: str,
 ) -> None:
     async def exercise() -> None:
@@ -196,8 +304,10 @@ def test_replayed_observation_does_not_advance_the_persisted_idle_window(
         assert replay["state"] == "waiting_gpu"
         assert replay["reason_code"] == "ubuntu_observation_replayed"
         after_replay = await repository.get_observation_state("ubuntu")
-        assert after_replay["observation_id"] == initial_state["observation_id"]
-        assert after_replay["idle_observation_count"] == 1
+        assert after_replay["observation_id"] != initial_state["observation_id"]
+        assert after_replay["failure_code"] is not None
+        assert after_replay["idle_since"] is None
+        assert after_replay["idle_observation_count"] == 0
         assert await repository.get_active_lease(GPU_UUID) is None
         await queue.close()
         await repository.close()

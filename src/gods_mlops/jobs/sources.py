@@ -59,6 +59,50 @@ class DatasetSourceRegistry:
             leakage_impact_count=int(row["leakage_impact_count"]),
         )
 
+    async def training_block_reasons_in_transaction(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        dataset_version: str,
+        model_kind: str,
+    ) -> tuple[str, ...]:
+        """Recheck mutable training eligibility while the admission transaction locks its version."""
+        row = await connection.fetchrow(
+            """
+            SELECT version.dataset_version, version.target, version.manifest_sha256,
+                   version.state, version.training_ready, version.training_reasons,
+                   version.evaluation_eligible, version.evaluation_reasons,
+                   (SELECT count(DISTINCT item.sample_id)
+                    FROM dataset_items AS item
+                    JOIN dataset_source_invalidations AS invalidation USING (sample_id)
+                    WHERE item.dataset_version = version.dataset_version) AS invalidated_source_count,
+                   (SELECT count(*) FROM dataset_version_leakage_impacts AS impact
+                    WHERE impact.dataset_version = version.dataset_version) AS leakage_impact_count
+            FROM dataset_versions AS version
+            WHERE version.dataset_version = $1 AND version.published_at IS NOT NULL
+            FOR SHARE OF version
+            """,
+            dataset_version,
+        )
+        if row is None:
+            return ("dataset_source_unavailable",)
+        source = DatasetTrainingSource(
+            dataset_version=row["dataset_version"],
+            target=row["target"],
+            manifest_sha256=row["manifest_sha256"].strip(),
+            state=row["state"],
+            training_ready=bool(row["training_ready"]),
+            training_reasons=tuple(sorted(_json_list(row["training_reasons"]))),
+            evaluation_eligible=bool(row["evaluation_eligible"]),
+            evaluation_reasons=tuple(sorted(_json_list(row["evaluation_reasons"]))),
+            invalidated_source_count=int(row["invalidated_source_count"]),
+            leakage_impact_count=int(row["leakage_impact_count"]),
+        )
+        reasons = set(source.training_block_reasons())
+        if source.target not in {model_kind, "both"}:
+            reasons.add(f"dataset_target_not_{model_kind}")
+        return tuple(sorted(reasons))
+
     async def prepare_annotation_batch(
         self,
         selections: list[AnnotationSourceSelection] | tuple[AnnotationSourceSelection, ...],

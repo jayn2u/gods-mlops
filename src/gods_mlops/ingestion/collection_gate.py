@@ -56,6 +56,20 @@ class CollectionStorageGate:
         self._min_free_bytes = min_free_bytes
         self._max_observation_age_seconds = max_observation_age_seconds
         self._clock = clock or (lambda: datetime.now(UTC))
+        if all(
+            (
+                expected_host_identity,
+                expected_gpu_uuid,
+                expected_filesystem_identity,
+                expected_storage_path,
+            )
+        ):
+            self._repository.configure_observation_identity(
+                expected_host_identity=expected_host_identity,
+                expected_gpu_uuid=expected_gpu_uuid,
+                expected_filesystem_identity=expected_filesystem_identity,
+                expected_storage_path=expected_storage_path,
+            )
 
     async def ensure_available(self) -> ResourceObservation:
         if not all(

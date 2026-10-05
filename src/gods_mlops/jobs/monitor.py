@@ -50,28 +50,31 @@ class GpuJobMonitor:
             return None
         job_id = lease["job_id"]
         source_reasons = await self._queue.training_source_block_reasons(job_id)
+        source_reason = None
         if source_reasons:
-            reason = (
+            source_reason = (
                 "source_sample_explicitly_invalidated"
                 if "source_sample_explicitly_invalidated" in source_reasons
                 else "dataset_source_unavailable"
             )
-            await self._queue.request_yield(job_id, reason=reason)
-            return await self._queue.get(job_id)
+            if (await self._queue.get(job_id))["state"] in {"running", "yield_requested"}:
+                await self._queue.request_yield(job_id, reason=source_reason)
         owner_pid = lease["owner_pid"]
         owner_start = lease["owner_start_ticks"]
         if owner_pid is None or owner_start is None:
             if observation.gpu_processes:
-                await self._queue.request_yield(
-                    job_id,
-                    reason="external_gpu_process_started_before_owner_bind",
-                )
+                if source_reason is None:
+                    await self._queue.request_yield(
+                        job_id,
+                        reason="external_gpu_process_started_before_owner_bind",
+                    )
                 return await self._queue.get(job_id)
             if self._lease_expired(lease, observation) and await self._idle_window_ready(observation):
                 await self._repository.release_unbound_expired_lease(
                     job_id=job_id,
                     lease_token=lease["lease_token"],
                     observation=observation,
+                    terminal_reason=source_reason,
                 )
             return await self._queue.get(job_id)
 
@@ -89,10 +92,11 @@ class GpuJobMonitor:
         ]
         if owner_is_live:
             if external_processes:
-                await self._queue.request_yield(
-                    job_id,
-                    reason="external_gpu_process_started",
-                )
+                if source_reason is None:
+                    await self._queue.request_yield(
+                        job_id,
+                        reason="external_gpu_process_started",
+                    )
                 return await self._queue.get(job_id)
             if (await self._queue.get(job_id))["state"] == "running":
                 await self._queue.renew_lease(
@@ -106,7 +110,7 @@ class GpuJobMonitor:
         # allocation keeps the exclusive lease fenced until that PID also exits.
         if owner_pid_still_uses_gpu:
             job = await self._queue.get(job_id)
-            if external_processes and job["state"] == "running":
+            if external_processes and job["state"] == "running" and source_reason is None:
                 await self._queue.request_yield(
                     job_id,
                     reason="external_gpu_process_started",
@@ -118,6 +122,7 @@ class GpuJobMonitor:
             job_id=job_id,
             lease_token=lease["lease_token"],
             observation=observation,
+            terminal_reason=source_reason,
         )
         return await self._queue.get(job_id)
 
