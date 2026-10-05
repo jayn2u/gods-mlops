@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+from collections.abc import Mapping
 from hashlib import sha256
 from time import perf_counter
 from typing import Any
@@ -436,7 +437,7 @@ def _move_inputs(inputs: dict[str, Any], device: Any) -> dict[str, Any]:
         elif isinstance(value, list):
             moved[key] = [
                 {name: item.to(device) if isinstance(item, torch.Tensor) else item for name, item in label.items()}
-                if isinstance(label, dict)
+                if isinstance(label, Mapping)
                 else label
                 for label in value
             ]

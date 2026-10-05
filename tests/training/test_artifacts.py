@@ -1180,6 +1180,40 @@ def test_detector_target_conversion_uses_the_frozen_labelstudio_box_and_person_c
     }
 
 
+def test_detector_moves_mapping_based_processor_labels_to_device(monkeypatch) -> None:
+    import sys
+    from collections import UserDict
+    from types import SimpleNamespace
+
+    class FakeTensor:
+        def __init__(self, device):
+            self.device = device
+
+        def to(self, device):
+            return FakeTensor(device)
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(Tensor=FakeTensor))
+    move_inputs = _require("gods_mlops.training.detector", "_move_inputs")
+    target_device = object()
+    processor_labels = UserDict(
+        {
+            "class_labels": FakeTensor("cpu"),
+            "boxes": FakeTensor("cpu"),
+            "area": FakeTensor("cpu"),
+            "iscrowd": FakeTensor("cpu"),
+        }
+    )
+
+    moved = move_inputs(
+        {"pixel_values": FakeTensor("cpu"), "labels": [processor_labels]},
+        target_device,
+    )
+
+    assert moved["pixel_values"].device is target_device
+    assert moved["labels"][0]["class_labels"].device is target_device
+    assert moved["labels"][0]["boxes"].device is target_device
+
+
 def test_qwen_generation_config_bounds_prompt_image_and_new_tokens() -> None:
     validate = _require("gods_mlops.training.caption", "validate_generation_config")
     allowed = {
