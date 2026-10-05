@@ -754,10 +754,15 @@ class PostgresAnnotationRepository:
                     raise ReviewAssignmentNotFoundError("crop cleanup reservation does not exist")
                 if row["state"] == "purge_pending":
                     return
-                if row["state"] != "deleted" or not row["quota_released"]:
+                if row["state"] != "deleted":
                     raise ReviewAssignmentConflictError("late crop cleanup is not eligible for reconciliation")
+                # Older tombstones reached deleted only after releasing their byte reservation.
                 await connection.execute(
-                    "UPDATE annotation_crops SET state = 'purge_pending', updated_at = now() WHERE crop_id = $1",
+                    """
+                    UPDATE annotation_crops
+                    SET state = 'purge_pending', quota_released = TRUE, updated_at = now()
+                    WHERE crop_id = $1
+                    """,
                     crop_id,
                 )
 

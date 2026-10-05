@@ -700,6 +700,144 @@ def test_expiry_fences_a_late_crop_writer_and_retries_failed_cleanup() -> None:
     asyncio.run(exercise())
 
 
+def test_lost_crop_ack_after_expiry_requeues_late_object_for_cleanup() -> None:
+    configured = _configured()
+    if configured is None:
+        pytest.skip("isolated PostgreSQL and S3 test endpoints are not configured")
+    database_url, s3_endpoint, access_key, secret_key, bucket = configured
+    objects = S3SampleStore(
+        endpoint_url=s3_endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
+        bucket=bucket,
+        region="us-east-1",
+    )
+    now = datetime.now(timezone.utc)
+    write_started = threading.Event()
+    release_write = threading.Event()
+
+    class LateLostAckStore(S3SampleStore):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.fail_cleanup_once = True
+
+        def ensure_object(self, *, object_key: str, image: bytes, expected_sha256: str) -> None:
+            if object_key.startswith("crops/"):
+                write_started.set()
+                if not release_write.wait(timeout=10):
+                    raise TimeoutError("late crop upload test writer was not released")
+                super().ensure_object(object_key=object_key, image=image, expected_sha256=expected_sha256)
+                raise OSError("injected late crop PUT acknowledgment loss")
+            super().ensure_object(object_key=object_key, image=image, expected_sha256=expected_sha256)
+
+        def delete_object(self, object_key: str) -> None:
+            if object_key.startswith("crops/") and self.fail_cleanup_once:
+                self.fail_cleanup_once = False
+                raise OSError("injected late crop cleanup failure")
+            super().delete_object(object_key)
+
+    async def exercise() -> None:
+        ingestion, annotations, sample_id, frame_key, frame_bytes, bbox_revision, initial_usage = (
+            await _seed_single_bbox_source(database_url=database_url, objects=objects)
+        )
+        late_store = LateLostAckStore(
+            endpoint_url=s3_endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            bucket=bucket,
+            region="us-east-1",
+        )
+        writer = None
+        try:
+            writer = asyncio.create_task(
+                CropService(repository=annotations, objects=late_store).create_crop(
+                    str(sample_id), bbox_revision
+                )
+            )
+            assert await asyncio.wait_for(asyncio.to_thread(write_started.wait, 5), timeout=6)
+            connection = await asyncpg.connect(database_url)
+            try:
+                await connection.execute(
+                    "UPDATE ingestion_samples SET retention_until = $2 WHERE sample_id = $1",
+                    sample_id,
+                    now - timedelta(seconds=1),
+                )
+            finally:
+                await connection.close()
+
+            await RetentionService(
+                repository=ingestion,
+                objects=objects,
+                annotations=annotations,
+            ).expire_candidates(now)
+            expired = await annotations.crops_for_revision(
+                sample_id=sample_id,
+                bbox_revision=UUID(bbox_revision),
+            )
+            assert expired[0]["state"] == "deleted"
+            assert await ingestion.sample_state(sample_id) == "expired"
+            assert await ingestion.storage_bytes() == initial_usage
+            # Simulate a deleted row created by the pre-flag implementation, which
+            # had already released its bytes but stored no quota_released marker.
+            connection = await asyncpg.connect(database_url)
+            try:
+                await connection.execute(
+                    "UPDATE annotation_crops SET quota_released = FALSE WHERE crop_id = $1",
+                    UUID(expired[0]["crop_id"]),
+                )
+            finally:
+                await connection.close()
+
+            release_write.set()
+            outcome = await asyncio.gather(writer, return_exceptions=True)
+            assert isinstance(outcome[0], OSError)
+            requeued = await annotations.crops_for_revision(
+                sample_id=sample_id,
+                bbox_revision=UUID(bbox_revision),
+            )
+            assert requeued[0]["state"] == "purge_pending"
+            assert await ingestion.storage_bytes() == initial_usage
+            connection = await asyncpg.connect(database_url)
+            try:
+                quota_released = await connection.fetchval(
+                    "SELECT quota_released FROM annotation_crops WHERE crop_id = $1",
+                    UUID(requeued[0]["crop_id"]),
+                )
+            finally:
+                await connection.close()
+            assert quota_released is True
+            assert objects.read_object(
+                object_key=requeued[0]["object_key"],
+                expected_sha256=requeued[0]["sha256"],
+            )
+
+            retried = await RetentionService(
+                repository=ingestion,
+                objects=objects,
+                annotations=annotations,
+            ).expire_candidates(now)
+            assert retried["crops_deleted"] >= 1
+            final_rows = await annotations.crops_for_revision(
+                sample_id=sample_id,
+                bbox_revision=UUID(bbox_revision),
+            )
+            assert final_rows[0]["state"] == "deleted"
+            with pytest.raises(FileNotFoundError):
+                objects.read_object(
+                    object_key=final_rows[0]["object_key"],
+                    expected_sha256=final_rows[0]["sha256"],
+                )
+            assert await ingestion.storage_bytes() == initial_usage
+        finally:
+            release_write.set()
+            if writer is not None and not writer.done():
+                await asyncio.gather(writer, return_exceptions=True)
+            await annotations.close()
+            await ingestion.close()
+
+    asyncio.run(exercise())
+
+
 def test_caption_provisioning_protects_crop_until_label_studio_media_binds() -> None:
     configured = _configured()
     if configured is None:

@@ -62,30 +62,28 @@ class CropService:
             source=source,
         )
         for crop, spec in zip(reserved, specs, strict=True):
-            await anyio.to_thread.run_sync(
-                partial(
-                    self._objects.ensure_object,
-                    object_key=crop["object_key"],
-                    image=spec["image"],
-                    expected_sha256=crop["sha256"],
+            try:
+                await anyio.to_thread.run_sync(
+                    partial(
+                        self._objects.ensure_object,
+                        object_key=crop["object_key"],
+                        image=spec["image"],
+                        expected_sha256=crop["sha256"],
+                    )
                 )
-            )
+            except Exception as upload_error:
+                try:
+                    await self._reconcile_expired_crop_write(crop)
+                except Exception as cleanup_error:
+                    raise cleanup_error from upload_error
+                raise
             try:
                 await self._repository.mark_crop_ready(UUID(crop["crop_id"]))
-            except ReviewAssignmentConflictError:
+            except ReviewAssignmentConflictError as state_error:
                 try:
-                    await anyio.to_thread.run_sync(
-                        partial(self._objects.delete_object, crop["object_key"])
-                    )
-                except Exception as error:  # noqa: BLE001 - retain a retryable tombstone for late PUTs
-                    await self._repository.mark_crop_cleanup_pending(UUID(crop["crop_id"]))
-                    await self._repository.record_retention_event(
-                        sample_id=sample_id,
-                        action="crop_expiry_deferred",
-                        reason="late_crop_writer_cleanup_failed",
-                        details={"crop_id": crop["crop_id"], "error_type": type(error).__name__},
-                    )
-                    raise
+                    await self._reconcile_expired_crop_write(crop)
+                except Exception as cleanup_error:
+                    raise cleanup_error from state_error
                 raise
         return _crop_batch(
             sample_id,
@@ -95,6 +93,29 @@ class CropService:
                 bbox_revision=bbox_revision_id,
             ),
         )
+
+    async def _reconcile_expired_crop_write(self, crop: dict[str, Any]) -> None:
+        """Remove ambiguous late bytes only after expiry fenced the crop row."""
+        rows = await self._repository.crops_for_revision(
+            sample_id=UUID(crop["sample_id"]),
+            bbox_revision=UUID(crop["bbox_revision"]),
+        )
+        current = next((item for item in rows if item["crop_id"] == crop["crop_id"]), None)
+        if current is None or current["state"] not in {"purge_pending", "deleted"}:
+            return
+        try:
+            await anyio.to_thread.run_sync(
+                partial(self._objects.delete_object, crop["object_key"])
+            )
+        except Exception as error:  # noqa: BLE001 - retain a quota-safe retry marker
+            await self._repository.mark_crop_cleanup_pending(UUID(crop["crop_id"]))
+            await self._repository.record_retention_event(
+                sample_id=UUID(crop["sample_id"]),
+                action="crop_expiry_deferred",
+                reason="late_crop_writer_cleanup_failed",
+                details={"crop_id": crop["crop_id"], "error_type": type(error).__name__},
+            )
+            raise
 
 
 def extract_person_crops(*, frame_bytes: bytes, result: list[dict[str, Any]]) -> list[dict[str, Any]]:
