@@ -40,10 +40,32 @@ class LabelStudioReviewWorkflow:
         media_object_key: str,
         required_bytes: int,
         expected_caption_revision_id: str | None = None,
+        source_sha256: str | None = None,
+        model_request_key: str | None = None,
+        model_version: str | None = None,
+        item_id: str | None = None,
     ) -> ReviewAssignment:
         """Reserve source media and review quota before any Label Studio upload."""
         if project_id <= 0:
             raise ValueError("Label Studio project ID must be positive")
+        model_identity = (source_sha256, model_request_key, model_version, item_id)
+        if any(value is not None for value in model_identity):
+            if not all(isinstance(value, str) and value for value in model_identity):
+                raise ValueError("model draft assignment requires complete immutable source/provenance")
+            if expected_caption_revision_id is not None:
+                raise ValueError("model draft assignments cannot replace a human caption revision")
+            return await self._repository.create_model_draft_assignment(
+                sample_id=sample_id,
+                stage=stage,
+                project_id=project_id,
+                bbox_revision=bbox_revision,
+                media_object_key=media_object_key,
+                required_bytes=required_bytes,
+                source_sha256=str(source_sha256),
+                model_request_key=str(model_request_key),
+                model_version=str(model_version),
+                item_id=str(item_id),
+            )
         return await self._repository.create_review_assignment(
             sample_id=sample_id,
             stage=stage,
@@ -66,11 +88,34 @@ class LabelStudioReviewWorkflow:
             media = await self._repository.label_studio_media_upload(revision)
             if media is None:
                 raise RuntimeError("active Label Studio review has no media reservation")
+            if prediction is not None and str(media["upload_filename"]).startswith("gods-model-"):
+                if not _matches_model_request_filename(media["upload_filename"], prediction):
+                    raise RuntimeError("active review assignment belongs to different model provenance")
+                attach_prediction = getattr(self._label_studio, "attach_prediction", None)
+                if not callable(attach_prediction):
+                    raise RuntimeError("Label Studio client cannot idempotently attach the model prediction")
+                await attach_prediction(
+                    project_id=project_id,
+                    task_id=assignment.label_studio_task_id,
+                    prediction=prediction,
+                )
             return _provisioned(assignment, media)
         if assignment.state != "provisioning":
             raise RuntimeError("review assignment is not available for Label Studio provisioning")
 
         source = await self._repository.review_media_source(assignment.sample_id, UUID(revision))
+        prepared_media = await self._repository.label_studio_media_upload(revision)
+        filename = (
+            prepared_media["upload_filename"]
+            if prepared_media is not None
+            else f"gods-review-{revision}-{source['sha256'][:16]}.jpg"
+        )
+        if (
+            prediction is not None
+            and filename.startswith("gods-model-")
+            and not _matches_model_request_filename(filename, prediction)
+        ):
+            raise RuntimeError("prepared review assignment belongs to different model provenance")
         image = await anyio.to_thread.run_sync(
             partial(
                 self._objects.read_object,
@@ -80,7 +125,6 @@ class LabelStudioReviewWorkflow:
         )
         if len(image) != source["object_size_bytes"]:
             raise OSError("Label Studio source media size did not match the persisted object metadata")
-        filename = f"gods-review-{revision}-{source['sha256'][:16]}.jpg"
         reservation = await self._repository.reserve_label_studio_media(
             revision=revision,
             project_id=project_id,
@@ -194,3 +238,13 @@ def _provisioned(assignment: ReviewAssignment, media: dict[str, Any]) -> dict[st
         "media_size_bytes": media["object_size_bytes"],
         "state": assignment.state,
     }
+
+
+def _matches_model_request_filename(filename: str, prediction: dict[str, Any]) -> bool:
+    from hashlib import sha256
+
+    model_version = prediction.get("model_version")
+    if not isinstance(model_version, str) or not model_version:
+        return False
+    suffix = sha256(model_version.encode("utf-8")).hexdigest()[:16]
+    return filename.endswith(f"-{suffix}.jpg")

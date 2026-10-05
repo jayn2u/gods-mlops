@@ -141,6 +141,30 @@ class LabelStudioApiClient:
             raise ValueError("Label Studio task ID must be positive")
         return await asyncio.to_thread(self._get_task, task_id)
 
+    async def get_project(self, project_id: int) -> dict:
+        """Read one operator-created project so draft routing can verify its label config."""
+        if project_id <= 0:
+            raise ValueError("Label Studio project ID must be positive")
+        result = await asyncio.to_thread(
+            self._request_json,
+            f"/api/projects/{project_id}/",
+            method="GET",
+        )
+        if not isinstance(result, dict) or result.get("id") != project_id:
+            raise RuntimeError("Label Studio project response did not match the requested ID")
+        return result
+
+    async def attach_prediction(self, *, project_id: int, task_id: int, prediction: dict) -> None:
+        """Idempotently attach one read-only model prediction to an existing review task."""
+        if project_id <= 0 or task_id <= 0:
+            raise ValueError("Label Studio project and task IDs must be positive")
+        if not isinstance(prediction, dict) or not isinstance(prediction.get("result"), list):
+            raise ValueError("pre-annotation must contain a result array")
+        model_version = prediction.get("model_version")
+        if not isinstance(model_version, str) or not model_version.strip():
+            raise ValueError("pre-annotation must carry its model provenance")
+        await asyncio.to_thread(self._ensure_prediction, project_id, task_id, prediction)
+
     async def create_project(self, *, title: str, label_config: str) -> int:
         if not title.strip() or not label_config.strip():
             raise ValueError("Label Studio project requires a title and label configuration")

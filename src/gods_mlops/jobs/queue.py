@@ -15,6 +15,7 @@ from .models import (
     AnnotationPreparationBatch,
     DatasetTrainingSource,
     ExecutionProfile,
+    ProbeInput,
     ProcessIdentity,
     ResourceObservation,
 )
@@ -37,6 +38,10 @@ class ResourceProfileNotFoundError(ValueError):
 
 class ResourceProfileConflictError(ValueError):
     """A profile name was reused for different configuration bytes."""
+
+
+class ResultArtifactConflictError(ValueError):
+    """A job attempted to publish different bytes for the same result artifact kind."""
 
 
 class ObservationReplayError(ValueError):
@@ -1446,14 +1451,21 @@ class PostgresJobQueueRepository:
                     """,
                     job_id,
                 )
+                result_exists = await connection.fetchval(
+                    """SELECT EXISTS(SELECT 1 FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type='result_artifact_committed')""",
+                    job_id,
+                )
                 if (
                     profile is None
                     or reservation is None
                     or reservation["state"] != "reserved"
+                    or result_exists
                     or prepared.size_bytes + prepared.metadata_size_bytes > profile["checkpoint_reservation_bytes"]
                 ):
                     raise ValueError("checkpoint exceeds its active versioned artifact reservation")
                 verified = store.commit(prepared)
+                checkpoint_uri = _verified_checkpoint_uri(verified)
                 await connection.execute(
                     """
                     UPDATE gods_mlops_jobs SET checkpoint_uri = $3, checkpoint_sha256 = $4,
@@ -1462,7 +1474,7 @@ class PostgresJobQueueRepository:
                     """,
                     job_id,
                     lease_token,
-                    verified.path.resolve().as_uri(),
+                    checkpoint_uri,
                     verified.sha256,
                     _canonical_json(identity.as_dict()),
                 )
@@ -1484,7 +1496,7 @@ class PostgresJobQueueRepository:
                     job["state"],
                     lease["fencing_token"],
                     _canonical_json({
-                        "checkpoint_uri": verified.path.resolve().as_uri(),
+                        "checkpoint_uri": checkpoint_uri,
                         "sha256": verified.sha256,
                         "size_bytes": verified.size_bytes,
                         "identity": identity.as_dict(),
@@ -1492,6 +1504,520 @@ class PostgresJobQueueRepository:
                 )
         store.prune_previous(prepared)
         return verified
+
+    async def checkpoint_metadata_for(self, job_id: str) -> dict[str, Any] | None:
+        """Return the current DB commit marker and its verified payload size."""
+        job = await self.get_job(job_id)
+        uri = job.get("checkpoint_uri")
+        digest = job.get("checkpoint_sha256")
+        identity = job.get("checkpoint_identity")
+        if uri is None:
+            return None
+        if digest is None or not isinstance(identity, dict):
+            raise ValueError("checkpoint commit marker is incomplete")
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT details FROM gods_mlops_job_events
+                WHERE job_id = $1::uuid AND event_type = 'checkpoint_committed'
+                  AND details->>'checkpoint_uri' = $2
+                  AND details->>'sha256' = $3
+                ORDER BY event_id DESC LIMIT 1
+                """,
+                job_id,
+                uri,
+                str(digest).strip(),
+            )
+        if row is None:
+            raise ValueError("checkpoint database commit marker has no matching event")
+        details = _json_value(row["details"])
+        if details.get("identity") != identity:
+            raise ValueError("checkpoint event identity does not match the active job row")
+        return {
+            "uri": uri,
+            "sha256": str(digest).strip(),
+            "size_bytes": int(details["size_bytes"]),
+            "identity": identity,
+        }
+
+    async def commit_result_artifact(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        identity,
+        prepared,
+        store,
+        source_registry: DatasetSourceRegistry,
+    ):
+        """Publish one immutable S3/file result under the current fence and reserved quota."""
+        from gods_mlops.jobs.checkpoints import CheckpointIdentityError, StaleCheckpointOwnerError
+
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                usage = await connection.fetchrow(
+                    "SELECT used_bytes FROM ingestion_storage_usage WHERE singleton = TRUE FOR UPDATE"
+                )
+                if usage is None:
+                    raise RuntimeError("the shared object-storage ledger is not initialized")
+                if identity.phase == "training":
+                    source_reasons = await source_registry.training_block_reasons_in_transaction(
+                        connection,
+                        dataset_version=identity.dataset_version,
+                        model_kind=identity.model_kind,
+                    )
+                    if source_reasons:
+                        raise DatasetNotReadyForTrainingError(source_reasons)
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
+                )
+                if (
+                    job is None
+                    or lease is None
+                    or str(job["lease_token"]) != str(lease["lease_token"])
+                    or job["state"] != "running"
+                ):
+                    raise StaleCheckpointOwnerError("result artifact writer no longer owns the running GPU lease")
+                expected = _checkpoint_identity_from_row(job)
+                if identity != expected or prepared.identity != expected or str(job["job_id"]) != job_id:
+                    raise CheckpointIdentityError("result artifact input, phase, model, or config identity changed")
+                profile = await connection.fetchrow(
+                    """SELECT result_reservation_bytes FROM gods_mlops_resource_profiles
+                       WHERE phase=$1 AND model_kind=$2 AND config_version=$3""",
+                    job["phase"],
+                    job["model_kind"],
+                    job["config_version"],
+                )
+                reservation = await connection.fetchrow(
+                    "SELECT * FROM gods_mlops_artifact_reservations WHERE job_id=$1::uuid FOR UPDATE",
+                    job_id,
+                )
+                if (
+                    profile is None
+                    or reservation is None
+                    or reservation["state"] != "reserved"
+                    or prepared.size_bytes > profile["result_reservation_bytes"]
+                    or reservation["consumed_bytes"] + prepared.size_bytes > reservation["reserved_bytes"]
+                ):
+                    raise ValueError("result artifact exceeds its active versioned reservation")
+                existing_rows = await connection.fetch(
+                    """SELECT details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type='result_artifact_committed'""",
+                    job_id,
+                )
+                existing = [_json_value(row["details"]) for row in existing_rows]
+                same_kind = [item for item in existing if item.get("kind") == prepared.kind]
+                if same_kind and any(
+                    item.get("sha256") != prepared.sha256
+                    or item.get("identity") != identity.as_dict()
+                    for item in same_kind
+                ):
+                    raise ResultArtifactConflictError("result artifact kind already has different immutable bytes")
+                verified = store.commit(prepared)
+                if same_kind:
+                    prior = same_kind[-1]
+                    if prior.get("uri") != verified.uri or prior.get("size_bytes") != verified.size_bytes:
+                        raise ResultArtifactConflictError("result artifact retry does not match its prior commit")
+                    return verified
+                details = {
+                    "kind": prepared.kind,
+                    "uri": verified.uri,
+                    "sha256": verified.sha256,
+                    "size_bytes": verified.size_bytes,
+                    "identity": identity.as_dict(),
+                }
+                await connection.execute(
+                    "UPDATE gods_mlops_artifact_reservations SET consumed_bytes=consumed_bytes+$2 WHERE job_id=$1::uuid",
+                    job_id,
+                    verified.size_bytes,
+                )
+                await connection.execute(
+                    """INSERT INTO gods_mlops_job_events(
+                           job_id,event_type,state,fencing_token,details
+                       ) VALUES($1::uuid,'result_artifact_committed','running',$2,$3::jsonb)""",
+                    job_id,
+                    lease["fencing_token"],
+                    _canonical_json(details),
+                )
+                return verified
+
+    async def complete_owned_job(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        identity,
+        details: dict[str, Any],
+        source_registry: DatasetSourceRegistry,
+    ) -> dict[str, Any]:
+        """Mark Task 8 work successful under its fence; the monitor still owns GPU release."""
+        from gods_mlops.jobs.checkpoints import CheckpointIdentityError, StaleCheckpointOwnerError
+
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                usage = await connection.fetchrow(
+                    "SELECT used_bytes FROM ingestion_storage_usage WHERE singleton = TRUE FOR UPDATE"
+                )
+                if usage is None:
+                    raise RuntimeError("the shared object-storage ledger is not initialized")
+                if identity.phase == "training":
+                    source_reasons = await source_registry.training_block_reasons_in_transaction(
+                        connection,
+                        dataset_version=identity.dataset_version,
+                        model_kind=identity.model_kind,
+                    )
+                    if source_reasons:
+                        raise DatasetNotReadyForTrainingError(source_reasons)
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
+                )
+                if job is None:
+                    raise KeyError(f"GPU job {job_id} does not exist")
+                expected = _checkpoint_identity_from_row(job)
+                if identity != expected:
+                    raise CheckpointIdentityError("completion identity does not match the immutable job")
+                if job["state"] == "completed":
+                    return _job_dict(job)
+                if (
+                    lease is None
+                    or str(job["lease_token"]) != str(lease_token)
+                    or job["state"] != "running"
+                    or job["phase"] not in {"preparation", "training"}
+                ):
+                    raise StaleCheckpointOwnerError("completion does not own a running Task 8 lease")
+                profile = await connection.fetchrow(
+                    """SELECT result_reservation_bytes FROM gods_mlops_resource_profiles
+                       WHERE phase=$1 AND model_kind=$2 AND config_version=$3""",
+                    job["phase"],
+                    job["model_kind"],
+                    job["config_version"],
+                )
+                reservation = await connection.fetchrow(
+                    "SELECT * FROM gods_mlops_artifact_reservations WHERE job_id=$1::uuid FOR UPDATE",
+                    job_id,
+                )
+                artifact_rows = await connection.fetch(
+                    """SELECT details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type='result_artifact_committed'""",
+                    job_id,
+                )
+                if profile is None or reservation is None or reservation["state"] != "reserved":
+                    raise ValueError("successful job has no active artifact reservation")
+                if not artifact_rows:
+                    raise ValueError("successful job must commit a result artifact before completion")
+                if reservation["consumed_bytes"] > reservation["reserved_bytes"]:
+                    raise RuntimeError("job artifact reservation accounting is inconsistent")
+                if usage["used_bytes"] < reservation["reserved_bytes"]:
+                    raise RuntimeError("shared object-storage ledger is below the active reservation")
+                canonical_details = _canonical_json(details)
+                completed = await connection.fetchrow(
+                    """UPDATE gods_mlops_jobs SET state='completed',reason_code=NULL,
+                           reason_detail=$3::jsonb,retryable=FALSE,completed_at=now(),updated_at=now()
+                       WHERE job_id=$1::uuid AND lease_token=$2::uuid RETURNING *""",
+                    job_id,
+                    lease_token,
+                    canonical_details,
+                )
+                if completed is None:
+                    raise StaleCheckpointOwnerError("completion fence changed before terminal commit")
+                usage_after_settlement = (
+                    usage["used_bytes"] - reservation["reserved_bytes"] + reservation["consumed_bytes"]
+                )
+                if usage_after_settlement < 0 or usage_after_settlement > 1024**4:
+                    raise RuntimeError("settled artifact usage is outside the one TiB storage ledger")
+                await connection.execute(
+                    "UPDATE ingestion_storage_usage SET used_bytes=$1 WHERE singleton=TRUE",
+                    usage_after_settlement,
+                )
+                await connection.execute(
+                    """UPDATE gods_mlops_artifact_reservations SET state='settled',settled_at=now()
+                       WHERE job_id=$1::uuid""",
+                    job_id,
+                )
+                await connection.execute(
+                    """INSERT INTO gods_mlops_job_events(
+                           job_id,event_type,state,fencing_token,details
+                       ) VALUES($1::uuid,'job_completed','completed',$2,$3::jsonb)""",
+                    job_id,
+                    lease["fencing_token"],
+                    _canonical_json({"identity": identity.as_dict(), "result": details}),
+                )
+                return _job_dict(completed)
+
+    async def result_artifacts_for(self, job_id: str) -> list[dict[str, Any]]:
+        """Return only committed result artifact events for one durable Task 8 job."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT details FROM gods_mlops_job_events
+                   WHERE job_id=$1::uuid AND event_type='result_artifact_committed'
+                   ORDER BY created_at, event_id""",
+                job_id,
+            )
+        return [_json_value(row["details"]) for row in rows]
+
+    async def profile_measurement_for_job(self, job_id: str) -> dict[str, Any] | None:
+        """Return one real model probe measurement and its evidence fields."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT measurement_id,input_sha256,config_sha256,model_kind,target_phase,
+                          result_state,peak_allocated_mib,peak_reserved_mib,optimizer_steps,
+                          inference_steps,checkpoint_resumed,verification_details,
+                          checkpoint_sha256,exit_code,measured_at
+                   FROM gods_mlops_profile_measurements WHERE job_id=$1::uuid""",
+                job_id,
+            )
+        if row is None:
+            return None
+        result = dict(row)
+        result["measurement_id"] = str(result["measurement_id"])
+        result["input_sha256"] = result["input_sha256"].strip()
+        result["config_sha256"] = result["config_sha256"].strip()
+        result["checkpoint_sha256"] = (
+            result["checkpoint_sha256"].strip() if result["checkpoint_sha256"] else None
+        )
+        result["verification_details"] = _json_value(result["verification_details"])
+        result["measured_at"] = result["measured_at"].isoformat()
+        return result
+
+    async def review_handoffs_for(self, job_id: str) -> list[dict[str, Any]]:
+        """Return CPU-published Task 5 assignment links attached after GPU exit."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT details FROM gods_mlops_job_events
+                   WHERE job_id=$1::uuid AND event_type='preparation_review_assignment'
+                   ORDER BY created_at, event_id""",
+                job_id,
+            )
+        return [_json_value(row["details"]) for row in rows]
+
+    async def record_preparation_review_assignment(
+        self,
+        *,
+        job_id: str,
+        item_id: str,
+        sample_id: str,
+        assignment_revision: str,
+        project_id: int,
+        model_request_key: str,
+        model_version: str,
+        model_id: str,
+        model_revision: str,
+        media_object_key: str,
+        source_sha256: str,
+        source_size_bytes: int,
+        bbox_revision: str | None,
+        result_sha256: str,
+    ) -> dict[str, Any]:
+        """Persist a Task 5 revision link after the GPU lease has been observed released."""
+        from uuid import UUID
+
+        UUID(job_id)
+        UUID(sample_id)
+        UUID(assignment_revision)
+        _validate_digest(result_sha256, "result_sha256")
+        _validate_digest(model_request_key, "model_request_key")
+        _validate_digest(source_sha256, "source_sha256")
+        if (
+            not item_id
+            or len(item_id) > 255
+            or not model_version
+            or len(model_version) > 255
+            or not model_id
+            or len(model_id) > 255
+            or not model_revision
+            or len(model_revision) > 255
+            or project_id <= 0
+            or source_size_bytes <= 0
+            or not media_object_key
+        ):
+            raise ValueError("preparation review provenance is invalid")
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                job = await connection.fetchrow(
+                    "SELECT * FROM gods_mlops_jobs WHERE job_id=$1::uuid FOR UPDATE", job_id
+                )
+                if job is None:
+                    raise KeyError(f"GPU job {job_id} does not exist")
+                if (
+                    job["phase"] != "preparation"
+                    or job["state"] != "completed"
+                    or job["lease_token"] is not None
+                    or job["model_kind"] not in {"detr", "qwen"}
+                ):
+                    raise ValueError("Task 5 assignment handoff requires completed preparation after observed GPU exit")
+                refs = _json_value(job["source_refs"])
+                matches = [
+                    item
+                    for item in refs.get("items", [])
+                    if str(item.get("item_id")) == item_id
+                    and str(item.get("sample_id")) == sample_id
+                    and item.get("object_key") == media_object_key
+                    and str(item.get("sha256")) == source_sha256
+                    and int(item.get("object_size_bytes", -1)) == source_size_bytes
+                    and (
+                        str(item.get("revision_id"))
+                        if item.get("revision_id") is not None
+                        else None
+                    )
+                    == bbox_revision
+                ]
+                if len(matches) != 1:
+                    raise ValueError("Task 5 assignment handoff item is outside the completed immutable batch")
+                if (job["model_kind"] == "detr") != (matches[0].get("item_kind") == "frame"):
+                    raise ValueError("Task 5 assignment handoff model/source kind does not match the job")
+                if job["model_kind"] == "qwen" and matches[0].get("item_kind") != "crop":
+                    raise ValueError("Qwen assignment handoff requires the exact reviewed crop source")
+                result_events = await connection.fetch(
+                    """SELECT details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type='result_artifact_committed'""",
+                    job_id,
+                )
+                if not any(
+                    item.get("sha256") == result_sha256
+                    and item.get("kind") == ("drafts" if job["model_kind"] == "detr" else "caption_drafts")
+                    and item.get("identity") == _checkpoint_identity_from_row(job).as_dict()
+                    for item in (_json_value(row["details"]) for row in result_events)
+                ):
+                    raise ValueError("Task 5 assignment handoff lacks a committed result artifact")
+                assignment = await connection.fetchrow(
+                    """SELECT assignment.sample_id,assignment.stage,assignment.bbox_revision,
+                              assignment.media_object_key,assignment.required_bytes,assignment.state,
+                              media.project_id,media.upload_filename,media.sha256,media.object_size_bytes,
+                              media.state AS media_state
+                       FROM review_assignments AS assignment
+                       JOIN label_studio_media_uploads AS media
+                         ON media.assignment_revision=assignment.revision
+                       WHERE assignment.revision=$1::uuid FOR UPDATE OF assignment,media""",
+                    assignment_revision,
+                )
+                request_marker = sha256(model_version.encode("utf-8")).hexdigest()[:16]
+                expected_filename = f"gods-model-{model_request_key[:32]}-{request_marker}.jpg"
+                expected_stage = "bbox" if job["model_kind"] == "detr" else "caption"
+                if assignment is not None and assignment["project_id"] != project_id:
+                    raise ValueError("Task 5 assignment project differs from the configured review project")
+                if (
+                    assignment is None
+                    or str(assignment["sample_id"]) != sample_id
+                    or assignment["stage"] != expected_stage
+                    or assignment["media_object_key"] != media_object_key
+                    or assignment["required_bytes"] != source_size_bytes
+                    or assignment["upload_filename"] != expected_filename
+                    or assignment["sha256"].strip() != source_sha256
+                    or assignment["object_size_bytes"] != source_size_bytes
+                    or assignment["bbox_revision"] != bbox_revision
+                    or assignment["state"] not in {"provisioning", "active", "finalized"}
+                    or assignment["media_state"] not in {"reserved", "uploaded", "deleted"}
+                ):
+                    raise ValueError("Task 5 assignment differs from the immutable source or model provenance")
+                active_lease = await connection.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM gods_mlops_gpu_leases WHERE job_id=$1::uuid)",
+                    job_id,
+                )
+                if active_lease:
+                    raise ValueError("Task 5 assignment handoff cannot run while the GPU lease is active")
+                details = {
+                    "item_id": item_id,
+                    "sample_id": sample_id,
+                    "assignment_revision": assignment_revision,
+                    "project_id": project_id,
+                    "model_request_key": model_request_key,
+                    "media_object_key": media_object_key,
+                    "source_sha256": source_sha256,
+                    "source_size_bytes": source_size_bytes,
+                    "bbox_revision": bbox_revision,
+                    "result_sha256": result_sha256,
+                    "model_version": model_version,
+                    "model_id": model_id,
+                    "model_revision": model_revision,
+                    "input_kind": job["input_kind"],
+                    "input_id": job["input_id"],
+                    "input_sha256": job["input_sha256"].strip(),
+                    "model_kind": job["model_kind"],
+                    "config_version": job["config_version"],
+                    "config_sha256": job["config_sha256"].strip(),
+                }
+                existing = await connection.fetch(
+                    """SELECT details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type='preparation_review_assignment'""",
+                    job_id,
+                )
+                for row in existing:
+                    current = _json_value(row["details"])
+                    if current.get("item_id") == item_id:
+                        if current != details:
+                            raise ResultArtifactConflictError(
+                                "Task 5 assignment handoff changed for an immutable preparation result"
+                            )
+                        return current
+                await connection.execute(
+                    """INSERT INTO gods_mlops_job_events(
+                           job_id,event_type,state,details
+                       ) VALUES($1::uuid,'preparation_review_assignment','completed',$2::jsonb)""",
+                    job_id,
+                    _canonical_json(details),
+                )
+                return details
+
+    async def settle_artifact_reservation(self, job_id: str) -> dict[str, Any] | None:
+        """Settle a terminal probe/failure reservation once and release unused global quota."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                usage = await connection.fetchrow(
+                    "SELECT used_bytes FROM ingestion_storage_usage WHERE singleton=TRUE FOR UPDATE"
+                )
+                if usage is None:
+                    raise RuntimeError("the shared object-storage ledger is not initialized")
+                job = await connection.fetchrow(
+                    "SELECT * FROM gods_mlops_jobs WHERE job_id=$1::uuid FOR UPDATE", job_id
+                )
+                if job is None:
+                    raise KeyError(f"GPU job {job_id} does not exist")
+                reservation = await connection.fetchrow(
+                    "SELECT * FROM gods_mlops_artifact_reservations WHERE job_id=$1::uuid FOR UPDATE",
+                    job_id,
+                )
+                if reservation is None or reservation["state"] == "settled":
+                    return _job_dict(job)
+                if job["state"] not in {"completed", "failed", "cancelled"}:
+                    raise ValueError("only terminal jobs can settle their artifact reservation")
+                if usage["used_bytes"] < reservation["reserved_bytes"]:
+                    raise RuntimeError("shared object-storage ledger is below the active reservation")
+                used_after = usage["used_bytes"] - reservation["reserved_bytes"] + reservation["consumed_bytes"]
+                await connection.execute(
+                    "UPDATE ingestion_storage_usage SET used_bytes=$1 WHERE singleton=TRUE",
+                    used_after,
+                )
+                await connection.execute(
+                    "UPDATE gods_mlops_artifact_reservations SET state='settled',settled_at=now() WHERE job_id=$1::uuid",
+                    job_id,
+                )
+                await connection.execute(
+                    """INSERT INTO gods_mlops_job_events(job_id,event_type,state,details)
+                       VALUES($1::uuid,'artifact_reservation_settled',$2,$3::jsonb)""",
+                    job_id,
+                    job["state"],
+                    _canonical_json({
+                        "reserved_bytes": reservation["reserved_bytes"],
+                        "consumed_bytes": reservation["consumed_bytes"],
+                        "released_bytes": reservation["reserved_bytes"] - reservation["consumed_bytes"],
+                    }),
+                )
+                return _job_dict(job)
 
     async def record_probe_measurement(
         self,
@@ -2110,18 +2636,29 @@ class JobQueue:
     async def submit_probe(
         self,
         *,
-        probe_input_id: str,
-        input_sha256: str,
         model_kind: str,
         config_version: str,
+        probe_input_id: str | None = None,
+        input_sha256: str | None = None,
+        probe_input: ProbeInput | None = None,
         rerun: bool = False,
     ) -> str:
         """Queue an immutable pre-publication resource probe on the shared queue."""
-        _validate_digest(input_sha256, "input_sha256")
-        if not probe_input_id.strip() or len(probe_input_id) > 255:
-            raise ValueError("probe_input_id must contain 1 to 255 characters")
         if model_kind not in {"detr", "clip", "qwen"}:
             raise ValueError("probe model_kind must be detr, clip, or qwen")
+        if probe_input is not None:
+            if probe_input.model_kind != model_kind:
+                raise ValueError("probe input model kind does not match the requested model")
+            probe_input_id = probe_input.probe_input_id
+            input_sha256 = probe_input.input_sha256
+            source_refs = probe_input.as_dict()
+        else:
+            if not isinstance(probe_input_id, str) or not probe_input_id.strip() or len(probe_input_id) > 255:
+                raise ValueError("probe_input_id must contain 1 to 255 characters")
+            source_refs = {"probe_input_id": probe_input_id, "input_sha256": input_sha256}
+        if not isinstance(input_sha256, str):
+            raise ValueError("probe input SHA-256 is missing")
+        _validate_digest(input_sha256, "input_sha256")
         profile = await self._repository.get_profile(
             phase="probe", model_kind=model_kind, config_version=config_version
         )
@@ -2129,13 +2666,15 @@ class JobQueue:
             raise ResourceProfileNotFoundError("probe config has no versioned resource profile")
         if profile["profile_state"] != "candidate":
             raise ValueError("resource probes require an unmeasured candidate profile")
+        if probe_input is not None and profile["target_phase"] != probe_input.target_phase:
+            raise ValueError("probe input target phase does not match its candidate profile")
         return await self._repository.enqueue(
             phase="probe",
             input_kind="probe_input",
             input_id=probe_input_id,
             input_sha256=input_sha256,
             dataset_version=None,
-            source_refs={"probe_input_id": probe_input_id, "input_sha256": input_sha256},
+            source_refs=source_refs,
             model_kind=model_kind,
             profile=profile,
             rerun=rerun,
@@ -2207,15 +2746,16 @@ class JobQueue:
             StaleCheckpointOwnerError,
         )
 
+        current_job = await self.get(job_id)
         expected = await self._repository.checkpoint_identity(job_id)
         if identity != expected:
             raise CheckpointIdentityError("checkpoint identity does not match the current immutable job input")
         if not await self._repository.lease_is_current(job_id, lease_token):
             raise StaleCheckpointOwnerError("checkpoint writer no longer owns the active GPU lease")
         profile = await self._repository.get_profile(
-            phase=(await self.get(job_id))["phase"],
-            model_kind=(await self.get(job_id))["model_kind"],
-            config_version=(await self.get(job_id))["config_version"],
+            phase=current_job["phase"],
+            model_kind=current_job["model_kind"],
+            config_version=current_job["config_version"],
         )
         if profile is None:
             raise CheckpointIdentityError("checkpoint resource profile is no longer available")
@@ -2224,6 +2764,7 @@ class JobQueue:
             payload=payload,
             reservation_bytes=profile["checkpoint_reservation_bytes"],
             replacement_reservation_bytes=2 * profile["checkpoint_reservation_bytes"],
+            previous_uri=current_job.get("checkpoint_uri"),
         )
         return await self._repository.commit_checkpoint(
             job_id=job_id,
@@ -2232,6 +2773,94 @@ class JobQueue:
             prepared=prepared,
             store=store,
         )
+
+    async def save_result_artifact(
+        self,
+        *,
+        store,
+        job_id: str,
+        lease_token: str,
+        identity,
+        kind: str,
+        payload: bytes,
+    ):
+        """Commit one result bundle under the Task 7 fence and shared reservation."""
+        from gods_mlops.jobs.checkpoints import CheckpointIdentityError, StaleCheckpointOwnerError
+
+        current_job = await self.get(job_id)
+        expected = await self._repository.checkpoint_identity(job_id)
+        if identity != expected:
+            raise CheckpointIdentityError("result identity does not match the current immutable job input")
+        if not await self._repository.lease_is_current(job_id, lease_token):
+            raise StaleCheckpointOwnerError("result writer no longer owns the active GPU lease")
+        profile = await self._repository.get_profile(
+            phase=current_job["phase"],
+            model_kind=current_job["model_kind"],
+            config_version=current_job["config_version"],
+        )
+        if profile is None:
+            raise CheckpointIdentityError("result resource profile is no longer available")
+        prepared = store.prepare(
+            identity=identity,
+            kind=kind,
+            payload=payload,
+            reservation_bytes=profile["result_reservation_bytes"],
+        )
+        try:
+            return await self._repository.commit_result_artifact(
+                job_id=job_id,
+                lease_token=lease_token,
+                identity=identity,
+                prepared=prepared,
+                store=store,
+                source_registry=self._sources,
+            )
+        except Exception:
+            discard = getattr(store, "discard", None)
+            if callable(discard):
+                discard(prepared)
+            raise
+
+    async def complete_owned_job(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        identity,
+        details: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await self._repository.complete_owned_job(
+            job_id=job_id,
+            lease_token=lease_token,
+            identity=identity,
+            details=details,
+            source_registry=self._sources,
+        )
+
+    async def settle_artifact_reservation(self, job_id: str) -> dict[str, Any] | None:
+        return await self._repository.settle_artifact_reservation(job_id)
+
+    async def load_checkpoint(self, *, store, job_id: str):
+        """Load only the current DB-committed checkpoint for this immutable job identity."""
+        from gods_mlops.jobs.checkpoints import CheckpointIntegrityError
+
+        details = await self._repository.checkpoint_metadata_for(job_id)
+        if details is None:
+            return None
+        identity = await self._repository.checkpoint_identity(job_id)
+        if identity.as_dict() != details["identity"]:
+            raise CheckpointIntegrityError("checkpoint identity changed in the job commit marker")
+        if hasattr(store, "load_uri"):
+            return store.load_uri(
+                details["uri"],
+                expected_identity=identity,
+                expected_sha256=details["sha256"],
+                expected_size_bytes=details["size_bytes"],
+            )
+        checkpoint = store.load(job_id, expected_identity=identity)
+        if checkpoint is None or checkpoint.sha256 != details["sha256"]:
+            raise CheckpointIntegrityError("local checkpoint does not match the database commit marker")
+        return checkpoint
 
     async def record_probe_measurement(
         self,
@@ -2248,7 +2877,7 @@ class JobQueue:
         verification_details: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Persist a probe result and promote only its measured runtime profile."""
-        return await self._repository.record_probe_measurement(
+        result = await self._repository.record_probe_measurement(
             job_id=job_id,
             lease_token=lease_token,
             exit_code=exit_code,
@@ -2260,6 +2889,9 @@ class JobQueue:
             inference_steps=inference_steps,
             verification_details=verification_details,
         )
+        if result.get("result_state") in {"succeeded", "failed"}:
+            await self._repository.settle_artifact_reservation(job_id)
+        return result
 
     async def record_communication_failure(
         self,
@@ -2335,6 +2967,16 @@ class JobQueue:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _verified_checkpoint_uri(verified: Any) -> str:
+    uri = getattr(verified, "uri", None)
+    if isinstance(uri, str) and uri:
+        return uri
+    path = getattr(verified, "path", None)
+    if path is None:
+        raise ValueError("verified checkpoint has no durable URI")
+    return path.resolve().as_uri()
 
 
 def _validate_digest(value: str, name: str) -> None:

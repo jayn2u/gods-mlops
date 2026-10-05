@@ -137,6 +137,11 @@ def test_pinned_label_studio_import_retries_lost_response_and_keeps_prediction_r
             image=media,
             prediction=prediction,
         )
+        await client.attach_prediction(
+            project_id=project_id,
+            task_id=reference.task_id,
+            prediction=prediction,
+        )
         task = await client.get_task(reference.task_id)
         assert retry.task_id == reference.task_id
         assert retry.file_upload_id == reference.file_upload_id

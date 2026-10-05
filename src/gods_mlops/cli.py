@@ -239,6 +239,7 @@ def _select_models(models: tuple, requested_id: str | None) -> tuple:
 
 def _check_training_image(*, require_cuda: bool) -> int:
     import numpy
+    import scipy
     import torch
     import torchvision
     from PIL import __version__ as pillow_version
@@ -252,6 +253,23 @@ def _check_training_image(*, require_cuda: bool) -> int:
         RTDetrImageProcessor,
         RTDetrV2ForObjectDetection,
     )
+    from transformers import RTDetrV2Config
+    from transformers.loss.loss_rt_detr import RTDetrHungarianMatcher
+
+    # Transformers 4.57.1 imports the RT-DETR Hungarian matcher lazily; importing
+    # its model class alone does not prove that scipy is present for optimization.
+    matcher = RTDetrHungarianMatcher(RTDetrV2Config(num_labels=2))
+    matches = matcher(
+        outputs={
+            "logits": torch.tensor([[[0.1, 0.9], [0.8, 0.2]]]),
+            "pred_boxes": torch.tensor([[[0.5, 0.5, 0.2, 0.2], [0.2, 0.2, 0.1, 0.1]]]),
+        },
+        targets=[
+            {"class_labels": torch.tensor([1]), "boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]])}
+        ],
+    )
+    if len(matches) != 1 or len(matches[0][0]) != 1:
+        raise RuntimeError("RT-DETR Hungarian assignment smoke did not match its synthetic target")
 
     cuda_available = torch.cuda.is_available()
     report = {
@@ -260,11 +278,13 @@ def _check_training_image(*, require_cuda: bool) -> int:
         "torchvision": torchvision.__version__,
         "cuda_available": cuda_available,
         "numpy": numpy.__version__,
+        "scipy": scipy.__version__,
         "pillow": pillow_version,
         "evaluation": [COCO.__name__, COCOeval.__name__],
         "model_classes": [
             RTDetrV2ForObjectDetection.__name__,
             RTDetrImageProcessor.__name__,
+            RTDetrHungarianMatcher.__name__,
             CLIPModel.__name__,
             CLIPProcessor.__name__,
             Qwen2_5_VLForConditionalGeneration.__name__,

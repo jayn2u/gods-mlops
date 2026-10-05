@@ -231,6 +231,219 @@ class PostgresAnnotationRepository:
                 )
                 return assignment_from_record(record)
 
+    async def create_model_draft_assignment(
+        self,
+        *,
+        sample_id: UUID,
+        stage: str,
+        project_id: int,
+        bbox_revision: str | None,
+        media_object_key: str,
+        required_bytes: int,
+        source_sha256: str,
+        model_request_key: str,
+        model_version: str,
+        item_id: str,
+    ) -> ReviewAssignment:
+        """Atomically find or prepare one source-bound model draft review assignment."""
+        if stage not in {"bbox", "caption"}:
+            raise ValueError("model drafts can prepare only bbox or caption review assignments")
+        if project_id <= 0 or required_bytes <= 0 or not media_object_key:
+            raise ValueError("model draft review requires project, source key, and positive byte count")
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", source_sha256)
+            or not re.fullmatch(r"[0-9a-f]{64}", model_request_key)
+            or not model_version
+            or len(model_version) > 255
+        ):
+            raise ValueError("model draft review identity or provenance is malformed")
+        if stage == "bbox" and bbox_revision is not None:
+            raise ReviewAssignmentConflictError("detector draft must bind the exact received frame")
+        if stage == "bbox" and item_id != str(sample_id):
+            raise ReviewAssignmentConflictError("detector draft item ID must be its exact frame sample ID")
+        if stage == "caption" and bbox_revision is None:
+            raise ReviewAssignmentConflictError("caption draft must bind its exact bbox revision")
+        request_marker = sha256(model_version.encode("utf-8")).hexdigest()[:16]
+        filename = f"gods-model-{model_request_key[:32]}-{request_marker}.jpg"
+        revision_id = UUID(bbox_revision) if bbox_revision is not None else None
+        bbox_revision_value = str(revision_id) if revision_id is not None else None
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                if stage == "bbox":
+                    source = await connection.fetchrow(
+                        """SELECT state,object_key,sha256,object_size_bytes
+                           FROM ingestion_samples WHERE sample_id=$1 FOR UPDATE""",
+                        sample_id,
+                    )
+                    if (
+                        source is None
+                        or source["state"] != "received"
+                        or source["object_key"] != media_object_key
+                        or source["sha256"].strip() != source_sha256
+                        or source["object_size_bytes"] != required_bytes
+                    ):
+                        raise ReviewAssignmentConflictError("detector draft frame source changed before assignment")
+                    source_sample_id = sample_id
+                else:
+                    try:
+                        UUID(item_id)
+                    except ValueError as error:
+                        raise ReviewAssignmentConflictError("caption draft crop ID is malformed") from error
+                    sample = await connection.fetchrow(
+                        "SELECT state FROM ingestion_samples WHERE sample_id=$1 FOR UPDATE",
+                        sample_id,
+                    )
+                    if sample is None or sample["state"] not in {"received", "expired"}:
+                        raise ReviewAssignmentConflictError("caption draft parent sample is unavailable")
+                    source = await connection.fetchrow(
+                        """SELECT crop_id,sample_id,bbox_revision,object_key,sha256,
+                                  object_size_bytes,state,caption_state,crop_set_ready
+                           FROM annotation_crops WHERE crop_id=$1::uuid FOR UPDATE""",
+                        item_id,
+                    )
+                    if (
+                        source is None
+                        or source["sample_id"] != sample_id
+                        or source["bbox_revision"] != revision_id
+                        or source["object_key"] != media_object_key
+                        or source["sha256"].strip() != source_sha256
+                        or source["object_size_bytes"] != required_bytes
+                        or source["state"] != "ready"
+                        or source["caption_state"] != "needs_review"
+                        or not source["crop_set_ready"]
+                    ):
+                        raise ReviewAssignmentConflictError("caption draft crop or bbox revision changed before assignment")
+                    source_sample_id = source["sample_id"]
+
+                existing = await connection.fetch(
+                    """SELECT assignment.assignment_id,assignment.revision,assignment.sample_id,
+                              assignment.stage,assignment.bbox_revision,assignment.label_studio_task_id,
+                              assignment.media_object_key,assignment.required_bytes,assignment.state,
+                              media.project_id,media.upload_filename,media.sha256,media.object_size_bytes
+                       FROM review_assignments AS assignment
+                       JOIN label_studio_media_uploads AS media
+                         ON media.assignment_revision=assignment.revision
+                       WHERE assignment.sample_id=$1 AND assignment.stage=$2
+                         AND assignment.media_object_key=$3
+                         AND assignment.bbox_revision IS NOT DISTINCT FROM $4
+                         AND media.upload_filename=$5""",
+                    source_sample_id,
+                    stage,
+                    media_object_key,
+                    bbox_revision_value,
+                    filename,
+                )
+                if existing:
+                    if len(existing) != 1:
+                        raise ReviewAssignmentConflictError("model draft request key matches multiple assignments")
+                    prior = existing[0]
+                    if (
+                        prior["project_id"] != project_id
+                        or prior["sha256"].strip() != source_sha256
+                        or prior["object_size_bytes"] != required_bytes
+                    ):
+                        raise ReviewAssignmentConflictError("model draft request provenance or project changed")
+                    if prior["state"] not in {"provisioning", "active", "finalized"}:
+                        raise ReviewAssignmentConflictError("model draft assignment is already terminal")
+                    return assignment_from_record(prior)
+
+                conflict = await connection.fetchrow(
+                    """SELECT revision FROM review_assignments
+                       WHERE sample_id=$1 AND stage=$2 AND state IN ('provisioning','active')""",
+                    source_sample_id,
+                    stage,
+                )
+                if conflict is not None:
+                    raise ReviewAssignmentConflictError(
+                        "another human or model review assignment is already active for this source"
+                    )
+                # Match Task 5's existing lock order: source row, shared quota, then
+                # active-review quota. This serializes model retries with human assignment.
+                usage = await connection.fetchrow(
+                    "SELECT used_bytes FROM ingestion_storage_usage WHERE singleton=TRUE FOR UPDATE"
+                )
+                if usage is None:
+                    raise RuntimeError("shared object quota ledger is missing")
+                if usage["used_bytes"] < required_bytes:
+                    raise ReviewAssignmentConflictError("model draft source bytes are absent from the shared quota")
+                next_global_bytes = usage["used_bytes"] + required_bytes
+                if next_global_bytes > GLOBAL_OBJECT_LIMIT:
+                    await self._record_capacity_stop(
+                        sample_id=source_sample_id,
+                        reason="global_object_quota_exceeded",
+                        action="model_draft_review_blocked",
+                    )
+                    raise GlobalObjectLimitError("model draft review copy exceeds the shared one TiB quota")
+                review_usage = await connection.fetchrow(
+                    "SELECT active_bytes FROM review_storage_usage WHERE singleton=TRUE FOR UPDATE"
+                )
+                if review_usage is None:
+                    raise RuntimeError("active review quota ledger is missing")
+                next_review_bytes = review_usage["active_bytes"] + 2 * required_bytes
+                if next_review_bytes > self._review_exception_bytes:
+                    await self._record_capacity_stop(
+                        sample_id=source_sample_id,
+                        reason="active_review_quota_exceeded",
+                        action="model_draft_review_blocked",
+                    )
+                    raise ReviewQuotaExceededError("model draft review exceeds the 100 GiB active-review quota")
+
+                assignment_id = uuid4()
+                new_revision = uuid4()
+                record = await connection.fetchrow(
+                    """INSERT INTO review_assignments(
+                           assignment_id,revision,sample_id,stage,bbox_revision,
+                           label_studio_task_id,media_object_key,required_bytes,state
+                       ) VALUES($1,$2,$3,$4,$5,NULL,$6,$7,'provisioning')
+                       RETURNING assignment_id,revision,sample_id,stage,bbox_revision,
+                                 label_studio_task_id,media_object_key,required_bytes,state""",
+                    assignment_id,
+                    new_revision,
+                    source_sample_id,
+                    stage,
+                    bbox_revision_value,
+                    media_object_key,
+                    required_bytes,
+                )
+                if stage == "bbox":
+                    head = await connection.fetchrow(
+                        """INSERT INTO sample_annotation_heads(sample_id,current_bbox_assignment_revision)
+                           VALUES($1,$2)
+                           ON CONFLICT(sample_id) DO UPDATE SET
+                             current_bbox_assignment_revision=EXCLUDED.current_bbox_assignment_revision,
+                             updated_at=now()
+                           WHERE sample_annotation_heads.current_bbox_assignment_revision IS NULL
+                           RETURNING sample_id""",
+                        source_sample_id,
+                        new_revision,
+                    )
+                    if head is None:
+                        raise ReviewAssignmentConflictError("bbox assignment head changed before model draft creation")
+                    await connection.execute(
+                        "UPDATE ingestion_samples SET selected=TRUE WHERE sample_id=$1", source_sample_id
+                    )
+                await connection.execute(
+                    "UPDATE ingestion_storage_usage SET used_bytes=$1 WHERE singleton=TRUE",
+                    next_global_bytes,
+                )
+                await connection.execute(
+                    """UPDATE review_storage_usage SET active_bytes=$1 WHERE singleton=TRUE""",
+                    next_review_bytes,
+                )
+                await connection.execute(
+                    """INSERT INTO label_studio_media_uploads(
+                           assignment_revision,project_id,upload_filename,sha256,
+                           object_size_bytes,state
+                       ) VALUES($1,$2,$3,$4,$5,'reserved')""",
+                    new_revision,
+                    project_id,
+                    filename,
+                    source_sha256,
+                    required_bytes,
+                )
+                return assignment_from_record(record)
+
     async def mark_bbox_edit(
         self,
         *,

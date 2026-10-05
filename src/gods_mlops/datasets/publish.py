@@ -93,6 +93,12 @@ class DatasetObjectStore:
         if not self._matches(object_key, len(content), sha256_digest):
             raise OSError("immutable dataset object failed read-after-write verification")
 
+    def delete_object(self, *, object_key: str) -> None:
+        """Delete one explicitly owned regenerable artifact after a replacement commits."""
+        if not object_key or object_key.startswith("/") or ".." in object_key.split("/"):
+            raise ValueError("S3 object key is not a safe relative key")
+        self._client.delete_object(Bucket=self._bucket, Key=object_key)
+
     def _matches(self, object_key: str, expected_size: int, expected_sha256: str) -> bool:
         try:
             response: dict[str, Any] = self._client.get_object(Bucket=self._bucket, Key=object_key)

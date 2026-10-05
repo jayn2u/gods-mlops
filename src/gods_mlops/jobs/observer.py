@@ -40,7 +40,18 @@ def identity_for(pid):
     status = (proc / "status").read_text(encoding="ascii")
     uid_line = next(line for line in status.splitlines() if line.startswith("Uid:"))
     uid = int(uid_line.split()[1])
-    return {"pid": int(pid), "start_ticks": int(fields[19]), "uid": uid}
+    cgroup_paths = []
+    try:
+        for line in (proc / "cgroup").read_text(encoding="ascii").splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[2].startswith("/") and parts[2] not in cgroup_paths:
+                cgroup_paths.append(parts[2])
+    except (OSError, UnicodeError):
+        # Process identity remains useful for admission, while the K8s owner resolver
+        # rejects this process because it cannot prove the cgroup/container identity.
+        cgroup_paths = []
+    return {"pid": int(pid), "start_ticks": int(fields[19]), "uid": uid,
+            "cgroup_paths": cgroup_paths}
 
 machine_id = pathlib.Path("/etc/machine-id").read_text(encoding="ascii").strip()
 host_identity = "machine-sha256:" + hashlib.sha256(machine_id.encode("ascii")).hexdigest()

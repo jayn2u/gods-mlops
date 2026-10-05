@@ -8,12 +8,14 @@ dependencies = [
     "boto3==1.40.53",
     "fastapi==0.116.1",
     "huggingface-hub==0.36.2",
+    "kubernetes==30.1.0",
     "numpy==2.3.3",
     "pillow==12.0.0",
     "pycocotools==2.0.11",
     "python-multipart==0.0.20",
     "pyyaml==6.0.3",
     "safetensors==0.7.0",
+    "scipy==1.18.1",
     "torch==2.12.0",
     "torchvision==0.27.0",
     "transformers==4.57.1",
@@ -25,9 +27,14 @@ gods-mlops = "gods_mlops.cli:main"
 gods-mlops-training-preflight = "gods_mlops.cli:training_preflight_main"
 gods-mlops-ingestion-api = "gods_mlops.ingestion.app:main"
 gods-mlops-resource-observer = "gods_mlops.jobs.observer:main"
+gods-mlops-training = "gods_mlops.training.cli:main"
 
 [dependency-groups]
-dev = ["pytest==8.4.2"]
+dev = [
+    "kfp==2.16.1",
+    "kfp-kubernetes==2.16.1",
+    "pytest==8.4.2",
+]
 
 [build-system]
 requires = ["hatchling==1.27.0"]
@@ -36,6 +43,7 @@ build-backend = "hatchling.build"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+pythonpath = [".", "src"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/gods_mlops"]

@@ -2,6 +2,9 @@ FROM ghcr.io/astral-sh/uv:0.12.20@sha256:100047e74f30778ab704942321a09750d615873
 
 FROM docker.io/library/python:3.12-slim-bookworm@sha256:54c85f3c47607a77f32adec749d3c81d1348bf25833671f512b26a9b6d778cb3
 
+ARG GODS_MLOPS_SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${GODS_MLOPS_SOURCE_REVISION}
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     UV_COMPILE_BYTECODE=1 \
@@ -15,6 +18,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 COPY --from=uv /uv /uvx /usr/local/bin/
 WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends openssh-client=1:9.2p1-2+deb12u10 \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project

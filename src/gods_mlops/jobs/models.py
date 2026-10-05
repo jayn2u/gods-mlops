@@ -113,6 +113,116 @@ class DatasetTrainingSource:
 
 
 @dataclass(frozen=True, slots=True)
+class ProbeInput:
+    """Immutable S3 manifest for a model-readiness fixture, separate from a dataset."""
+
+    probe_input_id: str
+    model_kind: str
+    target_phase: str
+    config_version: str
+    manifest_object_key: str
+    input_sha256: str
+    object_size_bytes: int
+    fixture: bool = True
+
+    def __post_init__(self) -> None:
+        import re
+
+        if not self.probe_input_id.strip() or len(self.probe_input_id) > 255:
+            raise ValueError("probe_input_id must contain 1 to 255 characters")
+        if self.model_kind not in {"detr", "clip", "qwen"}:
+            raise ValueError("probe model_kind must be detr, clip, or qwen")
+        if self.target_phase not in {"preparation", "training"}:
+            raise ValueError("model readiness probe target_phase is unsupported")
+        if self.model_kind == "qwen" and self.target_phase != "preparation":
+            raise ValueError("Qwen readiness probes are inference-only")
+        if self.model_kind in {"detr", "clip"} and self.target_phase != "training":
+            raise ValueError("DETR and CLIP readiness probes require their training target")
+        if not self.config_version.strip() or len(self.config_version) > 255:
+            raise ValueError("probe config_version must contain 1 to 255 characters")
+        if (
+            not self.manifest_object_key
+            or self.manifest_object_key.startswith("/")
+            or ".." in self.manifest_object_key.split("/")
+            or "\\" in self.manifest_object_key
+        ):
+            raise ValueError("probe manifest key must be a safe relative object key")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.input_sha256):
+            raise ValueError("probe manifest SHA-256 must be lowercase hexadecimal")
+        if self.object_size_bytes <= 0:
+            raise ValueError("probe manifest object size must be positive")
+        if self.fixture is not True:
+            raise ValueError("model readiness probe input must be explicitly marked as a fixture")
+
+    @property
+    def input_kind(self) -> str:
+        return "probe_input"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "gods-mlops-probe-input-v1",
+            "probe_input_id": self.probe_input_id,
+            "input_kind": self.input_kind,
+            "model_kind": self.model_kind,
+            "target_phase": self.target_phase,
+            "config_version": self.config_version,
+            "manifest_object_key": self.manifest_object_key,
+            "input_sha256": self.input_sha256,
+            "object_size_bytes": self.object_size_bytes,
+            "fixture": self.fixture,
+            "dataset_version": None,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "ProbeInput":
+        if value.get("schema") != "gods-mlops-probe-input-v1" or value.get("input_kind") != "probe_input":
+            raise ValueError("probe input reference schema is unsupported")
+        if value.get("dataset_version") is not None:
+            raise ValueError("probe input cannot claim a published dataset version")
+        return cls(
+            probe_input_id=str(value["probe_input_id"]),
+            model_kind=str(value["model_kind"]),
+            target_phase=str(value["target_phase"]),
+            config_version=str(value["config_version"]),
+            manifest_object_key=str(value["manifest_object_key"]),
+            input_sha256=str(value["input_sha256"]),
+            object_size_bytes=int(value["object_size_bytes"]),
+            fixture=value.get("fixture") is True,
+        )
+
+    def verify(self, object_store: Any) -> dict[str, Any]:
+        import json
+
+        from gods_mlops.datasets.manifest import canonical_json, content_sha256
+
+        payload = object_store.read_source(
+            object_key=self.manifest_object_key,
+            sha256_digest=self.input_sha256,
+            size_bytes=self.object_size_bytes,
+        )
+        if len(payload) != self.object_size_bytes or content_sha256(payload) != self.input_sha256:
+            raise ValueError("probe manifest blob failed frozen size or SHA-256 verification")
+        try:
+            manifest = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("probe manifest object is not valid UTF-8 JSON") from error
+        expected = {
+            "schema_version": 1,
+            "fixture": True,
+            "phase": "probe",
+            "model_kind": self.model_kind,
+            "input_kind": self.input_kind,
+            "input_id": self.probe_input_id,
+            "config_version": self.config_version,
+        }
+        if not isinstance(manifest, dict) or any(manifest.get(key) != value for key, value in expected.items()):
+            raise ValueError("probe manifest content differs from its typed immutable reference")
+        if content_sha256(canonical_json(manifest)) != self.input_sha256:
+            raise ValueError("probe manifest canonical content hash differs from its typed reference")
+        return manifest
+
+
+@dataclass(frozen=True, slots=True)
 class AnnotationSourceSelection:
     """Caller-selected immutable frame or completed crop for pre-publication GPU work."""
 
@@ -185,13 +295,27 @@ class ProcessIdentity:
     pid: int
     start_ticks: int
     uid: int | None = None
+    cgroup_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if self.pid <= 0 or self.start_ticks <= 0:
             raise ValueError("process identity needs a positive PID and start time")
+        if any(
+            not isinstance(path, str)
+            or not path.startswith("/")
+            or "\x00" in path
+            or len(path) > 4096
+            for path in self.cgroup_paths
+        ):
+            raise ValueError("process cgroup identities must be absolute bounded paths")
 
-    def as_dict(self) -> dict[str, int | None]:
-        return {"pid": self.pid, "start_ticks": self.start_ticks, "uid": self.uid}
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "pid": self.pid,
+            "start_ticks": self.start_ticks,
+            "uid": self.uid,
+            "cgroup_paths": list(self.cgroup_paths),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +352,7 @@ class ResourceObservation:
                 pid=int(item["pid"]),
                 start_ticks=int(item["start_ticks"]),
                 uid=int(item["uid"]) if item.get("uid") is not None else None,
+                cgroup_paths=tuple(str(path) for path in item.get("cgroup_paths", [])),
             )
 
         if not isinstance(value, dict):

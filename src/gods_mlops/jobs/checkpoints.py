@@ -92,11 +92,12 @@ class CheckpointIdentity:
 @dataclass(frozen=True, slots=True)
 class VerifiedCheckpoint:
     identity: CheckpointIdentity
-    path: Path
+    path: Path | None
     sha256: str
     size_bytes: int
     created_at: datetime
     payload: bytes
+    uri: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +145,7 @@ class FileCheckpointStore:
         payload: bytes,
         reservation_bytes: int,
         replacement_reservation_bytes: int | None = None,
+        previous_uri: str | None = None,
     ) -> PreparedCheckpoint:
         """Write and verify payload bytes without publishing a resume marker."""
         if not isinstance(payload, bytes) or not payload:
@@ -268,6 +270,7 @@ class FileCheckpointStore:
                             size_bytes=size_bytes,
                             created_at=created_at,
                             payload=payload,
+                            uri=path.resolve().as_uri(),
                         ),
                     )
                 )

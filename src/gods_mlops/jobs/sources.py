@@ -59,6 +59,27 @@ class DatasetSourceRegistry:
             leakage_impact_count=int(row["leakage_impact_count"]),
         )
 
+    async def training_manifest_reference(self, dataset_version: str) -> dict[str, str | int]:
+        """Return the published immutable manifest S3 reference for a current dataset."""
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT manifest_object_key, manifest_sha256, manifest_size_bytes
+                FROM dataset_versions
+                WHERE dataset_version = $1 AND published_at IS NOT NULL
+                  AND state = 'published'
+                """,
+                dataset_version,
+            )
+        if row is None or not row["manifest_object_key"]:
+            raise DatasetSourceUnavailableError("published dataset manifest is unavailable")
+        return {
+            "object_key": str(row["manifest_object_key"]),
+            "sha256": row["manifest_sha256"].strip(),
+            "size_bytes": int(row["manifest_size_bytes"]),
+        }
+
     async def training_block_reasons_in_transaction(
         self,
         connection: asyncpg.Connection,
