@@ -1121,6 +1121,175 @@ def test_s3_checkpoint_aba_replacement_recharges_pruned_object_lifetime(
     asyncio.run(exercise())
 
 
+async def _exercise_round1_checkpoint_prune_recreation(
+    database_url: str, *, prune_was_already_completed: bool
+) -> None:
+    endpoint = os.environ["GODS_MLOPS_TEST_S3_ENDPOINT"]
+    access = os.environ["GODS_MLOPS_TEST_S3_ACCESS_KEY"]
+    secret = os.environ["GODS_MLOPS_TEST_S3_SECRET_KEY"]
+    bucket = os.environ["GODS_MLOPS_TEST_S3_BUCKET"]
+    objects = DatasetObjectStore(
+        endpoint_url=endpoint, access_key=access, secret_key=secret, bucket=bucket, region="us-east-1"
+    )
+    repository, queue, sources, admission, job_id, now = await _probe_run(database_url)
+    object_keys: set[str] = set()
+    try:
+        baseline = await _storage_bytes(database_url)
+        await _admit_probe(queue, admission, job_id, now)
+        lease = await repository.get_active_lease(GPU_UUID)
+        identity = await repository.checkpoint_identity(job_id)
+        store = S3CheckpointStore(objects=objects, bucket=bucket, prefix=f"task8-r1-compat/{uuid4()}")
+        payload_a = b"round-one-checkpoint-A-retained-after-recreation"
+        payload_b = b"round-one-checkpoint-B-temporary-replacement"
+
+        first_a = await queue.save_checkpoint(
+            store=store,
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            identity=identity,
+            payload=payload_a,
+        )
+        object_keys.add(first_a.uri.removeprefix(f"s3://{bucket}/"))
+        if prune_was_already_completed:
+            second = await queue.save_checkpoint(
+                store=store,
+                job_id=job_id,
+                lease_token=lease["lease_token"],
+                identity=identity,
+                payload=payload_b,
+            )
+            object_keys.add(second.uri.removeprefix(f"s3://{bucket}/"))
+            with pytest.raises(FileNotFoundError):
+                objects.read_source(
+                    object_key=first_a.uri.removeprefix(f"s3://{bucket}/"),
+                    sha256_digest=first_a.sha256,
+                    size_bytes=first_a.size_bytes,
+                )
+        else:
+            original_prune_previous = store.prune_previous
+            failed_once = False
+
+            def lose_first_delete_ack(prepared):
+                nonlocal failed_once
+                if not failed_once:
+                    failed_once = True
+                    raise OSError("simulate round-one checkpoint prune acknowledgement loss")
+                original_prune_previous(prepared)
+
+            prepared_b = store.prepare(
+                identity=identity,
+                payload=payload_b,
+                reservation_bytes=96 * 1024**2,
+            )
+            object_keys.add(prepared_b.object_key)
+            store.prune_previous = lose_first_delete_ack
+            with pytest.raises(OSError, match="acknowledgement loss"):
+                await queue.save_checkpoint(
+                    store=store,
+                    job_id=job_id,
+                    lease_token=lease["lease_token"],
+                    identity=identity,
+                    payload=payload_b,
+                )
+            store.prune_previous = original_prune_previous
+
+        legacy_rows = await _rewrite_checkpoint_history_as_round1(
+            database_url,
+            job_id=job_id,
+            uri=first_a.uri,
+            sha256_digest=first_a.sha256,
+        )
+        assert "write_lifetime_id" not in legacy_rows["artifact_write_pending"]
+        assert legacy_rows["artifact_write_pending"]["operation_id"]
+        assert "write_lifetime_id" not in legacy_rows["checkpoint_committed"]
+        assert legacy_rows["checkpoint_committed"]["operation_id"]
+        assert "write_lifetime_id" not in legacy_rows["checkpoint_prune_pending"]
+        assert "operation_id" not in legacy_rows["checkpoint_prune_pending"]
+        if prune_was_already_completed:
+            assert "checkpoint_pruned" in legacy_rows
+            assert "write_lifetime_id" not in legacy_rows["checkpoint_pruned"]
+            assert "operation_id" not in legacy_rows["checkpoint_pruned"]
+        else:
+            assert "checkpoint_pruned" not in legacy_rows
+
+        recreated_a = await queue.save_checkpoint(
+            store=store,
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            identity=identity,
+            payload=payload_a,
+        )
+        after_recreation = await repository.artifact_reservation_for(job_id)
+        assert recreated_a.uri == first_a.uri
+        assert after_recreation["consumed_bytes"] == recreated_a.size_bytes
+        assert objects.read_source(
+            object_key=recreated_a.uri.removeprefix(f"s3://{bucket}/"),
+            sha256_digest=recreated_a.sha256,
+            size_bytes=recreated_a.size_bytes,
+        ) == payload_a
+
+        # A retry of the same currently committed bytes remains idempotent and charged once.
+        repeated = await queue.save_checkpoint(
+            store=store,
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            identity=identity,
+            payload=payload_a,
+        )
+        assert repeated.uri == recreated_a.uri
+        assert (await repository.artifact_reservation_for(job_id))["consumed_bytes"] == recreated_a.size_bytes
+
+        failed = await queue.record_probe_measurement(
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            exit_code=1,
+            peak_allocated_mib=None,
+            peak_reserved_mib=None,
+            optimizer_steps=0,
+            checkpoint_resumed=False,
+            checkpoint_sha256=None,
+            inference_steps=0,
+            verification_details={"passed": False, "failure": "test_round1_checkpoint_prune_compatibility"},
+        )
+        assert failed["result_state"] == "failed"
+        reservation = await repository.artifact_reservation_for(job_id)
+        assert reservation["state"] == "settled"
+        assert reservation["consumed_bytes"] == len(payload_a)
+        assert await _storage_bytes(database_url) == baseline + len(payload_a)
+    finally:
+        for object_key in object_keys:
+            objects.delete_object(object_key=object_key)
+        if "recreated_a" in locals():
+            objects.delete_object(object_key=recreated_a.uri.removeprefix(f"s3://{bucket}/"))
+        await queue.close()
+        await repository.close()
+        await sources.close()
+
+
+def test_s3_round1_completed_prune_recreation_gets_a_fresh_charge(task7_database_url: str) -> None:
+    required = (
+        "GODS_MLOPS_TEST_S3_ENDPOINT",
+        "GODS_MLOPS_TEST_S3_ACCESS_KEY",
+        "GODS_MLOPS_TEST_S3_SECRET_KEY",
+        "GODS_MLOPS_TEST_S3_BUCKET",
+    )
+    if any(not os.environ.get(name) for name in required):
+        pytest.skip("loopback-only Task 8 S3 endpoint is not configured")
+    asyncio.run(_exercise_round1_checkpoint_prune_recreation(task7_database_url, prune_was_already_completed=True))
+
+
+def test_s3_round1_pending_prune_recreation_gets_a_fresh_charge(task7_database_url: str) -> None:
+    required = (
+        "GODS_MLOPS_TEST_S3_ENDPOINT",
+        "GODS_MLOPS_TEST_S3_ACCESS_KEY",
+        "GODS_MLOPS_TEST_S3_SECRET_KEY",
+        "GODS_MLOPS_TEST_S3_BUCKET",
+    )
+    if any(not os.environ.get(name) for name in required):
+        pytest.skip("loopback-only Task 8 S3 endpoint is not configured")
+    asyncio.run(_exercise_round1_checkpoint_prune_recreation(task7_database_url, prune_was_already_completed=False))
+
+
 def test_file_checkpoint_replacements_account_only_retained_bytes_and_keep_replacing(
     task7_database_url: str, tmp_path: Path
 ) -> None:
@@ -1752,5 +1921,48 @@ async def _storage_bytes(database_url: str) -> int:
     connection = await asyncpg.connect(database_url)
     try:
         return int(await connection.fetchval("SELECT used_bytes FROM ingestion_storage_usage WHERE singleton=TRUE"))
+    finally:
+        await connection.close()
+
+
+async def _rewrite_checkpoint_history_as_round1(
+    database_url: str, *, job_id: str, uri: str, sha256_digest: str
+) -> dict[str, dict]:
+    """Remove only fields that did not exist in the round-1 durable event format."""
+    connection = await asyncpg.connect(database_url)
+    try:
+        await connection.execute(
+            """UPDATE gods_mlops_job_events SET details = CASE
+                     WHEN event_type IN ('artifact_write_pending','checkpoint_committed')
+                       THEN details - 'write_lifetime_id'
+                     WHEN event_type IN ('checkpoint_prune_pending','checkpoint_pruned')
+                       THEN details - 'write_lifetime_id' - 'operation_id'
+                     ELSE details END
+               WHERE job_id=$1::uuid
+                 AND event_type IN ('artifact_write_pending','checkpoint_committed',
+                                    'checkpoint_prune_pending','checkpoint_pruned')
+                 AND COALESCE(details->>'uri',details->>'checkpoint_uri')=$2
+                 AND details->>'sha256'=$3""",
+            job_id,
+            uri,
+            sha256_digest,
+        )
+        rows = await connection.fetch(
+            """SELECT event_type,details FROM gods_mlops_job_events
+               WHERE job_id=$1::uuid AND event_type IN
+                 ('artifact_write_pending','checkpoint_committed','checkpoint_prune_pending','checkpoint_pruned')
+                 AND COALESCE(details->>'uri',details->>'checkpoint_uri')=$2
+                 AND details->>'sha256'=$3
+               ORDER BY event_id""",
+            job_id,
+            uri,
+            sha256_digest,
+        )
+        return {
+            row["event_type"]: json.loads(row["details"])
+            if isinstance(row["details"], str)
+            else row["details"]
+            for row in rows
+        }
     finally:
         await connection.close()

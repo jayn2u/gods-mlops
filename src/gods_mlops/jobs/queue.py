@@ -1505,6 +1505,7 @@ class PostgresJobQueueRepository:
                 active_pending = []
                 deleted_intents: set[str] = set()
                 pruned_checkpoint_lifetimes: set[str] = set()
+                legacy_pruned_checkpoint_objects: set[tuple[str, str]] = set()
                 for row in events:
                     details = _json_value(row["details"])
                     event_type = row["event_type"]
@@ -1515,6 +1516,22 @@ class PostgresJobQueueRepository:
                         lifetime_id = details.get("write_lifetime_id") or details.get("operation_id")
                         if lifetime_id:
                             pruned_checkpoint_lifetimes.add(str(lifetime_id))
+                        # Round-1 prune events did not carry a lifetime/operation ID. A
+                        # later retry emits a synthetic legacy-* lifetime, which needs
+                        # the same URI/SHA fallback when paired with a round-1 write.
+                        if (
+                            not details.get("operation_id")
+                            and (
+                                not details.get("write_lifetime_id")
+                                or str(details["write_lifetime_id"]).startswith("legacy-")
+                            )
+                        ):
+                            legacy_pruned_checkpoint_objects.add(
+                                (
+                                    str(details.get("uri") or details.get("checkpoint_uri") or ""),
+                                    str(details.get("sha256") or ""),
+                                )
+                            )
                         continue
                     event_uri = details.get("uri") or details.get("checkpoint_uri")
                     if operation == "result" and event_type == "result_artifact_committed":
@@ -1543,9 +1560,18 @@ class PostgresJobQueueRepository:
                 for details in active_pending:
                     operation_id = str(details.get("operation_id", ""))
                     lifetime_id = str(details.get("write_lifetime_id") or operation_id)
+                    legacy_pruned_object = (
+                        operation == "checkpoint"
+                        and not details.get("write_lifetime_id")
+                        and (
+                            str(details.get("uri") or details.get("checkpoint_uri") or ""),
+                            str(details.get("sha256") or ""),
+                        )
+                        in legacy_pruned_checkpoint_objects
+                    )
                     if operation_id in deleted_intents or (
                         operation == "checkpoint" and lifetime_id in pruned_checkpoint_lifetimes
-                    ):
+                    ) or legacy_pruned_object:
                         continue
                     if (
                         details.get("uri") == uri
