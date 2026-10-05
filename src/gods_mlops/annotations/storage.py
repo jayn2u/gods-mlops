@@ -37,6 +37,7 @@ _MIGRATIONS = (
     (8, "0008_label_studio_media_state.sql"),
     (9, "0009_crop_expiry_reconciliation.sql"),
     (10, "0010_relevance_review_dependencies.sql"),
+    (11, "0011_immutable_datasets.sql"),
 )
 _MIGRATION_RESOURCES = files("gods_mlops.migrations")
 
@@ -776,139 +777,167 @@ class PostgresAnnotationRepository:
         crop_id: UUID | None = None,
         caption_revision: UUID | None = None,
     ) -> dict[str, Any]:
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                return await self.adopt_for_dataset_in_transaction(
+                    connection,
+                    dataset_version=dataset_version,
+                    target=target,
+                    sample_id=sample_id,
+                    bbox_revision=bbox_revision,
+                    crop_id=crop_id,
+                    caption_revision=caption_revision,
+                )
+
+    async def adopt_for_dataset_in_transaction(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        dataset_version: str,
+        target: str,
+        sample_id: UUID,
+        bbox_revision: UUID,
+        crop_id: UUID | None = None,
+        caption_revision: UUID | None = None,
+    ) -> dict[str, Any]:
+        """Adopt one current annotation source within its caller's transaction.
+
+        A dataset publisher uses this seam after it has acquired all sample, annotation-head,
+        and crop locks. The adoption, publication intent, and any relevance freeze can then
+        commit or roll back together without creating a retention race.
+        """
         if not dataset_version.strip() or len(dataset_version) > 255:
             raise ValueError("dataset_version must contain 1 to 255 characters")
         if target not in {"detr", "clip"}:
             raise ValueError("dataset target must be detr or clip")
         if (target == "clip") != (crop_id is not None and caption_revision is not None):
             raise ValueError("CLIP adoption requires one crop and its reviewed caption")
-        pool = await self._get_pool()
-        async with pool.acquire() as connection:
-            async with connection.transaction():
-                sample = await connection.fetchrow(
-                    "SELECT state FROM ingestion_samples WHERE sample_id = $1 FOR UPDATE",
-                    sample_id,
+        sample = await connection.fetchrow(
+            "SELECT state FROM ingestion_samples WHERE sample_id = $1 FOR UPDATE",
+            sample_id,
+        )
+        if sample is None:
+            raise ReviewAssignmentNotFoundError("dataset source frame does not exist")
+        if target == "detr":
+            if sample["state"] != "received":
+                raise ReviewAssignmentConflictError("DETR adoption requires a retained source frame")
+            head = await connection.fetchrow(
+                """
+                SELECT latest_bbox_revision, current_bbox_assignment_revision
+                FROM sample_annotation_heads WHERE sample_id = $1 FOR UPDATE
+                """,
+                sample_id,
+            )
+            if (
+                head is None
+                or head["latest_bbox_revision"] != bbox_revision
+                or head["current_bbox_assignment_revision"] is not None
+            ):
+                raise ReviewAssignmentConflictError("DETR adoption must use the latest finalized bbox")
+            prior = await connection.fetchrow(
+                """
+                SELECT adoption_id, dataset_version, target, sample_id,
+                       annotation_revision_id, crop_id, caption_revision_id
+                FROM dataset_adoptions
+                WHERE dataset_version = $1 AND target = 'detr' AND sample_id = $2
+                """,
+                dataset_version,
+                sample_id,
+            )
+            if prior is not None:
+                return _adoption_dict(prior)
+            exists = await connection.fetchval(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM annotation_revisions
+                    WHERE sample_id = $1 AND annotation_revision_id = $2 AND stage = 'bbox'
                 )
-                if sample is None:
-                    raise ReviewAssignmentNotFoundError("dataset source frame does not exist")
-                if target == "detr":
-                    if sample["state"] != "received":
-                        raise ReviewAssignmentConflictError("DETR adoption requires a retained source frame")
-                    head = await connection.fetchrow(
-                        """
-                        SELECT latest_bbox_revision, current_bbox_assignment_revision
-                        FROM sample_annotation_heads WHERE sample_id = $1 FOR UPDATE
-                        """,
-                        sample_id,
-                    )
-                    if (
-                        head is None
-                        or head["latest_bbox_revision"] != bbox_revision
-                        or head["current_bbox_assignment_revision"] is not None
-                    ):
-                        raise ReviewAssignmentConflictError("DETR adoption must use the latest finalized bbox")
-                    prior = await connection.fetchrow(
-                        """
-                        SELECT adoption_id, dataset_version, target, sample_id,
-                               annotation_revision_id, crop_id, caption_revision_id
-                        FROM dataset_adoptions
-                        WHERE dataset_version = $1 AND target = 'detr' AND sample_id = $2
-                        """,
-                        dataset_version,
-                        sample_id,
-                    )
-                    if prior is not None:
-                        return _adoption_dict(prior)
-                    exists = await connection.fetchval(
-                        """
-                        SELECT EXISTS (
-                            SELECT 1 FROM annotation_revisions
-                            WHERE sample_id = $1 AND annotation_revision_id = $2 AND stage = 'bbox'
-                        )
-                        """,
-                        sample_id,
-                        bbox_revision,
-                    )
-                    if not exists:
-                        raise ReviewAssignmentNotFoundError("finalized DETR annotation revision is missing")
-                    record = await connection.fetchrow(
-                        """
-                        INSERT INTO dataset_adoptions (
-                            adoption_id, dataset_version, target, sample_id, annotation_revision_id
-                        ) VALUES ($1, $2, 'detr', $3, $4)
-                        RETURNING adoption_id, dataset_version, target, sample_id,
-                                  annotation_revision_id, crop_id, caption_revision_id
-                        """,
-                        uuid4(),
-                        dataset_version,
-                        sample_id,
-                        bbox_revision,
-                    )
-                    await connection.execute(
-                        "UPDATE ingestion_samples SET selected = TRUE WHERE sample_id = $1",
-                        sample_id,
-                    )
-                    return _adoption_dict(record)
+                """,
+                sample_id,
+                bbox_revision,
+            )
+            if not exists:
+                raise ReviewAssignmentNotFoundError("finalized DETR annotation revision is missing")
+            record = await connection.fetchrow(
+                """
+                INSERT INTO dataset_adoptions (
+                    adoption_id, dataset_version, target, sample_id, annotation_revision_id
+                ) VALUES ($1, $2, 'detr', $3, $4)
+                RETURNING adoption_id, dataset_version, target, sample_id,
+                          annotation_revision_id, crop_id, caption_revision_id
+                """,
+                uuid4(),
+                dataset_version,
+                sample_id,
+                bbox_revision,
+            )
+            await connection.execute(
+                "UPDATE ingestion_samples SET selected = TRUE WHERE sample_id = $1",
+                sample_id,
+            )
+            return _adoption_dict(record)
 
-                crop = await connection.fetchrow(
-                    """
-                    SELECT bbox_revision, state, caption_state, caption_revision_id
-                    FROM annotation_crops WHERE sample_id = $1 AND crop_id = $2 FOR UPDATE
-                    """,
-                    sample_id,
-                    crop_id,
-                )
-                if (
-                    crop is None
-                    or crop["bbox_revision"] != bbox_revision
-                    or crop["state"] != "ready"
-                    or crop["caption_state"] != "reviewed"
-                    or crop["caption_revision_id"] != caption_revision
-                ):
-                    raise ReviewAssignmentConflictError(
-                        "CLIP adoption requires the exact reviewed crop revision"
-                    )
-                exists = await connection.fetchval(
-                    """
-                    SELECT EXISTS (
-                        SELECT 1 FROM annotation_revisions
-                        WHERE sample_id = $1 AND annotation_revision_id = $2 AND stage = 'caption'
-                    )
-                    """,
-                    sample_id,
-                    caption_revision,
-                )
-                if not exists:
-                    raise ReviewAssignmentNotFoundError("reviewed caption revision is missing")
-                prior = await connection.fetchrow(
-                    """
-                    SELECT adoption_id, dataset_version, target, sample_id,
-                           annotation_revision_id, crop_id, caption_revision_id
-                    FROM dataset_adoptions
-                    WHERE dataset_version = $1 AND target = 'clip' AND crop_id = $2
-                    """,
-                    dataset_version,
-                    crop_id,
-                )
-                if prior is not None:
-                    return _adoption_dict(prior)
-                record = await connection.fetchrow(
-                    """
-                    INSERT INTO dataset_adoptions (
-                        adoption_id, dataset_version, target, sample_id,
-                        annotation_revision_id, crop_id, caption_revision_id
-                    ) VALUES ($1, $2, 'clip', $3, $4, $5, $6)
-                    RETURNING adoption_id, dataset_version, target, sample_id,
-                              annotation_revision_id, crop_id, caption_revision_id
-                    """,
-                    uuid4(),
-                    dataset_version,
-                    sample_id,
-                    bbox_revision,
-                    crop_id,
-                    caption_revision,
-                )
-                return _adoption_dict(record)
+        crop = await connection.fetchrow(
+            """
+            SELECT bbox_revision, state, caption_state, caption_revision_id, crop_set_ready
+            FROM annotation_crops WHERE sample_id = $1 AND crop_id = $2 FOR UPDATE
+            """,
+            sample_id,
+            crop_id,
+        )
+        if (
+            crop is None
+            or crop["bbox_revision"] != bbox_revision
+            or crop["state"] != "ready"
+            or not crop["crop_set_ready"]
+            or crop["caption_state"] != "reviewed"
+            or crop["caption_revision_id"] != caption_revision
+        ):
+            raise ReviewAssignmentConflictError(
+                "CLIP adoption requires the exact reviewed crop revision"
+            )
+        exists = await connection.fetchval(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM annotation_revisions
+                WHERE sample_id = $1 AND annotation_revision_id = $2 AND stage = 'caption'
+            )
+            """,
+            sample_id,
+            caption_revision,
+        )
+        if not exists:
+            raise ReviewAssignmentNotFoundError("reviewed caption revision is missing")
+        prior = await connection.fetchrow(
+            """
+            SELECT adoption_id, dataset_version, target, sample_id,
+                   annotation_revision_id, crop_id, caption_revision_id
+            FROM dataset_adoptions
+            WHERE dataset_version = $1 AND target = 'clip' AND crop_id = $2
+            """,
+            dataset_version,
+            crop_id,
+        )
+        if prior is not None:
+            return _adoption_dict(prior)
+        record = await connection.fetchrow(
+            """
+            INSERT INTO dataset_adoptions (
+                adoption_id, dataset_version, target, sample_id,
+                annotation_revision_id, crop_id, caption_revision_id
+            ) VALUES ($1, $2, 'clip', $3, $4, $5, $6)
+            RETURNING adoption_id, dataset_version, target, sample_id,
+                      annotation_revision_id, crop_id, caption_revision_id
+            """,
+            uuid4(),
+            dataset_version,
+            sample_id,
+            bbox_revision,
+            crop_id,
+            caption_revision,
+        )
+        return _adoption_dict(record)
 
     async def record_relevance_judgments(
         self,

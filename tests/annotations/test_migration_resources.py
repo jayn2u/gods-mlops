@@ -19,5 +19,6 @@ def test_all_schema_migrations_are_packaged_as_stable_resources() -> None:
         "0008_label_studio_media_state.sql",
         "0009_crop_expiry_reconciliation.sql",
         "0010_relevance_review_dependencies.sql",
+        "0011_immutable_datasets.sql",
     ]
     assert all(migrations.joinpath(name).read_text(encoding="utf-8").strip() for name in names)
