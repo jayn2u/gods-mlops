@@ -145,7 +145,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
     result_uri = None
     commit_artifact = config.get("_commit_result_artifact")
     if callable(commit_artifact):
-        result_uri = commit_artifact("caption_drafts", encoded).uri
+        result_uri = commit_artifact("caption_drafts", encoded, measurements).uri
         encoded = b""
     return {
         "status": "succeeded",
@@ -162,18 +162,18 @@ def _caption_items(manifest: dict[str, Any], config: dict[str, Any]) -> list[dic
     items = manifest.get("items")
     if not isinstance(items, list) or not items:
         raise ValueError("Qwen caption input must be a typed non-empty crop batch")
-    selected = []
-    for item in items:
-        if item.get("item_kind") == "crop":
-            selected.append(item)
-        elif item.get("kind") == "crop" and item.get("split") == "train":
-            selected.append(item)
+    if any(
+        not isinstance(item, dict)
+        or not (item.get("item_kind") == "crop" or (item.get("kind") == "crop" and item.get("split") == "train"))
+        for item in items
+    ):
+        raise ValueError("Qwen caption input must contain only eligible crop items")
+    selected = list(items)
     limit = int(config.get("max_draft_images", 1))
     if limit < 1:
         raise ValueError("max_draft_images must be positive")
-    selected = selected[:limit]
-    if not selected:
-        raise ValueError("Qwen caption input contains no eligible crop")
+    if len(selected) > limit:
+        raise ValueError("Qwen caption batch exceeds its versioned max_draft_images bound")
     return selected
 
 

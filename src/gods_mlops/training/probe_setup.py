@@ -18,26 +18,42 @@ _PROFILE_VERSIONS = {
     "clip": "task8-clip-224-microbatch2-explicit-negative-probe-v1",
     "qwen": "task8-qwen-bounded-crop-caption-probe-v1",
 }
+_DETR_PREPARATION_PROFILE_VERSION = "task8-detr-640-frame-drafts-preparation-probe-v1"
 _A6000_CANDIDATE_MEMORY_MIB = 36_000
 _PROBE_ARTIFACT_RESERVATION_BYTES = 8 * 1024**3
 
 
-def candidate_profile(model_kind: str) -> ExecutionProfile:
+def candidate_profile(model_kind: str, *, target_phase: str | None = None) -> ExecutionProfile:
     """Return the exact unmeasured probe config; it never allowlists itself."""
     model = locked_model(model_kind)
+    requested_target = target_phase or ("preparation" if model_kind == "qwen" else "training")
     if model_kind == "detr":
-        target_phase = "training"
-        config = {
-            "model_id": model.model_id,
-            "model_revision": model.revision,
-            "input_size": 640,
-            "micro_batch": 1,
-            "optimizer_steps": 3,
-            "learning_rate": 1e-5,
-            "weight_decay": 1e-4,
-        }
+        if requested_target == "training":
+            config = {
+                "model_id": model.model_id,
+                "model_revision": model.revision,
+                "input_size": 640,
+                "micro_batch": 1,
+                "optimizer_steps": 3,
+                "learning_rate": 1e-5,
+                "weight_decay": 1e-4,
+            }
+            version = _PROFILE_VERSIONS[model_kind]
+        elif requested_target == "preparation":
+            config = {
+                "model_id": model.model_id,
+                "model_revision": model.revision,
+                "input_size": 640,
+                "micro_batch": 1,
+                "score_threshold": 0.3,
+                "max_draft_frames": 1,
+            }
+            version = _DETR_PREPARATION_PROFILE_VERSION
+        else:
+            raise ValueError("DETR readiness target must be training or preparation")
     elif model_kind == "clip":
-        target_phase = "training"
+        if requested_target != "training":
+            raise ValueError("CLIP readiness probe target must be training")
         config = {
             "model_id": model.model_id,
             "model_revision": model.revision,
@@ -49,8 +65,10 @@ def candidate_profile(model_kind: str) -> ExecutionProfile:
             "learning_rate": 1e-5,
             "weight_decay": 1e-4,
         }
+        version = _PROFILE_VERSIONS[model_kind]
     elif model_kind == "qwen":
-        target_phase = "preparation"
+        if requested_target != "preparation":
+            raise ValueError("Qwen readiness probe target must be preparation")
         config = {
             "model_id": model.model_id,
             "model_revision": model.revision,
@@ -59,13 +77,14 @@ def candidate_profile(model_kind: str) -> ExecutionProfile:
             "max_image_pixels": 1_048_576,
             "max_draft_images": 1,
         }
+        version = _PROFILE_VERSIONS[model_kind]
     else:
         raise ValueError("candidate probe model must be detr, clip, or qwen")
     return ExecutionProfile(
         model_kind=model_kind,
-        config_version=_PROFILE_VERSIONS[model_kind],
+        config_version=version,
         phase="probe",
-        target_phase=target_phase,
+        target_phase=requested_target,
         memory_requirement_mib=_A6000_CANDIDATE_MEMORY_MIB,
         artifact_reservation_bytes=_PROBE_ARTIFACT_RESERVATION_BYTES,
         config=config,
@@ -73,10 +92,16 @@ def candidate_profile(model_kind: str) -> ExecutionProfile:
     )
 
 
-def create_probe_input(*, objects: Any, model_kind: str) -> ProbeInput:
+def create_probe_input(
+    *, objects: Any, model_kind: str, target_phase: str | None = None
+) -> ProbeInput:
     """Store tiny deterministic synthetic media and a typed immutable S3 manifest."""
-    profile = candidate_profile(model_kind)
-    probe_input_id = f"task8-{model_kind}-synthetic-probe-v1"
+    profile = candidate_profile(model_kind, target_phase=target_phase)
+    probe_input_id = (
+        "task8-detr-preparation-synthetic-probe-v1"
+        if model_kind == "detr" and profile.target_phase == "preparation"
+        else f"task8-{model_kind}-synthetic-probe-v1"
+    )
     media = _probe_media(model_kind)
     item_objects = []
     for label, image_bytes in media.items():

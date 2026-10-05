@@ -9,12 +9,63 @@ from uuid import uuid4
 import asyncpg
 import pytest
 
-from gods_mlops.jobs.models import AnnotationSourceSelection, ExecutionProfile
+from gods_mlops.jobs.models import (
+    AnnotationPreparationBatch,
+    AnnotationSourceSelection,
+    ExecutionProfile,
+    ImmutableAnnotationItem,
+)
 from gods_mlops.jobs.queue import JobQueue, PostgresJobQueueRepository
 from gods_mlops.jobs.sources import DatasetSourceRegistry, DatasetSourceUnavailableError
 
 
-def test_gpu_preparation_uses_verified_frame_and_crop_refs_without_a_published_dataset(
+def test_qwen_preparation_rejects_over_limit_batch_before_queue_admission() -> None:
+    class Sources:
+        async def verify_annotation_batch(self, batch):
+            return None
+
+    class Repository:
+        enqueued = False
+
+        async def get_profile(self, *, phase, model_kind, config_version):
+            assert (phase, model_kind, config_version) == ("preparation", "qwen", "qwen-small-batch-v1")
+            return {"profile_state": "measured", "config_json": {"max_draft_images": 1}}
+
+        async def enqueue(self, **kwargs):
+            self.enqueued = True
+            raise AssertionError("an over-limit Qwen batch must not reach admission")
+
+    batch = AnnotationPreparationBatch(
+        batch_id="annotation-batch-qwen-over-limit",
+        input_sha256="a" * 64,
+        items=tuple(
+            ImmutableAnnotationItem(
+                item_kind="crop",
+                item_id=str(uuid4()),
+                sample_id=str(uuid4()),
+                sha256=hashlib.sha256(str(index).encode()).hexdigest(),
+                object_key=f"crops/{index}.jpg",
+                object_size_bytes=64,
+                revision_id=str(uuid4()),
+            )
+            for index in range(2)
+        ),
+    )
+    repository = Repository()
+    queue = JobQueue(repository=repository, sources=Sources())
+
+    with pytest.raises(ValueError, match="exceeds its versioned max_draft_images bound"):
+        asyncio.run(
+            queue.submit_preparation(
+                batch=batch,
+                model_kind="qwen",
+                config_version="qwen-small-batch-v1",
+            )
+        )
+    assert repository.enqueued is False
+
+
+def test_qwen_preparation_uses_verified_crop_refs_without_a_published_dataset(
     task7_database_url: str,
 ) -> None:
     async def exercise() -> None:
@@ -94,10 +145,7 @@ def test_gpu_preparation_uses_verified_frame_and_crop_refs_without_a_published_d
 
         sources = DatasetSourceRegistry(database_url=task7_database_url)
         batch = await sources.prepare_annotation_batch(
-            [
-                AnnotationSourceSelection("frame", str(sample_id), frame_sha),
-                AnnotationSourceSelection("crop", str(crop_id), crop_sha, str(bbox_revision)),
-            ]
+            [AnnotationSourceSelection("crop", str(crop_id), crop_sha, str(bbox_revision))]
         )
         queue = JobQueue(repository=repository, sources=sources)
         await queue.register_profile(
@@ -107,10 +155,18 @@ def test_gpu_preparation_uses_verified_frame_and_crop_refs_without_a_published_d
                 phase="preparation",
                 memory_requirement_mib=16_384,
                 artifact_reservation_bytes=32 * 1024**2,
-                config={"input_tokens": 4096, "output_tokens": 128},
+                config={"input_tokens": 4096, "output_tokens": 128, "max_draft_images": 1},
                 candidate=True,
             )
         )
+        async with repository._pool.acquire() as connection:
+            await connection.execute(
+                """UPDATE gods_mlops_resource_profiles
+                   SET profile_state='measured',measurement_id=$2::uuid
+                   WHERE phase='preparation' AND model_kind='qwen' AND config_version=$1""",
+                "caption-preparation-v1",
+                uuid4(),
+            )
         first = await queue.submit_preparation(
             batch=batch,
             model_kind="qwen",
@@ -135,7 +191,7 @@ def test_gpu_preparation_uses_verified_frame_and_crop_refs_without_a_published_d
         assert job["dataset_version"] is None
         assert job["input_id"] == batch.batch_id
         assert job["input_sha256"] == batch.input_sha256
-        assert {item["item_kind"] for item in job["source_refs"]["items"]} == {"frame", "crop"}
+        assert {item["item_kind"] for item in job["source_refs"]["items"]} == {"crop"}
         assert await connection_closed_dataset_count(task7_database_url) == 0
         await queue.close()
         await repository.close()

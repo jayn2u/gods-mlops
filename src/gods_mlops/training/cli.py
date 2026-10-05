@@ -29,6 +29,7 @@ def main(argv: list[str] | None = None) -> int:
         "run-probe", help="measure one locked model on Ubuntu through Task 7 and strict-SSH Docker"
     )
     probe.add_argument("--model-kind", choices=("detr", "clip", "qwen"), required=True)
+    probe.add_argument("--target-phase", choices=("training", "preparation"))
     probe.add_argument("--worker-image", required=True, help="source-matched image already loaded on Ubuntu")
     probe.add_argument("--worker-image-id", required=True, help="exact immutable Docker image ID from Ubuntu")
     probe.add_argument(
@@ -134,6 +135,7 @@ async def _run_probe(args: argparse.Namespace) -> int:
 
     await run_docker_model_probe(
         model_kind=args.model_kind,
+        target_phase=args.target_phase,
         worker_image=args.worker_image,
         expected_image_id=args.worker_image_id,
         model_cache_root=args.model_cache_root,

@@ -81,12 +81,15 @@ def validate_worker_claim(
     job: dict[str, Any],
     lease: dict[str, Any],
     profile: dict[str, Any] | None,
+    allowed_job_states: frozenset[str] = frozenset({"running"}),
 ) -> None:
     """Fail closed unless the latest durable job, profile, and fence exactly match."""
     if profile is None:
         raise WorkerAuthorizationError("worker resource profile is unavailable")
-    if job.get("state") != "running":
-        raise WorkerAuthorizationError("worker job is not currently running")
+    if job.get("state") not in allowed_job_states:
+        if allowed_job_states == frozenset({"running"}):
+            raise WorkerAuthorizationError("worker job is not currently running")
+        raise WorkerAuthorizationError("worker job is not in an authorized ownership state")
     if lease.get("job_id") != claim.job_id or job.get("job_id") != claim.job_id:
         raise WorkerAuthorizationError("worker job identity does not match its active lease")
     if str(job.get("lease_token")) != claim.lease_token or str(lease.get("lease_token")) != claim.lease_token:

@@ -55,10 +55,18 @@ async def run_worker() -> int:
         if profile is None:
             raise WorkerAuthorizationError("worker profile disappeared before model execution")
 
-        model = __import__("gods_mlops.training.contracts", fromlist=["locked_model"]).locked_model(
-            claim.model_kind
+        contracts = __import__(
+            "gods_mlops.training.contracts", fromlist=["locked_model", "validate_model_revision"]
         )
-        config = dict(profile["config_json"])
+        profile_config = dict(profile["config_json"])
+        try:
+            contracts.validate_model_revision({**profile_config, "model_kind": claim.model_kind})
+        except ValueError as error:
+            raise WorkerAuthorizationError(
+                "worker profile model ID or revision differs from the immutable lock"
+            ) from error
+        model = contracts.locked_model(claim.model_kind)
+        config = {**profile_config, "model_kind": claim.model_kind}
         config.update(
             {
                 "job_id": claim.job_id,
@@ -69,8 +77,6 @@ async def run_worker() -> int:
                 "input_sha256": claim.input_sha256,
                 "dataset_version": claim.dataset_version,
                 "model_kind": claim.model_kind,
-                "model_id": model.model_id,
-                "model_revision": model.revision,
                 "config_version": claim.config_version,
                 "config_sha256": claim.config_sha256,
                 "image_id": claim.image_id,
@@ -89,10 +95,7 @@ async def run_worker() -> int:
         event_loop = asyncio.get_running_loop()
 
         async def still_current() -> bool:
-            current = await queue.get(job_id)
-            return current.get("state") == "running" and await repository.lease_is_current(
-                job_id, lease_token
-            )
+            return await _worker_claim_at_safe_boundary(queue, claim, object_store=objects)
 
         def from_runner(coroutine):
             future = asyncio.run_coroutine_threadsafe(coroutine, event_loop)
@@ -116,7 +119,7 @@ async def run_worker() -> int:
                 )
             )
 
-        def commit_result(kind: str, payload: bytes):
+        def commit_result(kind: str, payload: bytes, runtime_measurements=None):
             return from_runner(
                 queue.save_result_artifact(
                     store=result_store,
@@ -125,6 +128,7 @@ async def run_worker() -> int:
                     identity=identity,
                     kind=kind,
                     payload=payload,
+                    runtime_measurements=runtime_measurements,
                 )
             )
 
@@ -133,6 +137,21 @@ async def run_worker() -> int:
         config["_commit_result_artifact"] = commit_result
         if not await still_current():
             raise WorkerAuthorizationError("worker lease was revoked before CUDA startup")
+
+        recovered_exit = await _recover_committed_result(
+            job=job,
+            queue=queue,
+            claim=claim,
+            identity=identity,
+            objects=objects,
+            checkpoint_store=checkpoint_store,
+            result_store=result_store,
+            model=model,
+            contracts=contracts,
+            config=config,
+        )
+        if recovered_exit is not None:
+            return recovered_exit
 
         with tempfile.TemporaryDirectory(prefix="gods-mlops-worker-") as stage_directory:
             stage_root = Path(stage_directory)
@@ -151,6 +170,7 @@ async def run_worker() -> int:
                     lambda: _runner_for(claim.phase, claim.model_kind, claim.target_phase)(
                         config, manifest_uri, str(output_root)
                     ),
+                    revalidate=still_current,
                 )
             except WorkerYieldRequested:
                 return 0
@@ -188,6 +208,7 @@ async def run_worker() -> int:
                 identity=identity,
                 kind=str(result["result_artifact_kind"]),
                 payload=result_payload,
+                runtime_measurements=result.get("resource_measurements"),
             )
             result["result_uri"] = artifact.uri
 
@@ -279,11 +300,121 @@ async def _worker_manifest(
     raise WorkerAuthorizationError("worker phase is unsupported")
 
 
+async def _recover_committed_result(
+    *,
+    job: dict[str, Any],
+    queue: JobQueue,
+    claim: WorkerClaim,
+    identity,
+    objects: Any,
+    checkpoint_store: S3CheckpointStore,
+    result_store: S3ResultArtifactStore,
+    model,
+    contracts,
+    config: dict[str, Any],
+) -> int | None:
+    """Finish a fenced retry from a verified result without importing or invoking a model runner."""
+    artifacts = await queue.repository.result_artifacts_for(claim.job_id)
+    if not artifacts:
+        return None
+    if len(artifacts) != 1:
+        raise WorkerAuthorizationError("committed result recovery requires exactly one immutable artifact")
+    expected_kind = _expected_result_kind(claim)
+    details = artifacts[0]
+    if details.get("kind") != expected_kind:
+        raise WorkerAuthorizationError("committed result kind differs from the immutable job phase")
+    try:
+        verified = result_store.verify_committed(details, expected_identity=identity)
+    except Exception as error:
+        raise WorkerAuthorizationError("committed result bytes or identity failed recovery verification") from error
+
+    measurements = details.get("runtime_measurements")
+    if not isinstance(measurements, dict):
+        raise WorkerAuthorizationError("committed result has no durable runner measurements for recovery")
+    if (
+        measurements.get("model_id") != model.model_id
+        or measurements.get("model_revision") != model.revision
+    ):
+        raise WorkerAuthorizationError("committed result measurements differ from the immutable model lock")
+
+    checkpoint_sha256 = None
+    if claim.phase == "training" or (claim.phase == "probe" and claim.target_phase == "training"):
+        checkpoint = await queue.load_checkpoint(store=checkpoint_store, job_id=claim.job_id)
+        if checkpoint is None:
+            raise WorkerAuthorizationError("committed result has no verified matching checkpoint for recovery")
+        checkpoint_sha256 = checkpoint.sha256
+
+    # Re-verify the exact frozen input bytes before using a prior result to complete this fence.
+    with tempfile.TemporaryDirectory(prefix="gods-mlops-recovery-") as stage_directory:
+        manifest_root = Path(stage_directory) / "manifest"
+        manifest_root.mkdir(mode=0o700)
+        manifest_uri, extra = await _worker_manifest(job, queue, objects, root=manifest_root)
+        config.update(extra)
+        manifest = contracts.load_manifest(manifest_uri, config=config)
+        contracts.validate_manifest_identity(config, manifest)
+    await validate_current_worker_claim(queue, claim, object_store=objects)
+
+    if claim.phase == "probe":
+        verification = _probe_verification(
+            claim,
+            {"hash": verified.sha256},
+            measurements,
+            checkpoint_sha256,
+        )
+        measured = await queue.record_probe_measurement(
+            job_id=claim.job_id,
+            lease_token=claim.lease_token,
+            exit_code=0,
+            peak_allocated_mib=_optional_int(measurements.get("peak_vram_allocated_mib")),
+            peak_reserved_mib=_optional_int(measurements.get("peak_vram_reserved_mib")),
+            optimizer_steps=int(measurements.get("optimizer_steps", 0)),
+            checkpoint_resumed=measurements.get("checkpoint_resumed") is True,
+            checkpoint_sha256=checkpoint_sha256,
+            inference_steps=int(measurements.get("inference_steps", 0)),
+            verification_details=verification,
+        )
+        return 0 if measured.get("result_state") == "succeeded" else 1
+
+    if claim.phase == "training":
+        publisher = DatasetPublisher.from_environment()
+        try:
+            await publisher.register_model_lineage(
+                model_id=verified.uri,
+                dataset_version=str(claim.dataset_version),
+            )
+        finally:
+            await publisher.close()
+    await queue.complete_owned_job(
+        job_id=claim.job_id,
+        lease_token=claim.lease_token,
+        identity=identity,
+        details={
+            "result_uri": verified.uri,
+            "result_sha256": verified.sha256,
+            "model_id": model.model_id,
+            "model_revision": model.revision,
+            "resource_measurements": measurements,
+        },
+    )
+    return 0
+
+
+def _expected_result_kind(claim: WorkerClaim) -> str:
+    if claim.phase == "training" or (claim.phase == "probe" and claim.target_phase == "training"):
+        return "model"
+    if claim.model_kind == "detr" and claim.target_phase == "preparation":
+        return "drafts"
+    if claim.model_kind == "qwen" and claim.target_phase == "preparation":
+        return "caption_drafts"
+    raise WorkerAuthorizationError("model phase has no committed result recovery contract")
+
+
 async def _run_after_owner_binding(
     repository: PostgresJobQueueRepository,
     claim: WorkerClaim,
     runner,
     *,
+    revalidate=None,
     timeout_seconds: int = 60,
     poll_interval_seconds: float = 1.0,
     sleep=asyncio.sleep,
@@ -314,9 +445,24 @@ async def _run_after_owner_binding(
         if all(value is not None for value in owner):
             if int(owner[0]) <= 0 or int(owner[1]) <= 0 or int(owner[2]) != 10001:
                 raise WorkerAuthorizationError("bound host PID/start/UID differs from the training worker")
+            if revalidate is not None and not await revalidate():
+                raise WorkerYieldRequested("worker claim changed while awaiting host PID binding")
             return await asyncio.to_thread(runner)
         await sleep(poll_interval_seconds)
     raise WorkerAuthorizationError("worker timed out waiting for its exact host PID/start/UID binding")
+
+
+async def _worker_claim_at_safe_boundary(queue, claim: WorkerClaim, *, object_store: Any = None) -> bool:
+    """Recheck the mutable Task 6 source before continuing past a safe runner boundary."""
+    job = await queue.get(claim.job_id)
+    if job.get("state") == "yield_requested":
+        return False
+    if job.get("state") != "running":
+        return False
+    if not await queue.repository.lease_is_current(claim.job_id, claim.lease_token):
+        return False
+    await validate_current_worker_claim(queue, claim, object_store=object_store)
+    return True
 
 
 def _runner_for(phase: str, model_kind: str, target_phase: str):

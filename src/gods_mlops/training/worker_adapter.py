@@ -25,6 +25,30 @@ def build_gpu_worker_job(
     checkpoint_claim: str = "gods-mlops-artifacts",
 ) -> dict[str, Any]:
     """Build one deterministic Ubuntu/A6000 worker Job for an already admitted lease."""
+    return _build_gpu_worker_job(
+        job=job,
+        lease=lease,
+        profile=profile,
+        namespace=namespace,
+        image=image,
+        model_cache_claim=model_cache_claim,
+        checkpoint_claim=checkpoint_claim,
+        allowed_job_states=frozenset({"running"}),
+    )
+
+
+def _build_gpu_worker_job(
+    *,
+    job: dict[str, Any],
+    lease: dict[str, Any],
+    profile: dict[str, Any],
+    namespace: str,
+    image: str,
+    model_cache_claim: str,
+    checkpoint_claim: str,
+    allowed_job_states: frozenset[str],
+) -> dict[str, Any]:
+    """Render the immutable worker contract for creation or read-only recovery."""
     if not re.fullmatch(r"[a-z0-9](?:[-a-z0-9.]{0,61}[a-z0-9])?", namespace):
         raise ValueError("worker namespace is invalid")
     if not _IMAGE_REF.fullmatch(image):
@@ -32,7 +56,13 @@ def build_gpu_worker_job(
     digest = image.rsplit("@", 1)[1]
     image_id = digest
     claim = WorkerClaim.from_admitted_job(job, lease, image_id=image_id)
-    validate_worker_claim(claim, job=job, lease=lease, profile=profile)
+    validate_worker_claim(
+        claim,
+        job=job,
+        lease=lease,
+        profile=profile,
+        allowed_job_states=allowed_job_states,
+    )
     if not re.fullmatch(r"[a-z0-9](?:[-a-z0-9.]{0,61}[a-z0-9])?", model_cache_claim):
         raise ValueError("model cache claim name is invalid")
     if not re.fullmatch(r"[a-z0-9](?:[-a-z0-9.]{0,61}[a-z0-9])?", checkpoint_claim):
@@ -79,7 +109,7 @@ def build_gpu_worker_job(
         {"name": "GODS_MLOPS_CONFIG_SHA256", "value": claim.config_sha256},
         {"name": "GODS_MLOPS_IMAGE_ID", "value": claim.image_id},
         {"name": "GODS_MLOPS_NODE_NAME", "valueFrom": {"fieldRef": {"fieldPath": "spec.nodeName"}}},
-        {"name": "GODS_MLOPS_MODEL_LOCK", "value": "/opt/gods-mlops/models/lock.json"},
+        {"name": "GODS_MLOPS_MODEL_LOCK", "value": "/app/models/lock.json"},
         {"name": "GODS_MLOPS_MODEL_CACHE_ROOT", "value": "/mnt/model-cache"},
         {"name": "GODS_MLOPS_CHECKPOINT_ROOT", "value": "/mnt/gods-objects/checkpoints"},
     ]
@@ -160,18 +190,55 @@ class KubernetesOwnedWorkerAdapter:
             if getattr(error, "status", None) != 409:
                 raise
             existing = self._batch_api.read_namespaced_job(name=name, namespace=self._namespace)
-            existing_dict = _to_plain_dict(existing)
-            expected_meta = body["metadata"]
-            actual_meta = existing_dict.get("metadata", {})
-            if (
-                actual_meta.get("name") != name
-                or actual_meta.get("namespace") != self._namespace
-                or actual_meta.get("labels") != expected_meta["labels"]
-                or actual_meta.get("annotations") != expected_meta["annotations"]
-                or not _same_worker_pod_contract(existing_dict, body)
-            ):
-                raise WorkerAuthorizationError("existing Kubernetes Job is not this job/fence/input/config") from error
+            self._validate_existing_worker(existing, body, cause=error)
             return existing
+
+    def read_existing_worker(
+        self,
+        *,
+        job: dict[str, Any],
+        lease: dict[str, Any],
+        profile: dict[str, Any],
+    ) -> Any | None:
+        """Read the exact owned worker for a retained non-running lease, never creating one."""
+        allowed_states = frozenset({"yield_requested", "completed", "failed", "cancelled"})
+        if job.get("state") not in allowed_states:
+            raise WorkerAuthorizationError("only a retained yielding or terminal job can reuse a worker")
+        body = _build_gpu_worker_job(
+            job=job,
+            lease=lease,
+            profile=profile,
+            namespace=self._namespace,
+            image=self._image,
+            model_cache_claim="gods-mlops-model-cache",
+            checkpoint_claim="gods-mlops-artifacts",
+            allowed_job_states=allowed_states,
+        )
+        name = body["metadata"]["name"]
+        try:
+            existing = self._batch_api.read_namespaced_job(name=name, namespace=self._namespace)
+        except Exception as error:  # a missing old worker is not permission to launch a replacement
+            if getattr(error, "status", None) == 404:
+                return None
+            raise
+        self._validate_existing_worker(existing, body)
+        return existing
+
+    def _validate_existing_worker(self, existing: Any, body: dict[str, Any], *, cause=None) -> None:
+        existing_dict = _to_plain_dict(existing)
+        expected_meta = body["metadata"]
+        actual_meta = existing_dict.get("metadata", {})
+        if (
+            actual_meta.get("name") != expected_meta["name"]
+            or actual_meta.get("namespace") != self._namespace
+            or actual_meta.get("labels") != expected_meta["labels"]
+            or actual_meta.get("annotations") != expected_meta["annotations"]
+            or not _same_worker_pod_contract(existing_dict, body)
+        ):
+            error = WorkerAuthorizationError("existing Kubernetes Job is not this job/fence/input/config")
+            if cause is not None:
+                raise error from cause
+            raise error
 
 
 def resolve_owned_gpu_process(

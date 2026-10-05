@@ -16,12 +16,19 @@ from gods_mlops.jobs.checkpoints import CheckpointIdentity, CheckpointIntegrityE
 @dataclass(frozen=True, slots=True)
 class PreparedS3Checkpoint:
     identity: CheckpointIdentity
+    bucket: str
     object_key: str
     sha256: str
     size_bytes: int
     created_at: datetime
     payload: bytes
     previous_uri: str | None
+    previous_sha256: str | None
+    previous_size_bytes: int | None
+
+    @property
+    def uri(self) -> str:
+        return f"s3://{self.bucket}/{self.object_key}"
 
     @property
     def metadata_size_bytes(self) -> int:
@@ -47,6 +54,8 @@ class S3CheckpointStore:
         reservation_bytes: int,
         replacement_reservation_bytes: int | None = None,
         previous_uri: str | None = None,
+        previous_sha256: str | None = None,
+        previous_size_bytes: int | None = None,
     ) -> PreparedS3Checkpoint:
         if not isinstance(payload, bytes) or not payload:
             raise ValueError("checkpoint payload must contain bytes")
@@ -59,12 +68,15 @@ class S3CheckpointStore:
         key = f"{self._prefix}/{identity.job_id}/checkpoints/{identity_sha}/{digest}.checkpoint"
         return PreparedS3Checkpoint(
             identity=identity,
+            bucket=self._bucket,
             object_key=key,
             sha256=digest,
             size_bytes=len(payload),
             created_at=datetime.now(UTC),
             payload=payload,
             previous_uri=previous_uri,
+            previous_sha256=previous_sha256,
+            previous_size_bytes=previous_size_bytes,
         )
 
     def commit(self, prepared: PreparedS3Checkpoint) -> VerifiedCheckpoint:
@@ -124,14 +136,42 @@ class S3CheckpointStore:
         )
 
     def prune_previous(self, prepared: PreparedS3Checkpoint) -> None:
-        if not prepared.previous_uri:
+        if not prepared.previous_uri or prepared.previous_uri == prepared.uri:
             return
-        bucket, key = _parse_uri(prepared.previous_uri)
-        allowed_prefix = f"{self._prefix}/{prepared.identity.job_id}/checkpoints/"
+        if prepared.previous_sha256 is None or prepared.previous_size_bytes is None:
+            raise CheckpointIntegrityError("previous checkpoint deletion has no verified size and SHA-256")
+        self.prune_uri(
+            prepared.previous_uri,
+            sha256_digest=prepared.previous_sha256,
+            size_bytes=prepared.previous_size_bytes,
+            job_id=prepared.identity.job_id,
+        )
+
+    def prune_uri(self, uri: str, *, sha256_digest: str, size_bytes: int, job_id: str) -> None:
+        bucket, key = _parse_uri(uri)
+        allowed_prefix = f"{self._prefix}/{job_id}/checkpoints/"
         if bucket != self._bucket or not key.startswith(allowed_prefix):
             raise CheckpointIntegrityError("previous checkpoint URI is outside the immutable job prefix")
-        if key != prepared.object_key:
-            self._objects.delete_object(object_key=key)
+        if not re.fullmatch(r"[0-9a-f]{64}", sha256_digest) or size_bytes <= 0:
+            raise CheckpointIntegrityError("previous checkpoint deletion identity is invalid")
+        if not key.endswith(f"/{sha256_digest}.checkpoint"):
+            raise CheckpointIntegrityError("previous checkpoint key does not match its content identity")
+        try:
+            self._objects.read_source(
+                object_key=key,
+                sha256_digest=sha256_digest,
+                size_bytes=size_bytes,
+            )
+        except FileNotFoundError:
+            return
+        self._objects.delete_object(object_key=key)
+        try:
+            self._objects.read_source(
+                object_key=key, sha256_digest=sha256_digest, size_bytes=size_bytes
+            )
+        except FileNotFoundError:
+            return
+        raise CheckpointIntegrityError("previous checkpoint still exists after deletion")
 
 
 def _parse_uri(uri: str) -> tuple[str, str]:

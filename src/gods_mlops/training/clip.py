@@ -115,10 +115,11 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             device=device,
             scaler=scaler,
         )
-    images = [pair["image"] for pair in pairs]
-    texts = [pair["text"] for pair in pairs]
-    encoded = processor(text=texts, images=images, return_tensors="pt", padding=True)
-    encoded = {key: value.to(device) for key, value in encoded.items()}
+    probe_encoded = (
+        _encode_contrastive_batch(pairs, processor=processor, device=device)
+        if config.get("phase") == "probe"
+        else None
+    )
     losses = []
     steps_done = start_step
     for _ in range(steps):
@@ -130,6 +131,19 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
                 scaler=scaler,
                 optimizer_steps=steps_done,
                 model_revision=model_lock.revision,
+            )
+        if config.get("phase") == "probe":
+            encoded = probe_encoded
+        else:
+            batch = _contrastive_batch(pairs, micro_batch=micro_batch, optimizer_step=steps_done)
+            validate_contrastive_pairs(
+                {
+                    "contrastive_config_version": config.get("contrastive_config_version"),
+                    "pairs": batch,
+                }
+            )
+            encoded = _encode_contrastive_batch(
+                batch, processor=processor, device=device, object_store=object_store
             )
         from .runner_support import step_optimizer
 
@@ -202,7 +216,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             step_optimizer(
                 model,
                 optimizer_instance,
-                encoded,
+                probe_encoded,
                 scaler=scaler,
                 model_kwargs={"return_loss": True},
                 max_grad_norm=float(config.get("max_grad_norm", 1.0)),
@@ -237,6 +251,8 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             "gradient_accumulation_steps": 1,
             "contrastive_config_version": config["contrastive_config_version"],
             "pair_count": pair_count,
+            "training_examples_consumed": max(0, total_steps - start_step) * micro_batch,
+            "next_batch_offset": (total_steps * micro_batch) % pair_count,
             "initial_optimizer_steps": initial_probe_steps,
             "resume_steps": resume_steps,
             "checkpoint_resumed": resumed,
@@ -262,7 +278,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         checkpoint_payload = b""
     commit_result = config.get("_commit_result_artifact")
     if callable(commit_result):
-        result_uri = commit_result("model", result_payload).uri
+        result_uri = commit_result("model", result_payload, measurements).uri
         result_payload = b""
     return {
         "status": "succeeded",
@@ -303,8 +319,9 @@ def _pairs_from_manifest(
                 unique.append((item, text))
                 seen_ids.add(item_id)
                 seen_texts.add(text)
-        selected = unique[:micro_batch]
-        positive_texts = [text for _item, text in selected]
+        if len(unique) < micro_batch:
+            raise ValueError("published CLIP input is smaller than its complete contrastive micro-batch")
+        positive_texts = [text for _item, text in unique]
         raw_pairs = [
             {
                 "image_id": str(item["item_id"]),
@@ -312,11 +329,11 @@ def _pairs_from_manifest(
                 "negative_texts": [other for other in positive_texts if other != text],
                 "media": item,
             }
-            for item, text in selected
+            for item, text in unique
         ]
     if not isinstance(raw_pairs, list):
         raise ValueError("CLIP manifest has no explicit pair list")
-    selected_pairs = raw_pairs[:micro_batch]
+    selected_pairs = raw_pairs[:micro_batch] if phase == "probe" else raw_pairs
     if len(selected_pairs) < micro_batch:
         raise ValueError("CLIP manifest does not contain the complete versioned contrastive micro-batch")
     media_items = [pair.get("media", pair) for pair in selected_pairs]
@@ -325,9 +342,37 @@ def _pairs_from_manifest(
         object_store = dataset_object_store_from_environment()
     pairs = []
     for pair, media in zip(selected_pairs, media_items, strict=True):
-        image = load_rgb_image(media, object_store=object_store)
-        pairs.append({**pair, "image": image})
+        if phase == "probe":
+            image = load_rgb_image(media, object_store=object_store)
+            pairs.append({**pair, "image": image})
+        else:
+            pairs.append({**pair, "media": media})
     return pairs, object_store
+
+
+def _contrastive_batch(
+    pairs: list[dict[str, Any]], *, micro_batch: int, optimizer_step: int
+) -> list[dict[str, Any]]:
+    """Select a deterministic cyclic micro-batch; optimizer step is the resume cursor."""
+    if micro_batch < 2 or optimizer_step < 0 or len(pairs) < micro_batch:
+        raise ValueError("CLIP batch cursor requires a complete positive micro-batch")
+    start = (optimizer_step * micro_batch) % len(pairs)
+    return [pairs[(start + offset) % len(pairs)] for offset in range(micro_batch)]
+
+
+def _encode_contrastive_batch(
+    pairs: list[dict[str, Any]], *, processor, device, object_store=None
+) -> dict[str, Any]:
+    images = [
+        pair["image"]
+        if "image" in pair
+        else load_rgb_image(pair["media"], object_store=object_store)
+        for pair in pairs
+    ]
+    encoded = processor(
+        text=[pair["text"] for pair in pairs], images=images, return_tensors="pt", padding=True
+    )
+    return {key: value.to(device) for key, value in encoded.items()}
 
 
 def _worker_should_continue(config: dict[str, Any]) -> bool:

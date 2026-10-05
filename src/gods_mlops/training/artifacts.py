@@ -105,6 +105,38 @@ class S3ResultArtifactStore:
             object_key=prepared.object_key,
         )
 
+    def verify_committed(self, details: dict[str, Any], *, expected_identity: Any) -> VerifiedResultArtifact:
+        """Read and verify one already committed S3 result without publishing new bytes."""
+        if not isinstance(details, dict) or details.get("identity") != expected_identity.as_dict():
+            raise ResultArtifactIntegrityError("committed result identity differs from the current job")
+        kind = details.get("kind")
+        digest = details.get("sha256")
+        size_bytes = details.get("size_bytes")
+        if not isinstance(kind, str) or not _KIND.fullmatch(kind):
+            raise ResultArtifactIntegrityError("committed result kind is invalid")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ResultArtifactIntegrityError("committed result SHA-256 is invalid")
+        if not isinstance(size_bytes, int) or size_bytes <= 0:
+            raise ResultArtifactIntegrityError("committed result size is invalid")
+        identity_hash = sha256(canonical_json(expected_identity.as_dict())).hexdigest()
+        object_key = f"{self._prefix}/{expected_identity.job_id}/results/{identity_hash}/{kind}-{digest}.artifact"
+        uri = f"s3://{self._bucket}/{object_key}"
+        if details.get("object_key") != object_key or details.get("uri") != uri:
+            raise ResultArtifactIntegrityError("committed result URI differs from its immutable job key")
+        self._objects.read_source(
+            object_key=object_key,
+            sha256_digest=digest,
+            size_bytes=size_bytes,
+        )
+        return VerifiedResultArtifact(
+            identity=expected_identity,
+            kind=kind,
+            sha256=digest,
+            size_bytes=size_bytes,
+            uri=uri,
+            object_key=object_key,
+        )
+
 
 class FileResultArtifactStore:
     """Local atomic adapter for bounded Task 8 probes and isolated unit tests."""

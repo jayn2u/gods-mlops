@@ -99,9 +99,10 @@ async def publish_preparation_handoffs(queue: JobQueue, job_id: str) -> list[dic
         raise PreparationReviewHandoffError(
             "preparation_assignment_source_mismatch", "draft item IDs do not match the exact frozen frame/crop refs"
         )
-    if model_kind == "detr" and set(draft_by_id) != set(by_id):
+    if set(draft_by_id) != set(by_id):
         raise PreparationReviewHandoffError(
-            "preparation_assignment_source_mismatch", "DETR draft output omitted one or more selected frames"
+            "preparation_assignment_source_mismatch",
+            "preparation draft output omitted one or more selected source items",
         )
 
     database_url = _required("GODS_MLOPS_DATABASE_URL")

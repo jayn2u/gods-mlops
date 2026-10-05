@@ -100,6 +100,62 @@ def test_training_worker_requires_a_measured_profile_and_exact_config_identity()
         validate_claim(claim, job=training_job, lease=training_lease, profile={**measured_profile, "profile_state": "candidate"})
 
 
+def test_published_clip_batches_cover_examples_and_resume_from_optimizer_cursor() -> None:
+    pairs_from_manifest = _require("gods_mlops.training.clip", "_pairs_from_manifest")
+    batch_for_step = _require("gods_mlops.training.clip", "_contrastive_batch")
+    validate_pairs = _require("gods_mlops.training.clip", "validate_contrastive_pairs")
+    items = [
+        {
+            "kind": "crop",
+            "split": "train",
+            "item_id": f"crop-{index}",
+            "image_path": f"/unused/{index}.jpg",
+            "snapshot": {"caption": {"text": f"distinct person description {index}"}},
+        }
+        for index in range(5)
+    ]
+    pairs, object_store = pairs_from_manifest(
+        {"items": items}, {"phase": "training", "micro_batch": 2}, 2
+    )
+
+    assert object_store is None
+    assert len(pairs) == 5
+    batches = [batch_for_step(pairs, micro_batch=2, optimizer_step=step) for step in range(3)]
+    consumed = {pair["image_id"] for batch in batches for pair in batch}
+    assert consumed == {item["item_id"] for item in items}
+    assert all(validate_pairs({"contrastive_config_version": "test-v1", "pairs": batch}) == 2 for batch in batches)
+    assert [pair["image_id"] for pair in batch_for_step(pairs, micro_batch=2, optimizer_step=3)] == [
+        "crop-1",
+        "crop-2",
+    ]
+    assert batches[0] != batch_for_step(pairs, micro_batch=2, optimizer_step=3)
+
+
+def test_qwen_caption_batch_is_complete_or_rejected_at_its_versioned_bound() -> None:
+    caption_items = _require("gods_mlops.training.caption", "_caption_items")
+    items = [
+        {"item_kind": "crop", "item_id": "crop-a"},
+        {"item_kind": "crop", "item_id": "crop-b"},
+    ]
+
+    with pytest.raises(ValueError, match="exceeds its versioned max_draft_images bound"):
+        caption_items({"items": items}, {"max_draft_images": 1})
+    assert caption_items({"items": items}, {"max_draft_images": 2}) == items
+
+
+def test_detr_preparation_probe_enforces_its_measured_frame_bound() -> None:
+    detector_items = _require("gods_mlops.training.detector", "_detector_items")
+    frames = [
+        {"kind": "frame", "item_kind": "frame", "item_id": f"frame-{index}"}
+        for index in range(2)
+    ]
+    config = {"phase": "probe", "target_phase": "preparation", "max_draft_frames": 1}
+
+    with pytest.raises(ValueError, match="exceeds its versioned max_draft_frames bound"):
+        detector_items({"items": frames}, config)
+    assert detector_items({"items": frames[:1]}, config) == frames[:1]
+
+
 def test_kubernetes_worker_process_requires_owned_pod_and_exact_cgroup_identity() -> None:
     resolve = _require("gods_mlops.training.worker_adapter", "resolve_owned_gpu_process")
     job_uid = "25f66a14-6178-4290-911f-d28f294adf84"
@@ -279,6 +335,60 @@ def test_delayed_worker_never_calls_cuda_or_model_loader_before_current_host_bin
     assert model_loader_calls == ["from_pretrained"]
 
 
+def test_worker_revalidates_mutable_source_after_host_binding_before_cuda() -> None:
+    module = _require("gods_mlops.training.worker", "_run_after_owner_binding")
+    claim_type = _require("gods_mlops.training.claims", "WorkerClaim")
+    auth_error = _require("gods_mlops.training.claims", "WorkerAuthorizationError")
+    job, lease, _profile = _probe_job(generation=2)
+    claim = claim_type.from_admitted_job(job, lease, image_id="sha256:" + "a" * 64)
+    identity = {"owner": None, "source_current": True}
+
+    class Repository:
+        async def get_job(self, job_id):
+            return {"state": "running", "lease_token": claim.lease_token}
+
+        async def get_active_lease(self, gpu_uuid):
+            owner = identity["owner"]
+            return {
+                "job_id": claim.job_id,
+                "lease_token": claim.lease_token,
+                "fencing_token": claim.fence,
+                "owner_pid": owner[0] if owner else None,
+                "owner_start_ticks": owner[1] if owner else None,
+                "owner_uid": owner[2] if owner else None,
+            }
+
+        async def lease_is_current(self, job_id, lease_token):
+            return job_id == claim.job_id and lease_token == claim.lease_token
+
+    async def invalidate_source_during_wait(seconds):
+        identity["source_current"] = False
+        identity["owner"] = (7312, 238191, 10001)
+
+    async def revalidate_source():
+        if not identity["source_current"]:
+            raise auth_error("training source readiness changed during owner binding")
+        return True
+
+    cuda_calls = []
+    model_loader_calls = []
+
+    def runner():
+        cuda_calls.append("cuda")
+        model_loader_calls.append("from_pretrained")
+
+    with pytest.raises(auth_error, match="source readiness changed during owner binding"):
+        asyncio.run(
+            module(
+                Repository(), claim, runner, timeout_seconds=2,
+                poll_interval_seconds=0.1, sleep=invalidate_source_during_wait,
+                revalidate=revalidate_source,
+            )
+        )
+    assert cuda_calls == []
+    assert model_loader_calls == []
+
+
 def test_gpu_process_observation_preserves_host_cgroup_identity() -> None:
     cgroups = ["/kubepods.slice/cri-containerd-" + "b" * 64 + ".scope"]
     observation = ResourceObservation.from_dict(
@@ -325,6 +435,48 @@ def test_owned_gpu_job_is_idempotently_pinned_to_ubuntu_and_one_gpu() -> None:
     assert pod_spec["containers"][0]["image"] == "registry.example/gods-mlops-training@sha256:" + "a" * 64
     env = {item["name"]: item for item in pod_spec["containers"][0]["env"]}
     assert env["GODS_MLOPS_NODE_NAME"]["valueFrom"]["fieldRef"]["fieldPath"] == "spec.nodeName"
+    assert env["GODS_MLOPS_MODEL_LOCK"]["value"] == "/app/models/lock.json"
+
+
+def test_yielding_job_reconciliation_reads_exact_owned_job_without_creating_a_replacement() -> None:
+    adapter_type = _require("gods_mlops.training.worker_adapter", "KubernetesOwnedWorkerAdapter")
+    build_job = _require("gods_mlops.training.worker_adapter", "build_gpu_worker_job")
+    job, lease, profile = _probe_job()
+    namespace = "gods-mlops"
+    image = "registry.example/gods-mlops-training@sha256:" + "a" * 64
+    existing = build_job(
+        job=job,
+        lease=lease,
+        profile=profile,
+        namespace=namespace,
+        image=image,
+    )
+    existing["metadata"]["uid"] = "25f66a14-6178-4290-911f-d28f294adf84"
+
+    class BatchAPI:
+        def __init__(self) -> None:
+            self.created = []
+            self.read = []
+
+        def create_namespaced_job(self, *, namespace, body):
+            self.created.append(body)
+            raise AssertionError("a retained yield must never create a replacement Job")
+
+        def read_namespaced_job(self, *, name, namespace):
+            self.read.append((name, namespace))
+            return existing
+
+    batch_api = BatchAPI()
+    adapter = adapter_type(batch_api=batch_api, namespace=namespace, image=image)
+
+    actual = adapter.read_existing_worker(
+        job={**job, "state": "yield_requested"}, lease=lease, profile=profile
+    )
+
+    assert actual is existing
+    assert actual["metadata"]["uid"] == existing["metadata"]["uid"]
+    assert batch_api.read == [(existing["metadata"]["name"], namespace)]
+    assert batch_api.created == []
 
 
 def test_owned_job_conflict_rejects_matching_labels_with_a_different_pod_contract() -> None:
@@ -551,6 +703,46 @@ def test_versioned_probe_profiles_and_probe_only_synthetic_media_are_separate_fr
             expected_item_kind = "frame" if model_kind == "detr" else "crop"
             assert all(item["item_kind"] == expected_item_kind for item in manifest["items"])
 
+    prep_profile = module.candidate_profile("detr", target_phase="preparation")
+    assert prep_profile.target_phase == "preparation"
+    assert prep_profile.config_version == "task8-detr-640-frame-drafts-preparation-probe-v1"
+    assert prep_profile.config["max_draft_frames"] == 1
+    prep_objects = Objects()
+    prep_input = module.create_probe_input(
+        objects=prep_objects, model_kind="detr", target_phase="preparation"
+    )
+    prep_manifest = prep_input.verify(prep_objects)
+    assert prep_input.target_phase == "preparation"
+    assert len(prep_manifest["items"]) == 1
+
+
+def test_training_cli_dispatches_detr_preparation_measurement_target(monkeypatch) -> None:
+    cli = _require("gods_mlops.training.cli", "main")
+    docker_probe = importlib.import_module("gods_mlops.training.docker_probe")
+    captured = {}
+
+    async def fake_probe(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(docker_probe, "run_docker_model_probe", fake_probe)
+    result = cli(
+        [
+            "run-probe",
+            "--model-kind",
+            "detr",
+            "--target-phase",
+            "preparation",
+            "--worker-image",
+            "registry.example/gods-training@sha256:" + "a" * 64,
+            "--worker-image-id",
+            "sha256:" + "b" * 64,
+        ]
+    )
+
+    assert result == 0
+    assert captured["model_kind"] == "detr"
+    assert captured["target_phase"] == "preparation"
+
 
 def test_training_runtime_locks_scipy_for_transformers_rtdetr_hungarian_loss() -> None:
     import tomllib
@@ -609,6 +801,7 @@ def test_docker_probe_starts_only_a_pinned_uid_worker_with_readonly_cache_and_lo
     assert environment["GODS_MLOPS_LEASE_TOKEN"] == lease["lease_token"]
     assert environment["GODS_MLOPS_FENCE"] == "2"
     assert environment["GODS_MLOPS_MODEL_CACHE_ROOT"] == "/mnt/model-cache"
+    assert environment["GODS_MLOPS_MODEL_LOCK"] == "/app/models/lock.json"
 
     captured = {}
 

@@ -110,6 +110,9 @@ class PreparedCheckpoint:
     size_bytes: int
     metadata_size_bytes: int
     created_at: datetime
+    previous_uri: str | None = None
+    previous_sha256: str | None = None
+    previous_size_bytes: int | None = None
 
 
 class FileCheckpointStore:
@@ -146,6 +149,8 @@ class FileCheckpointStore:
         reservation_bytes: int,
         replacement_reservation_bytes: int | None = None,
         previous_uri: str | None = None,
+        previous_sha256: str | None = None,
+        previous_size_bytes: int | None = None,
     ) -> PreparedCheckpoint:
         """Write and verify payload bytes without publishing a resume marker."""
         if not isinstance(payload, bytes) or not payload:
@@ -201,6 +206,9 @@ class FileCheckpointStore:
             size_bytes=len(payload),
             metadata_size_bytes=len(encoded_metadata),
             created_at=created_at,
+            previous_uri=previous_uri,
+            previous_sha256=previous_sha256,
+            previous_size_bytes=previous_size_bytes,
         )
 
     def commit(self, prepared: PreparedCheckpoint) -> VerifiedCheckpoint:

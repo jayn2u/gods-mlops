@@ -58,6 +58,7 @@ class TrainingController:
             if job.get("state") in {"completed", "failed", "cancelled"}:
                 lease = await self._repository.get_active_lease(self._admission.expected_gpu_uuid)
                 if lease is None or lease.get("job_id") != job_id:
+                    await self._cleanup_terminal_artifact_writes(job_id)
                     return job
 
             if not job.get("lease_token"):
@@ -77,13 +78,22 @@ class TrainingController:
             if profile is None:
                 await self._sleep(self._interval_seconds)
                 continue
-            worker_job = self._worker_adapter.ensure_worker(job=job, lease=lease, profile=profile)
-            worker_uid = _get(_get(worker_job, "metadata"), "uid")
-            if not worker_uid:
+            worker_job = None
+            if job.get("state") == "running":
+                worker_job = self._worker_adapter.ensure_worker(job=job, lease=lease, profile=profile)
+            elif job.get("state") in {"yield_requested", "completed", "failed", "cancelled"}:
+                # A retained lease can outlive the job's runnable state. Read its
+                # exact owned Job for observation, but never turn a yield/terminal
+                # state into a new GPU launch.
+                worker_job = self._worker_adapter.read_existing_worker(
+                    job=job, lease=lease, profile=profile
+                )
+            worker_uid = _get(_get(worker_job, "metadata"), "uid") if worker_job is not None else None
+            if worker_job is not None and not worker_uid:
                 raise RuntimeError("created Kubernetes worker Job has no authoritative UID")
 
             observation = await self._observer_call()
-            if lease.get("owner_pid") is None:
+            if lease.get("owner_pid") is None and worker_uid:
                 pods = self._core_api.list_namespaced_pod(
                     namespace=self._namespace,
                     label_selector=(
@@ -109,6 +119,7 @@ class TrainingController:
             if current.get("state") in {"completed", "failed", "cancelled"} and (
                 active is None or active.get("job_id") != job_id
             ):
+                await self._cleanup_terminal_artifact_writes(job_id)
                 return current
             await self._sleep(self._interval_seconds)
         raise TimeoutError(f"training controller timed out for job {job_id}")
@@ -120,6 +131,11 @@ class TrainingController:
         else:
             value = await asyncio.to_thread(method)
         return value if isinstance(value, ResourceObservation) else ResourceObservation.from_dict(value)
+
+    async def _cleanup_terminal_artifact_writes(self, job_id: str) -> None:
+        cleanup = getattr(self._queue, "cleanup_pending_artifact_writes_from_environment", None)
+        if callable(cleanup):
+            await cleanup(job_id)
 
     async def close(self) -> None:
         await self._repository.close()

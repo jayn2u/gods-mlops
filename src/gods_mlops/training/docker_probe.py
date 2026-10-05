@@ -62,6 +62,7 @@ finally:
 class DockerProbeEvidence:
     job_id: str
     model_kind: str
+    target_phase: str
     config_version: str
     input_sha256: str
     image_reference: str
@@ -83,6 +84,7 @@ class DockerProbeEvidence:
             "event": "task8_real_model_probe_complete",
             "job_id": self.job_id,
             "model_kind": self.model_kind,
+            "target_phase": self.target_phase,
             "config_version": self.config_version,
             "input_sha256": self.input_sha256,
             "image_reference": self.image_reference,
@@ -113,6 +115,7 @@ async def run_docker_model_probe(
     model_kind: str,
     worker_image: str,
     expected_image_id: str,
+    target_phase: str | None = None,
     model_cache_root: str = "/data/jayn2u/gods-mlops-model-preparation",
     timeout_seconds: int = 3600,
     evidence_directory: str | Path = "output/task8-real-model-probes",
@@ -120,6 +123,7 @@ async def run_docker_model_probe(
     """Submit one typed candidate through Task 7, bind Docker host PID, and run its worker."""
     if model_kind not in {"detr", "clip", "qwen"}:
         raise ValueError("real-model probe model_kind must be detr, clip, or qwen")
+    profile = candidate_profile(model_kind, target_phase=target_phase)
     if not _IMAGE_REF.fullmatch(worker_image) or not _IMAGE_ID.fullmatch(expected_image_id):
         raise ValueError("probe requires the source-matched image reference and exact Docker image ID")
     if not model_cache_root.startswith("/") or any(char in model_cache_root for char in ":,\n\r"):
@@ -189,12 +193,13 @@ async def run_docker_model_probe(
     job_id: str | None = None
     try:
         await repository.ensure_schema()
-        profile = candidate_profile(model_kind)
         await queue.register_profile(profile)
         if profile.config_version is None:
             raise RuntimeError("candidate profile lost its immutable config version")
         objects = dataset_object_store_from_environment()
-        probe_input = create_probe_input(objects=objects, model_kind=model_kind)
+        probe_input = create_probe_input(
+            objects=objects, model_kind=model_kind, target_phase=profile.target_phase
+        )
         docker_image_id = await _remote_ssh(
             ssh_target,
             ssh_port,
@@ -346,10 +351,17 @@ async def run_docker_model_probe(
         measurement = await repository.profile_measurement_for_job(job_id)
         if measurement is None or measurement["result_state"] != "succeeded":
             raise DockerProbeError("real-model probe completed without a successful profile measurement")
-        artifact = await _probe_result_artifact(queue, objects, job_id, identity=await repository.checkpoint_identity(job_id))
+        artifact = await _probe_result_artifact(
+            queue,
+            objects,
+            job_id,
+            identity=await repository.checkpoint_identity(job_id),
+            target_phase=profile.target_phase or "training",
+        )
         evidence = DockerProbeEvidence(
             job_id=job_id,
             model_kind=model_kind,
+            target_phase=profile.target_phase or "training",
             config_version=profile.config_version,
             input_sha256=claim.input_sha256,
             image_reference=worker_image,
@@ -604,7 +616,7 @@ def _worker_environment(
         "GODS_MLOPS_CONFIG_SHA256": claim.config_sha256,
         "GODS_MLOPS_IMAGE_ID": image_id,
         "GODS_MLOPS_NODE_NAME": "ubuntu",
-        "GODS_MLOPS_MODEL_LOCK": "/opt/gods-mlops/models/lock.json",
+        "GODS_MLOPS_MODEL_LOCK": "/app/models/lock.json",
         "GODS_MLOPS_MODEL_CACHE_ROOT": "/mnt/model-cache",
         "GODS_MLOPS_CHECKPOINT_ROOT": "/tmp/gods-mlops-checkpoints",
         "HOME": "/tmp",
@@ -827,9 +839,13 @@ async def _probe_result_artifact(
     job_id: str,
     *,
     identity,
+    target_phase: str,
 ) -> tuple[dict, dict]:
     artifacts = await queue.repository.result_artifacts_for(job_id)
-    expected_kind = "caption_drafts" if identity.model_kind == "qwen" else "model"
+    if target_phase == "preparation":
+        expected_kind = "drafts" if identity.model_kind == "detr" else "caption_drafts"
+    else:
+        expected_kind = "model"
     matches = [
         item for item in artifacts
         if item.get("kind") == expected_kind and item.get("identity") == identity.as_dict()
@@ -845,7 +861,12 @@ async def _probe_result_artifact(
         sha256_digest=artifact["sha256"],
         size_bytes=artifact["size_bytes"],
     )
-    if identity.model_kind == "qwen":
+    if target_phase == "preparation":
+        output = {
+            "result_document": json.loads(payload),
+            "resource_measurements": artifact.get("runtime_measurements"),
+        }
+    elif identity.model_kind == "qwen":
         output = json.loads(payload)
     else:
         import tarfile

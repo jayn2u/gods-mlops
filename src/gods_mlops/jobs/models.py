@@ -136,8 +136,8 @@ class ProbeInput:
             raise ValueError("model readiness probe target_phase is unsupported")
         if self.model_kind == "qwen" and self.target_phase != "preparation":
             raise ValueError("Qwen readiness probes are inference-only")
-        if self.model_kind in {"detr", "clip"} and self.target_phase != "training":
-            raise ValueError("DETR and CLIP readiness probes require their training target")
+        if self.model_kind == "clip" and self.target_phase != "training":
+            raise ValueError("CLIP readiness probes require their training target")
         if not self.config_version.strip() or len(self.config_version) > 255:
             raise ValueError("probe config_version must contain 1 to 255 characters")
         if (

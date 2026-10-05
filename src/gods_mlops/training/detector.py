@@ -275,7 +275,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         checkpoint_payload = b""
     commit_result = config.get("_commit_result_artifact")
     if callable(commit_result):
-        result_uri = commit_result("model", result_payload).uri
+        result_uri = commit_result("model", result_payload, measurements).uri
         result_payload = b""
     return {
         "status": "succeeded",
@@ -361,7 +361,7 @@ def _draft_detections(
     result_uri = None
     commit_result = config.get("_commit_result_artifact")
     if callable(commit_result):
-        result_uri = commit_result("drafts", encoded).uri
+        result_uri = commit_result("drafts", encoded, measurements).uri
         encoded = b""
     return {
         "status": "succeeded",
@@ -386,6 +386,12 @@ def _detector_items(manifest: dict[str, Any], config: dict[str, Any]) -> list[di
         selected = [item for item in items if item.get("kind") == "frame" or item.get("item_kind") == "frame"]
     if not selected:
         raise ValueError("detector manifest has no frame items for this phase")
+    if config.get("target_phase") == "preparation" or config.get("phase") == "preparation":
+        limit = config.get("max_draft_frames", 1)
+        if type(limit) is not int or limit < 1:
+            raise ValueError("DETR preparation profile needs a positive max_draft_frames bound")
+        if len(selected) > limit:
+            raise ValueError("DETR preparation input exceeds its versioned max_draft_frames bound")
     return selected
 
 

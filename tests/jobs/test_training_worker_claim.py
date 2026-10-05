@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 import os
+from hashlib import sha256
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -97,6 +98,73 @@ async def _training_run(database_url: str):
     return repository, queue, sources, admission, dataset_version, sample_id, job_id, now
 
 
+async def _probe_run(database_url: str):
+    repository = PostgresJobQueueRepository(database_url=database_url)
+    await repository.ensure_schema()
+    sources = DatasetSourceRegistry(database_url=database_url)
+    queue = JobQueue(repository=repository, sources=sources)
+    model = importlib.import_module("gods_mlops.training.contracts").locked_model("detr")
+    config_version = f"task8-storage-probe-{uuid4().hex}"
+    profile = ExecutionProfile(
+        model_kind="detr",
+        config_version=config_version,
+        phase="probe",
+        target_phase="training",
+        memory_requirement_mib=8_192,
+        artifact_reservation_bytes=96 * 1024**2,
+        config={"model_id": model.model_id, "model_revision": model.revision, "input_size": 640, "micro_batch": 1},
+        candidate=True,
+    )
+    await queue.register_profile(profile)
+    probe_input = ProbeInput(
+        probe_input_id=f"task8-storage-probe-{uuid4().hex}",
+        model_kind="detr",
+        target_phase="training",
+        config_version=config_version,
+        manifest_object_key=f"probe-inputs/task8-tests/{uuid4().hex}.json",
+        input_sha256="5" * 64,
+        object_size_bytes=1024,
+        fixture=True,
+    )
+    job_id = await queue.submit_probe(
+        model_kind="detr", config_version=config_version, probe_input=probe_input
+    )
+    now = [datetime.now(UTC)]
+
+    class Observer:
+        async def observe(self):
+            return _observation(now[0] + timedelta(milliseconds=100))
+
+    admission = GpuAdmission(
+        repository=repository,
+        queue=queue,
+        expected_node_id="ubuntu",
+        expected_host_identity=HOST_IDENTITY,
+        expected_gpu_uuid=GPU_UUID,
+        expected_filesystem_identity=FILESYSTEM_IDENTITY,
+        expected_storage_path=STORAGE_PATH,
+        observer=Observer(),
+        clock=lambda: now[0],
+    )
+    return repository, queue, sources, admission, job_id, now
+
+
+async def _admit_probe(queue: JobQueue, admission: GpuAdmission, job_id: str, now) -> dict:
+    admitted = None
+    base_time = now[0]
+    for offset in range(0, 31, 5):
+        now[0] = base_time + timedelta(seconds=offset)
+        admitted = await admission.admit(job_id, _observation(now[0]))
+        if admitted.get("reason_code") == "ubuntu_observation_replayed":
+            state = await queue.repository.get_observation_state("ubuntu")
+            raise AssertionError(
+                f"probe admission replayed at offset {offset}: now={now[0].isoformat()} "
+                f"stored={state['observed_at']} id={state['observation_id']}"
+            )
+    assert admitted is not None and admitted["state"] == "running", admitted
+    return admitted
+
+
 def _guard_function():
     module = importlib.import_module("gods_mlops.training.claims")
     function = getattr(module, "validate_current_worker_claim", None)
@@ -135,6 +203,91 @@ def _result_artifact_store(tmp_path: Path):
     return FileResultArtifactStore(root=tmp_path), None
 
 
+def test_ordinary_worker_rejects_profile_revision_mismatch_before_cuda_or_runner(monkeypatch) -> None:
+    worker = _require_module("gods_mlops.training.worker")
+    error_type = WorkerAuthorizationError
+    job = {
+        "job_id": "a0320b59-663c-4cdc-b893-086bb970ea60",
+        "state": "running",
+        "lease_token": "8ad96890-3434-4f07-85bb-8cde17a2b009",
+        "lease_generation": 1,
+        "phase": "training",
+        "target_phase": None,
+        "input_kind": "dataset_version",
+        "input_id": "dataset-task8-lock-test",
+        "input_sha256": "1" * 64,
+        "dataset_version": "dataset-task8-lock-test",
+        "model_kind": "clip",
+        "config_version": "clip-measured-lock-test-v1",
+        "config_sha256": "2" * 64,
+    }
+    lease = {
+        "job_id": job["job_id"],
+        "lease_token": job["lease_token"],
+        "fencing_token": 1,
+        "gpu_uuid": GPU_UUID,
+    }
+    profile = {
+        "profile_state": "measured",
+        "config_json": {
+            "model_kind": "clip",
+            "model_id": "openai/clip-vit-base-patch16",
+            "model_revision": "f" * 40,
+            "resolution": 224,
+            "micro_batch": 2,
+            "contrastive_config_version": "task8-explicit-negatives-v1",
+        },
+    }
+
+    class Repository:
+        async def get_active_lease(self, gpu_uuid):
+            return lease
+
+        async def get_profile(self, *, phase, model_kind, config_version):
+            return profile
+
+        async def checkpoint_identity(self, job_id):
+            raise AssertionError("a mismatched profile must fail before checkpoint or CUDA setup")
+
+        async def close(self):
+            return None
+
+    class Sources:
+        async def close(self):
+            return None
+
+    repository = Repository()
+    sources = Sources()
+
+    class Queue:
+        source_registry = sources
+
+        async def get(self, job_id):
+            return job
+
+    async def validate_claim(queue, claim, *, object_store):
+        return job, lease
+
+    monkeypatch.setattr(worker, "PostgresJobQueueRepository", lambda **kwargs: repository)
+    monkeypatch.setattr(worker, "DatasetSourceRegistry", lambda **kwargs: sources)
+    monkeypatch.setattr(worker, "JobQueue", lambda **kwargs: Queue())
+    monkeypatch.setattr(worker, "dataset_object_store_from_environment", lambda: object())
+    monkeypatch.setattr(worker, "validate_current_worker_claim", validate_claim)
+    monkeypatch.setattr(worker, "_verify_claim_environment", lambda claim: None)
+    monkeypatch.setattr(worker, "_runner_for", lambda *args: pytest.fail("runner must not start"))
+    for name, value in {
+        "GODS_MLOPS_DATABASE_URL": "postgresql://test:test@127.0.0.1:15439/gods",
+        "GODS_MLOPS_JOB_ID": job["job_id"],
+        "GODS_MLOPS_LEASE_TOKEN": job["lease_token"],
+        "GODS_MLOPS_IMAGE_ID": "sha256:" + "a" * 64,
+        "GODS_MLOPS_GPU_UUID": GPU_UUID,
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(error_type, match="model ID or revision differs from the immutable lock"):
+        asyncio.run(worker.run_worker())
+
+
 def test_worker_start_rechecks_task6_current_source_invalidation_before_cuda(task7_database_url: str) -> None:
     async def exercise() -> None:
         guard = _guard_function()
@@ -159,6 +312,30 @@ def test_worker_start_rechecks_task6_current_source_invalidation_before_cuda(tas
 
         with pytest.raises(WorkerAuthorizationError, match="source readiness changed.*source_sample_explicitly_invalidated"):
             await guard(queue, claim)
+
+        worker = _require_module("gods_mlops.training.worker")
+        cuda_calls = []
+        model_loader_calls = []
+
+        async def bind_after_invalidation(seconds):
+            assert await queue.bind_process(job_id, lease["lease_token"], OWNER)
+
+        def runner():
+            cuda_calls.append("cuda")
+            model_loader_calls.append("from_pretrained")
+
+        with pytest.raises(WorkerAuthorizationError, match="source readiness changed.*source_sample_explicitly_invalidated"):
+            await worker._run_after_owner_binding(
+                repository,
+                claim,
+                runner,
+                timeout_seconds=2,
+                poll_interval_seconds=0.1,
+                sleep=bind_after_invalidation,
+                revalidate=lambda: worker._worker_claim_at_safe_boundary(queue, claim),
+            )
+        assert cuda_calls == []
+        assert model_loader_calls == []
         await queue.close()
         await repository.close()
         await sources.close()
@@ -372,6 +549,12 @@ def test_s3_checkpoint_and_result_use_task7_fence_and_shared_global_reservation(
         artifact_store, objects = _result_artifact_store(tmp_path)
         if objects is None:
             pytest.skip("loopback-only Task 8 S3 endpoint is not configured")
+        result_prefix = f"task8-tests/{uuid4()}"
+        artifact_store = S3ResultArtifactStore(
+            objects=objects,
+            bucket=os.environ["GODS_MLOPS_TEST_S3_BUCKET"],
+            prefix=result_prefix,
+        )
         checkpoint_store = S3CheckpointStore(
             objects=objects,
             bucket=os.environ["GODS_MLOPS_TEST_S3_BUCKET"],
@@ -445,7 +628,7 @@ def test_s3_checkpoint_and_result_use_task7_fence_and_shared_global_reservation(
         lost_result_store = S3ResultArtifactStore(
             objects=LostResultAck(),
             bucket=os.environ["GODS_MLOPS_TEST_S3_BUCKET"],
-            prefix=f"task8-tests/{uuid4()}",
+            prefix=result_prefix,
         )
         result_payload = b"measured model result bundle"
         with pytest.raises(OSError, match="lost S3 result acknowledgement"):
@@ -487,6 +670,480 @@ def test_s3_checkpoint_and_result_use_task7_fence_and_shared_global_reservation(
 
         objects.delete_object(object_key=result_artifact.object_key)
         objects.delete_object(object_key=checkpoint.uri.removeprefix(f"s3://{os.environ['GODS_MLOPS_TEST_S3_BUCKET']}/"))
+        await queue.close()
+        await repository.close()
+        await sources.close()
+
+    asyncio.run(exercise())
+
+
+def test_s3_result_put_lost_ack_remains_charged_until_verified_terminal_cleanup(
+    task7_database_url: str,
+) -> None:
+    if not all(os.environ.get(name) for name in (
+        "GODS_MLOPS_TEST_S3_ENDPOINT",
+        "GODS_MLOPS_TEST_S3_ACCESS_KEY",
+        "GODS_MLOPS_TEST_S3_SECRET_KEY",
+        "GODS_MLOPS_TEST_S3_BUCKET",
+    )):
+        pytest.skip("loopback-only Task 8 S3 endpoint is not configured")
+
+    async def exercise() -> None:
+        endpoint = os.environ["GODS_MLOPS_TEST_S3_ENDPOINT"]
+        access = os.environ["GODS_MLOPS_TEST_S3_ACCESS_KEY"]
+        secret = os.environ["GODS_MLOPS_TEST_S3_SECRET_KEY"]
+        bucket = os.environ["GODS_MLOPS_TEST_S3_BUCKET"]
+        objects = DatasetObjectStore(
+            endpoint_url=endpoint, access_key=access, secret_key=secret, bucket=bucket, region="us-east-1"
+        )
+        repository, queue, sources, admission, job_id, now = await _probe_run(task7_database_url)
+        baseline = await _storage_bytes(task7_database_url)
+        await _admit_probe(queue, admission, job_id, now)
+        lease = await repository.get_active_lease(GPU_UUID)
+        identity = await repository.checkpoint_identity(job_id)
+        payload = b"immutable result whose S3 verification acknowledgement was lost"
+        delegate = S3ResultArtifactStore(objects=objects, bucket=bucket, prefix=f"task8-pending/{uuid4()}")
+
+        class LostReadback:
+            lost = False
+
+            @property
+            def _bucket(self):
+                return delegate._bucket
+
+            @property
+            def _prefix(self):
+                return delegate._prefix
+
+            def prepare(self, **kwargs):
+                return delegate.prepare(**kwargs)
+
+            def commit(self, prepared):
+                if not self.lost:
+                    self.lost = True
+                    objects.write_immutable(
+                        object_key=prepared.object_key,
+                        content=prepared.payload,
+                        sha256_digest=prepared.sha256,
+                        content_type="application/octet-stream",
+                    )
+                    raise OSError("lost result readback acknowledgement after S3 put")
+                return delegate.commit(prepared)
+
+        store = LostReadback()
+        expected = store.prepare(
+            identity=identity,
+            kind="model",
+            payload=payload,
+            reservation_bytes=32 * 1024**2,
+        )
+        with pytest.raises(OSError, match="lost result readback acknowledgement"):
+            await queue.save_result_artifact(
+                store=store,
+                job_id=job_id,
+                lease_token=lease["lease_token"],
+                identity=identity,
+                kind="model",
+                payload=payload,
+            )
+        reservation = await repository.artifact_reservation_for(job_id)
+        assert reservation["consumed_bytes"] == len(payload)
+        async with repository._pool.acquire() as connection:
+            pending = await connection.fetchrow(
+                """SELECT details FROM gods_mlops_job_events
+                   WHERE job_id=$1::uuid AND event_type='artifact_write_pending'""",
+                job_id,
+            )
+        pending_details = json.loads(pending["details"])
+        assert pending_details["uri"] == expected.uri
+        assert pending_details["sha256"] == expected.sha256
+        assert pending_details["size_bytes"] == len(payload)
+        assert pending_details["identity"] == identity.as_dict()
+        assert objects.read_source(
+            object_key=expected.object_key, sha256_digest=expected.sha256, size_bytes=len(payload)
+        ) == payload
+
+        failed = await queue.record_probe_measurement(
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            exit_code=1,
+            peak_allocated_mib=None,
+            peak_reserved_mib=None,
+            optimizer_steps=0,
+            checkpoint_resumed=False,
+            checkpoint_sha256=None,
+            inference_steps=0,
+            verification_details={"passed": False, "failure": "lost_result_readback_ack"},
+        )
+        assert failed["result_state"] == "failed"
+        assert (await repository.artifact_reservation_for(job_id))["state"] == "settled"
+        assert await _storage_bytes(task7_database_url) == baseline + len(payload)
+        released = await repository.release_after_observed_exit(
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            observation=ResourceObservation.from_dict(_observation(datetime.now(UTC))),
+        )
+        assert released is True
+
+        foreign_payload = b"neighboring unowned S3 object"
+        foreign_key = f"{expected.object_key}.foreign"
+        objects.write_immutable(
+            object_key=foreign_key,
+            content=foreign_payload,
+            sha256_digest=__import__("hashlib").sha256(foreign_payload).hexdigest(),
+            content_type="application/octet-stream",
+        )
+
+        await queue.cleanup_pending_artifact_writes(object_store=objects, job_id=job_id)
+        assert await _storage_bytes(task7_database_url) == baseline
+        with pytest.raises(FileNotFoundError):
+            objects.read_source(
+                object_key=expected.object_key,
+                sha256_digest=expected.sha256,
+                size_bytes=len(payload),
+            )
+        assert objects.read_source(
+            object_key=foreign_key,
+            sha256_digest=__import__("hashlib").sha256(foreign_payload).hexdigest(),
+            size_bytes=len(foreign_payload),
+        ) == foreign_payload
+        objects.delete_object(object_key=foreign_key)
+        await queue.close()
+        await repository.close()
+        await sources.close()
+
+    asyncio.run(exercise())
+
+
+def test_new_fence_recovers_committed_probe_result_without_retraining_or_double_charge(
+    task7_database_url: str, monkeypatch
+) -> None:
+    required = (
+        "GODS_MLOPS_TEST_S3_ENDPOINT",
+        "GODS_MLOPS_TEST_S3_ACCESS_KEY",
+        "GODS_MLOPS_TEST_S3_SECRET_KEY",
+        "GODS_MLOPS_TEST_S3_BUCKET",
+    )
+    if any(not os.environ.get(name) for name in required):
+        pytest.skip("loopback-only Task 8 S3 endpoint is not configured")
+
+    async def exercise() -> None:
+        from gods_mlops.datasets.manifest import canonical_json
+
+        endpoint = os.environ["GODS_MLOPS_TEST_S3_ENDPOINT"]
+        access = os.environ["GODS_MLOPS_TEST_S3_ACCESS_KEY"]
+        secret = os.environ["GODS_MLOPS_TEST_S3_SECRET_KEY"]
+        bucket = os.environ["GODS_MLOPS_TEST_S3_BUCKET"]
+        objects = DatasetObjectStore(
+            endpoint_url=endpoint, access_key=access, secret_key=secret, bucket=bucket, region="us-east-1"
+        )
+        writes: list[str] = []
+        original_write = objects.write_immutable
+
+        def count_write(*, object_key, content, sha256_digest, content_type):
+            writes.append(object_key)
+            original_write(
+                object_key=object_key,
+                content=content,
+                sha256_digest=sha256_digest,
+                content_type=content_type,
+            )
+
+        objects.write_immutable = count_write
+        repository = PostgresJobQueueRepository(database_url=task7_database_url)
+        await repository.ensure_schema()
+        sources = DatasetSourceRegistry(database_url=task7_database_url)
+        queue = JobQueue(repository=repository, sources=sources)
+        model = importlib.import_module("gods_mlops.training.contracts").locked_model("detr")
+        config_version = f"task8-recovery-{uuid4().hex}"
+        profile = ExecutionProfile(
+            model_kind="detr",
+            config_version=config_version,
+            phase="probe",
+            target_phase="training",
+            memory_requirement_mib=8_192,
+            artifact_reservation_bytes=96 * 1024**2,
+            config={
+                "model_id": model.model_id,
+                "model_revision": model.revision,
+                "input_size": 640,
+                "micro_batch": 1,
+            },
+            candidate=True,
+        )
+        await queue.register_profile(profile)
+        probe_input_id = f"task8-recovery-{uuid4().hex}"
+        manifest = {
+            "schema_version": 1,
+            "fixture": True,
+            "phase": "probe",
+            "model_kind": "detr",
+            "input_kind": "probe_input",
+            "input_id": probe_input_id,
+            "config_version": config_version,
+        }
+        manifest_payload = canonical_json(manifest)
+        manifest_sha = sha256(manifest_payload).hexdigest()
+        manifest_key = f"probe-inputs/task8-recovery/{uuid4().hex}.json"
+        objects.write_immutable(
+            object_key=manifest_key,
+            content=manifest_payload,
+            sha256_digest=manifest_sha,
+            content_type="application/json",
+        )
+        probe_input = ProbeInput(
+            probe_input_id=probe_input_id,
+            model_kind="detr",
+            target_phase="training",
+            config_version=config_version,
+            manifest_object_key=manifest_key,
+            input_sha256=manifest_sha,
+            object_size_bytes=len(manifest_payload),
+            fixture=True,
+        )
+        job_id = await queue.submit_probe(
+            model_kind="detr", config_version=config_version, probe_input=probe_input
+        )
+        baseline = await _storage_bytes(task7_database_url)
+        now = [datetime.now(UTC)]
+
+        class Observer:
+            async def observe(self):
+                return _observation(now[0] + timedelta(milliseconds=100))
+
+        admission = GpuAdmission(
+            repository=repository,
+            queue=queue,
+            expected_node_id="ubuntu",
+            expected_host_identity=HOST_IDENTITY,
+            expected_gpu_uuid=GPU_UUID,
+            expected_filesystem_identity=FILESYSTEM_IDENTITY,
+            expected_storage_path=STORAGE_PATH,
+            observer=Observer(),
+            clock=lambda: now[0],
+        )
+        first_job = await _admit_probe(queue, admission, job_id, now)
+        first_lease = await repository.get_active_lease(GPU_UUID)
+        identity = await repository.checkpoint_identity(job_id)
+        checkpoint_store = S3CheckpointStore(objects=objects, bucket=bucket)
+        result_store = S3ResultArtifactStore(objects=objects, bucket=bucket)
+        checkpoint = await queue.save_checkpoint(
+            store=checkpoint_store,
+            job_id=job_id,
+            lease_token=first_lease["lease_token"],
+            identity=identity,
+            payload=b"verified generation-one optimizer checkpoint",
+        )
+        result_payload = b"immutable generation-one probe result bundle"
+        measurements = {
+            "peak_vram_allocated_mib": 7_200,
+            "peak_vram_reserved_mib": 8_000,
+            "elapsed_seconds": 4.2,
+            "optimizer_steps": 3,
+            "inference_steps": 0,
+            "checkpoint_resumed": True,
+            "initial_weight_sha256": "3" * 64,
+            "final_weight_sha256": "4" * 64,
+            "model_id": model.model_id,
+            "model_revision": model.revision,
+            "losses": [1.1, 0.8, 0.6],
+        }
+        artifact = await queue.save_result_artifact(
+            store=result_store,
+            job_id=job_id,
+            lease_token=first_lease["lease_token"],
+            identity=identity,
+            kind="model",
+            payload=result_payload,
+            runtime_measurements=measurements,
+        )
+        before_recovery = await repository.artifact_reservation_for(job_id)
+        assert before_recovery["state"] == "reserved"
+        assert before_recovery["consumed_bytes"] == checkpoint.size_bytes + artifact.size_bytes
+        assert len(await repository.result_artifacts_for(job_id)) == 1
+        result_write_count = len(writes)
+
+        assert await queue.bind_process(job_id, first_lease["lease_token"], OWNER)
+        monitor = GpuJobMonitor(repository=repository, queue=queue, admission=admission)
+        admission_base = now[0]
+        now[0] = admission_base + timedelta(seconds=35)
+        released = await monitor.observe(_observation(now[0]))
+        assert released["state"] == "waiting_gpu"
+        assert await repository.get_active_lease(GPU_UUID) is None
+        for offset in range(40, 71, 5):
+            now[0] = admission_base + timedelta(seconds=offset)
+            recovered_job = await admission.admit(job_id, _observation(now[0]))
+        assert recovered_job["state"] == "running"
+        second_lease = await repository.get_active_lease(GPU_UUID)
+        assert second_lease["fencing_token"] == first_lease["fencing_token"] + 1
+        assert second_lease["lease_token"] != first_lease["lease_token"]
+        assert (await repository.artifact_reservation_for(job_id))["consumed_bytes"] == before_recovery["consumed_bytes"]
+
+        worker = _require_module("gods_mlops.training.worker")
+        runner_calls: list[tuple] = []
+
+        def fail_if_runner_starts(*args):
+            runner_calls.append(args)
+            raise AssertionError("recovery must not import or execute the model runner")
+
+        monkeypatch.setattr(worker, "_runner_for", fail_if_runner_starts)
+        monkeypatch.setattr(worker, "_verify_claim_environment", lambda claim: None)
+        monkeypatch.setattr(worker, "dataset_object_store_from_environment", lambda: objects)
+        for name, value in {
+            "GODS_MLOPS_DATABASE_URL": task7_database_url,
+            "GODS_MLOPS_JOB_ID": job_id,
+            "GODS_MLOPS_LEASE_TOKEN": second_lease["lease_token"],
+            "GODS_MLOPS_IMAGE_ID": "sha256:" + "a" * 64,
+            "GODS_MLOPS_GPU_UUID": GPU_UUID,
+            "GODS_MLOPS_S3_ENDPOINT_URL": endpoint,
+            "GODS_MLOPS_S3_ACCESS_KEY": access,
+            "GODS_MLOPS_S3_SECRET_KEY": secret,
+            "GODS_MLOPS_S3_BUCKET": bucket,
+            "GODS_MLOPS_S3_REGION": "us-east-1",
+            "GODS_MLOPS_MODEL_LOCK": str(Path(__file__).resolve().parents[2] / "models" / "lock.json"),
+        }.items():
+            monkeypatch.setenv(name, value)
+        assert await worker.run_worker() == 0
+        assert runner_calls == []
+        assert len(writes) == result_write_count
+        assert len(await repository.result_artifacts_for(job_id)) == 1
+        reservation = await repository.artifact_reservation_for(job_id)
+        assert reservation["state"] == "settled"
+        assert reservation["consumed_bytes"] == before_recovery["consumed_bytes"]
+        assert await _storage_bytes(task7_database_url) == baseline + checkpoint.size_bytes + artifact.size_bytes
+        assert (await queue.get(job_id))["state"] == "completed"
+        measurement = await repository.profile_measurement_for_job(job_id)
+        assert measurement is not None and measurement["result_state"] == "succeeded"
+
+        assert await repository.release_after_observed_exit(
+            job_id=job_id,
+            lease_token=second_lease["lease_token"],
+            observation=ResourceObservation.from_dict(_observation(now[0] + timedelta(seconds=1))),
+        )
+        objects.delete_object(object_key=manifest_key)
+        objects.delete_object(object_key=checkpoint.uri.removeprefix(f"s3://{bucket}/"))
+        objects.delete_object(object_key=artifact.object_key)
+        await queue.close()
+        await repository.close()
+        await sources.close()
+
+    asyncio.run(exercise())
+
+
+def test_s3_checkpoint_delete_failure_keeps_both_versions_charged_until_retry(
+    task7_database_url: str,
+) -> None:
+    if not all(os.environ.get(name) for name in (
+        "GODS_MLOPS_TEST_S3_ENDPOINT",
+        "GODS_MLOPS_TEST_S3_ACCESS_KEY",
+        "GODS_MLOPS_TEST_S3_SECRET_KEY",
+        "GODS_MLOPS_TEST_S3_BUCKET",
+    )):
+        pytest.skip("loopback-only Task 8 S3 endpoint is not configured")
+
+    async def exercise() -> None:
+        endpoint = os.environ["GODS_MLOPS_TEST_S3_ENDPOINT"]
+        access = os.environ["GODS_MLOPS_TEST_S3_ACCESS_KEY"]
+        secret = os.environ["GODS_MLOPS_TEST_S3_SECRET_KEY"]
+        bucket = os.environ["GODS_MLOPS_TEST_S3_BUCKET"]
+        objects = DatasetObjectStore(
+            endpoint_url=endpoint, access_key=access, secret_key=secret, bucket=bucket, region="us-east-1"
+        )
+        repository, queue, sources, admission, job_id, now = await _probe_run(task7_database_url)
+        baseline = await _storage_bytes(task7_database_url)
+        await _admit_probe(queue, admission, job_id, now)
+        lease = await repository.get_active_lease(GPU_UUID)
+        identity = await repository.checkpoint_identity(job_id)
+        delegate = S3CheckpointStore(objects=objects, bucket=bucket, prefix=f"task8-prune/{uuid4()}")
+
+        class LoseFirstDelete:
+            failed = False
+
+            def prepare(self, **kwargs):
+                return delegate.prepare(**kwargs)
+
+            def commit(self, prepared):
+                return delegate.commit(prepared)
+
+            def load_uri(self, *args, **kwargs):
+                return delegate.load_uri(*args, **kwargs)
+
+            def prune_previous(self, prepared):
+                if not self.failed and prepared.previous_uri:
+                    self.failed = True
+                    raise OSError("checkpoint prune acknowledgement failed")
+                return delegate.prune_previous(prepared)
+
+            def prune_uri(self, *args, **kwargs):
+                return delegate.prune_uri(*args, **kwargs)
+
+        store = LoseFirstDelete()
+        first_payload = b"checkpoint generation one"
+        first = await queue.save_checkpoint(
+            store=store,
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            identity=identity,
+            payload=first_payload,
+        )
+        second_payload = b"checkpoint generation two is larger than the first"
+        second_prepared = delegate.prepare(
+            identity=identity,
+            payload=second_payload,
+            reservation_bytes=32 * 1024**2,
+            replacement_reservation_bytes=64 * 1024**2,
+            previous_uri=first.uri,
+            previous_sha256=first.sha256,
+            previous_size_bytes=first.size_bytes,
+        )
+        with pytest.raises(OSError, match="checkpoint prune acknowledgement"):
+            await queue.save_checkpoint(
+                store=store,
+                job_id=job_id,
+                lease_token=lease["lease_token"],
+                identity=identity,
+                payload=second_payload,
+            )
+        pending_reservation = await repository.artifact_reservation_for(job_id)
+        assert pending_reservation["consumed_bytes"] == len(first_payload) + len(second_payload)
+        assert objects.read_source(
+            object_key=first.uri.removeprefix(f"s3://{bucket}/"),
+            sha256_digest=first.sha256,
+            size_bytes=len(first_payload),
+        ) == first_payload
+
+        resumed = await queue.save_checkpoint(
+            store=store,
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            identity=identity,
+            payload=second_payload,
+        )
+        assert resumed.sha256 == sha256(second_payload).hexdigest()
+        assert (await queue.load_checkpoint(store=delegate, job_id=job_id)).payload == second_payload
+        assert (await repository.artifact_reservation_for(job_id))["consumed_bytes"] == len(second_payload)
+        with pytest.raises(FileNotFoundError):
+            objects.read_source(
+                object_key=first.uri.removeprefix(f"s3://{bucket}/"),
+                sha256_digest=first.sha256,
+                size_bytes=len(first_payload),
+            )
+
+        failed = await queue.record_probe_measurement(
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            exit_code=1,
+            peak_allocated_mib=None,
+            peak_reserved_mib=None,
+            optimizer_steps=0,
+            checkpoint_resumed=False,
+            checkpoint_sha256=None,
+            inference_steps=0,
+            verification_details={"passed": False, "failure": "test_terminal_settlement"},
+        )
+        assert failed["result_state"] == "failed"
+        assert await _storage_bytes(task7_database_url) == baseline + len(second_payload)
+        objects.delete_object(object_key=second_prepared.object_key)
         await queue.close()
         await repository.close()
         await sources.close()
@@ -823,6 +1480,14 @@ def test_model_draft_assignment_reuses_atomic_task5_request_after_worker_or_even
                     candidate=True,
                 )
             )
+            async with queue_repository._pool.acquire() as connection:
+                await connection.execute(
+                    """UPDATE gods_mlops_resource_profiles
+                       SET profile_state='measured',measurement_id=$2::uuid
+                       WHERE phase='preparation' AND model_kind='detr' AND config_version=$1""",
+                    config_version,
+                    uuid4(),
+                )
             batch = await sources.prepare_annotation_batch(
                 [
                     AnnotationSourceSelection(
