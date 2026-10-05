@@ -24,6 +24,7 @@ dependencies = [
 gods-mlops = "gods_mlops.cli:main"
 gods-mlops-training-preflight = "gods_mlops.cli:training_preflight_main"
 gods-mlops-ingestion-api = "gods_mlops.ingestion.app:main"
+gods-mlops-resource-observer = "gods_mlops.jobs.observer:main"
 
 [dependency-groups]
 dev = ["pytest==8.4.2"]

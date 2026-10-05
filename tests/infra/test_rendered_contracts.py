@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 import subprocess
@@ -288,6 +289,90 @@ def test_label_studio_uses_private_postgres_backed_single_operator_service_and_s
     assert config["COLLECT_ANALYTICS"] == "false"
 
 
+def test_resource_observer_uses_pinned_ubuntu_ssh_identity_and_never_requests_a_gpu(
+    rendered_objects: list[dict],
+) -> None:
+    observer = _find_one(
+        rendered_objects,
+        kind="Deployment",
+        name="gods-mlops-resource-observer",
+    )
+    pod_spec = observer["spec"]["template"]["spec"]
+    assert pod_spec["nodeSelector"]["kubernetes.io/hostname"] == "vis-lab"
+    assert pod_spec["securityContext"]["runAsNonRoot"] is True
+    assert pod_spec["securityContext"]["runAsUser"] == 10001
+    assert pod_spec["securityContext"]["runAsGroup"] == 10001
+    containers = [*pod_spec.get("initContainers", []), *pod_spec["containers"]]
+    assert all("nvidia.com/gpu" not in json.dumps(container.get("resources", {})) for container in containers)
+
+    app = next(item for item in pod_spec["containers"] if item["name"] == "resource-observer")
+    env = {item["name"]: item for item in app["env"]}
+    for name, key in (
+        ("GODS_MLOPS_UBUNTU_SSH_TARGET", "GODS_MLOPS_UBUNTU_SSH_TARGET"),
+        ("GODS_MLOPS_UBUNTU_SSH_PORT", "GODS_MLOPS_UBUNTU_SSH_PORT"),
+        ("GODS_MLOPS_UBUNTU_GPU_UUID", "GODS_MLOPS_UBUNTU_GPU_UUID"),
+        ("GODS_MLOPS_UBUNTU_STORAGE_PATH", "GODS_MLOPS_UBUNTU_STORAGE_PATH"),
+        ("GODS_MLOPS_UBUNTU_SSH_IDENTITY_FILE", "GODS_MLOPS_UBUNTU_SSH_IDENTITY_FILE"),
+        ("GODS_MLOPS_UBUNTU_SSH_KNOWN_HOSTS", "GODS_MLOPS_UBUNTU_SSH_KNOWN_HOSTS"),
+        ("GODS_MLOPS_UBUNTU_SSH_TIMEOUT_SECONDS", "GODS_MLOPS_UBUNTU_SSH_TIMEOUT_SECONDS"),
+    ):
+        assert env[name]["valueFrom"]["configMapKeyRef"] == {
+            "name": "gods-mlops-ingestion-config",
+            "key": key,
+        }
+    assert _find_one(
+        rendered_objects, kind="ConfigMap", name="gods-mlops-ingestion-config"
+    )["data"]["GODS_MLOPS_UBUNTU_SSH_TARGET"] == "jayn2u@203.253.21.179"
+    assert _find_one(
+        rendered_objects, kind="ConfigMap", name="gods-mlops-ingestion-config"
+    )["data"]["GODS_MLOPS_UBUNTU_SSH_PORT"] == "2222"
+    assert env["GODS_MLOPS_DATABASE_URL"]["valueFrom"]["secretKeyRef"] == {
+        "name": "gods-mlops-ingestion-credentials",
+        "key": "DATABASE_URL",
+    }
+    assert any(
+        volume.get("secret", {}).get("secretName") == "gods-mlops-ubuntu-observer-ssh"
+        for volume in pod_spec["volumes"]
+    )
+
+    config = _find_one(
+        rendered_objects,
+        kind="ConfigMap",
+        name="gods-mlops-ingestion-config",
+    )["data"]
+    assert config["GODS_MLOPS_UBUNTU_GPU_UUID"] == "GPU-e5fd41ed-1688-8aca-3cd4-7904d53d764e"
+    assert config["GODS_MLOPS_UBUNTU_HOST_IDENTITY"] == (
+        "machine-sha256:05b2ebc4a41bc27dbadb661479ce1e6c4aa65320822ef05309079191ce5cc60a"
+    )
+    assert config["GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY"] == (
+        "ext4:uuid=fca206c4-c1d5-4138-a668-9d714ed3616b"
+    )
+    assert config["GODS_MLOPS_UBUNTU_STORAGE_PATH"] == "/data/jayn2u/gods-mlops"
+    assert int(config["GODS_MLOPS_UBUNTU_STORAGE_MIN_FREE_BYTES"]) == 1024**4
+
+
+def test_ingestion_deployment_consumes_the_same_fail_closed_resource_identity(
+    rendered_objects: list[dict],
+) -> None:
+    deployment = _find_one(rendered_objects, kind="Deployment", name="gods-mlops-ingestion")
+    app = next(
+        item for item in deployment["spec"]["template"]["spec"]["containers"]
+        if item["name"] == "ingestion-api"
+    )
+    env = {item["name"]: item for item in app["env"]}
+    for name, key in (
+        ("GODS_MLOPS_UBUNTU_HOST_IDENTITY", "GODS_MLOPS_UBUNTU_HOST_IDENTITY"),
+        ("GODS_MLOPS_UBUNTU_GPU_UUID", "GODS_MLOPS_UBUNTU_GPU_UUID"),
+        ("GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY", "GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY"),
+        ("GODS_MLOPS_UBUNTU_STORAGE_PATH", "GODS_MLOPS_UBUNTU_STORAGE_PATH"),
+        ("GODS_MLOPS_UBUNTU_STORAGE_MIN_FREE_BYTES", "GODS_MLOPS_UBUNTU_STORAGE_MIN_FREE_BYTES"),
+    ):
+        assert env[name]["valueFrom"]["configMapKeyRef"] == {
+            "name": "gods-mlops-ingestion-config",
+            "key": key,
+        }
+
+
 def test_label_studio_tmp_is_disposable_but_credentials_and_media_remain_retained(
     rendered_objects: list[dict],
 ) -> None:
@@ -354,7 +439,7 @@ def test_retention_cronjob_is_bounded_serial_and_uses_the_ingestion_image(
     assert pod["restartPolicy"] == "Never"
     assert pod["automountServiceAccountToken"] is False
     worker = pod["containers"][0]
-    assert worker["image"] == "gods-mlops-ingestion:0.2.0"
+    assert worker["image"] == "gods-mlops-ingestion:0.3.0"
     assert worker["command"] == ["python", "-m", "gods_mlops.retention.runner"]
     names = {entry["name"] for entry in worker["env"]}
     assert {

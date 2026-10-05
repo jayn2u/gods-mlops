@@ -1,0 +1,137 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gods-mlops-resource-observer
+  namespace: gods-mlops
+  labels:
+    app.kubernetes.io/name: gods-mlops-resource-observer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gods-mlops-resource-observer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gods-mlops-resource-observer
+    spec:
+      automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/hostname: vis-lab
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      initContainers:
+        - name: prepare-ssh-credentials
+          image: gods-mlops-ingestion:0.3.0
+          imagePullPolicy: Never
+          command:
+            - /bin/sh
+            - -ec
+            - install -m 0400 /ssh-source/id_ed25519 /run/ubuntu-ssh/id_ed25519 && install -m 0444 /ssh-source/known_hosts /run/ubuntu-ssh/known_hosts
+          volumeMounts:
+            - name: ssh-source
+              mountPath: /ssh-source
+              readOnly: true
+            - name: ssh-runtime
+              mountPath: /run/ubuntu-ssh
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      containers:
+        - name: resource-observer
+          image: gods-mlops-ingestion:0.3.0
+          imagePullPolicy: Never
+          command:
+            - python
+            - -m
+            - gods_mlops.jobs.observer
+          env:
+            - name: GODS_MLOPS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: gods-mlops-ingestion-credentials
+                  key: DATABASE_URL
+            - name: GODS_MLOPS_UBUNTU_SSH_TARGET
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: GODS_MLOPS_UBUNTU_SSH_TARGET
+            - name: GODS_MLOPS_UBUNTU_SSH_PORT
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: GODS_MLOPS_UBUNTU_SSH_PORT
+            - name: GODS_MLOPS_UBUNTU_GPU_UUID
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: GODS_MLOPS_UBUNTU_GPU_UUID
+            - name: GODS_MLOPS_UBUNTU_STORAGE_PATH
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: GODS_MLOPS_UBUNTU_STORAGE_PATH
+            - name: GODS_MLOPS_UBUNTU_SSH_IDENTITY_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: GODS_MLOPS_UBUNTU_SSH_IDENTITY_FILE
+            - name: GODS_MLOPS_UBUNTU_SSH_KNOWN_HOSTS
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: GODS_MLOPS_UBUNTU_SSH_KNOWN_HOSTS
+            - name: GODS_MLOPS_UBUNTU_SSH_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: GODS_MLOPS_UBUNTU_SSH_TIMEOUT_SECONDS
+          volumeMounts:
+            - name: ssh-runtime
+              mountPath: /run/ubuntu-ssh
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 384Mi
+      volumes:
+        - name: ssh-source
+          secret:
+            secretName: gods-mlops-ubuntu-observer-ssh
+            defaultMode: 0440
+            items:
+              - key: id_ed25519
+                path: id_ed25519
+              - key: known_hosts
+                path: known_hosts
+        - name: ssh-runtime
+          emptyDir:
+            medium: Memory
+            sizeLimit: 2Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi

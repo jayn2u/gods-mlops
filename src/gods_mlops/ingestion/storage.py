@@ -227,6 +227,36 @@ class PostgresIngestionRepository:
                     raise SampleConflictError("sample ID is already bound to different bytes")
                 return _reservation(existing, created=False)
 
+    async def lookup_existing_receipt(self, metadata: CandidateMetadata) -> SampleReceipt | None:
+        """Return a durable prior receipt before applying any new-collection gate."""
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT sample_id, sha256, receipt_id, object_key, state
+                FROM ingestion_samples WHERE sample_id = $1
+                """,
+                metadata.sample_id,
+            )
+        if row is None:
+            return None
+        if row["sha256"] != metadata.sha256:
+            raise SampleConflictError("sample ID is already bound to different bytes")
+        if row["state"] == "received":
+            return SampleReceipt(
+                sample_id=row["sample_id"],
+                sha256=row["sha256"].strip(),
+                receipt_id=row["receipt_id"],
+                object_key=row["object_key"],
+            )
+        if row["state"] == "expired":
+            raise SampleExpiredError("sample object has expired and is no longer available")
+        if row["state"] == "purge_pending":
+            raise SampleStorageError("sample is being removed by the retention owner")
+        if row["state"] == "storage_limited":
+            raise GlobalObjectLimitError("candidate object store has reached its global capacity")
+        return None
+
     async def mark_received(self, sample_id: UUID) -> SampleReceipt:
         """Commit a receipt after S3 verification; repeat commits return the same receipt."""
         pool = await self._get_pool()

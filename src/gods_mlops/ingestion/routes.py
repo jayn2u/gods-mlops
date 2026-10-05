@@ -10,6 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from pydantic import ValidationError
 
+from .collection_gate import CollectionPausedError
 from .schemas import (
     CandidateMetadata,
     CandidateReason,
@@ -80,6 +81,12 @@ def build_ingestion_router(*, service: IngestionService, bearer_token: str) -> A
             ) from error
         try:
             return await service.receive(metadata, image_bytes)
+        except CollectionPausedError as error:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=error.as_detail(),
+                headers={"Retry-After": "5"},
+            ) from error
         except SampleConflictError as error:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,

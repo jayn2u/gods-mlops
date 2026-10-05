@@ -9,6 +9,8 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from gods_mlops.jobs.queue import PostgresJobQueueRepository
+from .collection_gate import CollectionStorageGate, MIN_UBUNTU_FILESYSTEM_FREE_BYTES
 from .routes import build_ingestion_router
 from .service import IngestionService
 from .storage import PostgresIngestionRepository, S3SampleStore
@@ -26,6 +28,11 @@ class IngestionSettings:
     s3_bucket: str
     s3_region: str
     bearer_token: str
+    ubuntu_host_identity: str | None = None
+    ubuntu_gpu_uuid: str | None = None
+    ubuntu_filesystem_identity: str | None = None
+    ubuntu_storage_path: str | None = None
+    ubuntu_storage_min_free_bytes: int = MIN_UBUNTU_FILESYSTEM_FREE_BYTES
     bind_host: str = "0.0.0.0"
     port: int = 8080
 
@@ -47,15 +54,30 @@ def build_app(
         bucket=settings.s3_bucket,
         region=settings.s3_region,
     )
-    ingestion = IngestionService(repository=database, objects=object_store)
+    resource_observations = PostgresJobQueueRepository(database_url=settings.database_url)
+    collection_gate = CollectionStorageGate(
+        repository=resource_observations,
+        expected_host_identity=settings.ubuntu_host_identity,
+        expected_gpu_uuid=settings.ubuntu_gpu_uuid,
+        expected_filesystem_identity=settings.ubuntu_filesystem_identity,
+        expected_storage_path=settings.ubuntu_storage_path,
+        min_free_bytes=settings.ubuntu_storage_min_free_bytes,
+    )
+    ingestion = IngestionService(
+        repository=database,
+        objects=object_store,
+        collection_gate=collection_gate,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await database.ensure_schema()
+        await resource_observations.ensure_schema()
         try:
             yield
         finally:
             await database.close()
+            await resource_observations.close()
 
     app = FastAPI(title="Gods candidate ingestion", lifespan=lifespan)
     app.include_router(build_ingestion_router(service=ingestion, bearer_token=settings.bearer_token))
@@ -81,6 +103,13 @@ def _settings_from_environment() -> IngestionSettings:
         s3_bucket=_required("GODS_MLOPS_S3_BUCKET"),
         s3_region=os.environ.get("GODS_MLOPS_S3_REGION", "us-east-1"),
         bearer_token=_required("GODS_MLOPS_INGESTION_TOKEN"),
+        ubuntu_host_identity=os.environ.get("GODS_MLOPS_UBUNTU_HOST_IDENTITY"),
+        ubuntu_gpu_uuid=os.environ.get("GODS_MLOPS_UBUNTU_GPU_UUID"),
+        ubuntu_filesystem_identity=os.environ.get("GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY"),
+        ubuntu_storage_path=os.environ.get("GODS_MLOPS_UBUNTU_STORAGE_PATH"),
+        ubuntu_storage_min_free_bytes=int(
+            os.environ.get("GODS_MLOPS_UBUNTU_STORAGE_MIN_FREE_BYTES", str(MIN_UBUNTU_FILESYSTEM_FREE_BYTES))
+        ),
         bind_host=os.environ.get("GODS_MLOPS_BIND_HOST", "0.0.0.0"),
         port=int(os.environ.get("GODS_MLOPS_PORT", "8080")),
     )

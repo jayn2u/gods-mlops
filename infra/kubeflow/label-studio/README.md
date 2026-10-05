@@ -7,8 +7,8 @@ The `label-studio` Kustomize component deploys the immutable Label Studio Commun
 Build and import the Task 5 receiver/retention image, which also supplies the same-Pod media cleanup sidecar:
 
 ```sh
-docker build -f infra/kubeflow/ingestion/Dockerfile -t gods-mlops-ingestion:0.2.0 .
-docker save gods-mlops-ingestion:0.2.0 -o /tmp/gods-mlops-ingestion-0.2.0.tar
+docker build -f infra/kubeflow/ingestion/Dockerfile -t gods-mlops-ingestion:0.3.0 .
+docker save gods-mlops-ingestion:0.3.0 -o /tmp/gods-mlops-ingestion-0.3.0.tar
 ```
 
 The Label Studio image is locked in `infra/versions.lock.yaml`; import the exact `heartexlabs/label-studio:1.23.2@sha256:afcc516a22775a39d0d66f4c2ddc95d01be3e3d3862b21fcf4f9de34b4ad4e12` image before applying Kustomize. Both workloads use `imagePullPolicy: Never` so an absent local image fails closed.

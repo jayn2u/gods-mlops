@@ -111,7 +111,7 @@ spec:
             - name: tmp
               mountPath: /tmp
         - name: media-cleanup
-          image: gods-mlops-ingestion:0.2.0
+          image: gods-mlops-ingestion:0.3.0
           imagePullPolicy: Never
           command:
             - python

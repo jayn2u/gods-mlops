@@ -9,6 +9,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /opt/gods-mlops
 COPY --from=uv-tools /uv /uvx /usr/local/bin/
 COPY pyproject.toml uv.lock ./
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y openssh-client=1:9.2p1-2+deb12u10 \
+    && rm -rf /var/lib/apt/lists/*
 RUN uv export --locked --no-dev --no-emit-project --no-hashes --output-file /tmp/uv-constraints.txt
 COPY infra/kubeflow/ingestion/requirements.txt /tmp/ingestion-requirements.txt
 RUN pip install --no-cache-dir --constraint /tmp/uv-constraints.txt --requirement /tmp/ingestion-requirements.txt \
@@ -20,6 +23,7 @@ COPY src/gods_mlops/annotations /opt/gods-mlops/gods_mlops/annotations
 COPY src/gods_mlops/datasets /opt/gods-mlops/gods_mlops/datasets
 COPY src/gods_mlops/migrations /opt/gods-mlops/gods_mlops/migrations
 COPY src/gods_mlops/retention /opt/gods-mlops/gods_mlops/retention
+COPY src/gods_mlops/jobs /opt/gods-mlops/gods_mlops/jobs
 
 ENV PYTHONPATH=/opt/gods-mlops
 USER 10001:10001

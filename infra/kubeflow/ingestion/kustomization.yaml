@@ -5,3 +5,4 @@ resources:
   - config.yaml
   - database.yaml
   - api.yaml
+  - observer.yaml

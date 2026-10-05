@@ -23,6 +23,9 @@ training:
   pillow: 12.0.0
   safetensors: 0.7.0
 
+runtime_tools:
+  debian_bookworm_openssh_client: "1:9.2p1-2+deb12u10"
+
 storage:
   engine: SeaweedFS
   version: "4.47"

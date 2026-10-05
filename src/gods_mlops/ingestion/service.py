@@ -17,6 +17,7 @@ from .schemas import (
     GlobalObjectLimitError,
     SampleExpiredError,
 )
+from .collection_gate import CollectionStorageGate
 from .storage import PostgresIngestionRepository, S3SampleStore, sample_object_key
 
 
@@ -59,9 +60,11 @@ class IngestionService:
         *,
         repository: IngestionRepository,
         objects: SampleObjectStore,
+        collection_gate: CollectionStorageGate | None = None,
     ) -> None:
         self._repository = repository
         self._objects = objects
+        self._collection_gate = collection_gate
 
     async def receive(self, metadata: CandidateMetadata, image: bytes) -> SampleReceipt:
         """Persist quota+metadata, verify the immutable object, and then issue receipt."""
@@ -69,6 +72,13 @@ class IngestionService:
             raise ValueError("sample image must not be empty")
         if sha256(image).hexdigest() != metadata.sha256:
             raise ValueError("sample image does not match its declared SHA-256")
+        lookup_receipt = getattr(self._repository, "lookup_existing_receipt", None)
+        if lookup_receipt is not None:
+            existing_receipt = await lookup_receipt(metadata)
+            if existing_receipt is not None:
+                return existing_receipt
+        if self._collection_gate is not None:
+            await self._collection_gate.ensure_available()
         object_key = sample_object_key(metadata)
         reservation = await self._repository.reserve(metadata, object_key, len(image))
         if reservation.sha256 != metadata.sha256:

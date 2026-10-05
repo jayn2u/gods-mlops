@@ -37,7 +37,7 @@ spec:
             runAsGroup: 10001
           containers:
             - name: retention
-              image: gods-mlops-ingestion:0.2.0
+              image: gods-mlops-ingestion:0.3.0
               imagePullPolicy: Never
               command:
                 - python
