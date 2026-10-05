@@ -24,7 +24,7 @@ from gods_mlops.ingestion.schemas import (
     SampleReceipt,
     SampleStorageError,
 )
-from gods_mlops.ingestion.app import IngestionSettings, build_app
+from gods_mlops.ingestion.app import IngestionSettings, _settings_from_environment, build_app
 from gods_mlops.ingestion.service import IngestionService
 from gods_mlops.ingestion.schemas import CandidateReason
 from gods_mlops.ingestion.storage import PostgresIngestionRepository, S3SampleStore
@@ -53,6 +53,28 @@ def _configured_backends(
         region="us-east-1",
     )
     return repository, objects, database_url
+
+
+def test_ingestion_settings_loads_the_explicit_observer_node_identity(monkeypatch) -> None:
+    values = {
+        "GODS_MLOPS_DATABASE_URL": "postgresql://gods_task7:unused@127.0.0.1:15438/postgres",
+        "GODS_MLOPS_S3_ENDPOINT_URL": "http://127.0.0.1:8333",
+        "GODS_MLOPS_S3_ACCESS_KEY": "test-access-key",
+        "GODS_MLOPS_S3_SECRET_KEY": "test-secret-key",
+        "GODS_MLOPS_S3_BUCKET": "gods-samples",
+        "GODS_MLOPS_INGESTION_TOKEN": "test-token-0123456789abcdef0123456789abcdef",
+        "GODS_MLOPS_UBUNTU_NODE_ID": "ubuntu",
+        "GODS_MLOPS_UBUNTU_HOST_IDENTITY": "machine-sha256:task7-test-ubuntu",
+        "GODS_MLOPS_UBUNTU_GPU_UUID": "GPU-e5fd41ed-1688-8aca-3cd4-7904d53d764e",
+        "GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY": "ext4:uuid=task7-test-data",
+        "GODS_MLOPS_UBUNTU_STORAGE_PATH": "/data/jayn2u/gods-mlops",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+    settings = _settings_from_environment()
+
+    assert getattr(settings, "ubuntu_node_id", None) == "ubuntu"
 
 
 def test_postgres_accepts_a_valid_64_character_sample_sha256() -> None:

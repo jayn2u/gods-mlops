@@ -64,6 +64,16 @@ spec:
                 secretKeyRef:
                   name: gods-mlops-ingestion-credentials
                   key: DATABASE_URL
+            - name: GODS_MLOPS_UBUNTU_NODE_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: GODS_MLOPS_UBUNTU_NODE_ID
+            - name: GODS_MLOPS_UBUNTU_HOST_IDENTITY
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: GODS_MLOPS_UBUNTU_HOST_IDENTITY
             - name: GODS_MLOPS_UBUNTU_SSH_TARGET
               valueFrom:
                 configMapKeyRef:
@@ -79,6 +89,11 @@ spec:
                 configMapKeyRef:
                   name: gods-mlops-ingestion-config
                   key: GODS_MLOPS_UBUNTU_GPU_UUID
+            - name: GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY
             - name: GODS_MLOPS_UBUNTU_STORAGE_PATH
               valueFrom:
                 configMapKeyRef:

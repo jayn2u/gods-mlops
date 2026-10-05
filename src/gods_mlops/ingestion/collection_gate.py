@@ -38,6 +38,7 @@ class CollectionStorageGate:
         self,
         *,
         repository: PostgresJobQueueRepository,
+        expected_node_id: str | None = "ubuntu",
         expected_host_identity: str | None,
         expected_gpu_uuid: str | None,
         expected_filesystem_identity: str | None,
@@ -47,6 +48,7 @@ class CollectionStorageGate:
         clock=None,
     ) -> None:
         self._repository = repository
+        self._expected_node_id = expected_node_id
         self._expected_host_identity = expected_host_identity
         self._expected_gpu_uuid = expected_gpu_uuid
         self._expected_filesystem_identity = expected_filesystem_identity
@@ -58,6 +60,7 @@ class CollectionStorageGate:
         self._clock = clock or (lambda: datetime.now(UTC))
         if all(
             (
+                expected_node_id,
                 expected_host_identity,
                 expected_gpu_uuid,
                 expected_filesystem_identity,
@@ -65,6 +68,7 @@ class CollectionStorageGate:
             )
         ):
             self._repository.configure_observation_identity(
+                expected_node_id=expected_node_id,
                 expected_host_identity=expected_host_identity,
                 expected_gpu_uuid=expected_gpu_uuid,
                 expected_filesystem_identity=expected_filesystem_identity,
@@ -74,6 +78,7 @@ class CollectionStorageGate:
     async def ensure_available(self) -> ResourceObservation:
         if not all(
             (
+                self._expected_node_id,
                 self._expected_host_identity,
                 self._expected_gpu_uuid,
                 self._expected_filesystem_identity,
@@ -81,7 +86,8 @@ class CollectionStorageGate:
             )
         ):
             raise CollectionPausedError("ubuntu_observer_identity_not_configured")
-        state = await self._repository.get_observation_state("ubuntu")
+        assert self._expected_node_id is not None
+        state = await self._repository.get_observation_state(self._expected_node_id)
         if state is None or state["observation"] is None or state["failure_code"] is not None:
             failure = state["failure_code"] if state is not None else None
             raise CollectionPausedError(
@@ -100,7 +106,7 @@ class CollectionStorageGate:
                 details={"age_seconds": round(age_seconds, 3)},
             )
         if (
-            observation.node_id != "ubuntu"
+            observation.node_id != self._expected_node_id
             or observation.hostname.lower() != "ubuntu"
             or observation.host_identity != self._expected_host_identity
             or observation.gpu_uuid != self._expected_gpu_uuid

@@ -62,6 +62,7 @@ class PostgresJobQueueRepository:
         self,
         *,
         database_url: str,
+        expected_node_id: str | None = "ubuntu",
         expected_host_identity: str | None = None,
         expected_gpu_uuid: str | None = None,
         expected_filesystem_identity: str | None = None,
@@ -71,6 +72,7 @@ class PostgresJobQueueRepository:
         self._database_url = database_url
         self._pool: asyncpg.Pool | None = None
         self._schema_ready = False
+        self._expected_node_id = expected_node_id
         self._expected_observation_identity: tuple[str, ...] | None = None
         self._observation_max_age_seconds = observation_max_age_seconds
         supplied = (
@@ -80,9 +82,10 @@ class PostgresJobQueueRepository:
             expected_storage_path,
         )
         if any(value is not None for value in supplied):
-            if not all(value for value in supplied):
+            if not expected_node_id or not all(value for value in supplied):
                 raise ValueError("trusted Ubuntu observation identity must be configured completely")
             self.configure_observation_identity(
+                expected_node_id=expected_node_id,
                 expected_host_identity=expected_host_identity,
                 expected_gpu_uuid=expected_gpu_uuid,
                 expected_filesystem_identity=expected_filesystem_identity,
@@ -94,6 +97,7 @@ class PostgresJobQueueRepository:
     def configure_observation_identity(
         self,
         *,
+        expected_node_id: str | None = "ubuntu",
         expected_host_identity: str | None,
         expected_gpu_uuid: str | None,
         expected_filesystem_identity: str | None,
@@ -101,6 +105,7 @@ class PostgresJobQueueRepository:
     ) -> None:
         """Pin the trusted observer identity before either admission or producer writes."""
         values = (
+            expected_node_id,
             expected_host_identity,
             expected_gpu_uuid,
             expected_filesystem_identity,
@@ -109,7 +114,7 @@ class PostgresJobQueueRepository:
         if not all(isinstance(value, str) and value.strip() for value in values):
             raise ValueError("trusted Ubuntu observation identity must be configured completely")
         identity = (
-            "ubuntu",
+            expected_node_id,
             "ubuntu",
             "NVIDIA RTX A6000",
             expected_host_identity,
@@ -119,7 +124,14 @@ class PostgresJobQueueRepository:
         )
         if self._expected_observation_identity is not None and self._expected_observation_identity != identity:
             raise ValueError("repository is already pinned to another Ubuntu observation identity")
+        if self._expected_node_id is not None and self._expected_node_id != expected_node_id:
+            raise ValueError("repository is already pinned to another Ubuntu observation node")
+        self._expected_node_id = expected_node_id
         self._expected_observation_identity = identity
+
+    @property
+    def expected_node_id(self) -> str:
+        return self._expected_node_id or "ubuntu"
 
     @staticmethod
     async def _lock_job_then_lease(
@@ -417,7 +429,7 @@ class PostgresJobQueueRepository:
         received_at = received_at or datetime.now(UTC)
         reason = self._observation_rejection_reason(observation, received_at)
         if reason is not None:
-            await self.record_observation_failure(node_id="ubuntu", failure_code=reason)
+            await self.record_observation_failure(node_id=self.expected_node_id, failure_code=reason)
             raise ResourceObservationRejectedError(reason)
         pool = await self._get_pool()
         payload = _canonical_json(observation.to_dict())
@@ -426,7 +438,8 @@ class PostgresJobQueueRepository:
         async with pool.acquire() as connection:
             async with connection.transaction():
                 current = await connection.fetchrow(
-                    "SELECT * FROM gods_mlops_gpu_observation_current WHERE node_id = 'ubuntu' FOR UPDATE"
+                    "SELECT * FROM gods_mlops_gpu_observation_current WHERE node_id = $1 FOR UPDATE",
+                    self.expected_node_id,
                 )
                 if current is not None:
                     if str(current["observation_id"]) == observation.observation_id:
@@ -446,6 +459,7 @@ class PostgresJobQueueRepository:
                 if rejected is not None:
                     await self._record_observation_failure_in_transaction(
                         connection,
+                        node_id=self.expected_node_id,
                         failure_code=str(rejected),
                     )
                 else:
@@ -470,7 +484,7 @@ class PostgresJobQueueRepository:
                             node_id, observation_id, observed_at, received_at, observation,
                             failure_code, failure_count, idle_since, idle_observation_count,
                             last_observed_at
-                        ) VALUES ('ubuntu', $1::uuid, $2, now(), $3::jsonb, NULL, 0, $4, $5, $2)
+                        ) VALUES ($1, $2::uuid, $3, now(), $4::jsonb, NULL, 0, $5, $6, $3)
                         ON CONFLICT (node_id) DO UPDATE SET
                             observation_id = EXCLUDED.observation_id,
                             observed_at = EXCLUDED.observed_at,
@@ -483,6 +497,7 @@ class PostgresJobQueueRepository:
                             last_observed_at = EXCLUDED.last_observed_at
                         RETURNING *
                         """,
+                        self.expected_node_id,
                         observation.observation_id,
                         observation.observed_at,
                         payload,
@@ -540,6 +555,7 @@ class PostgresJobQueueRepository:
         self,
         connection: asyncpg.Connection,
         *,
+        node_id: str,
         failure_code: str,
     ) -> None:
         await connection.execute(
@@ -547,13 +563,14 @@ class PostgresJobQueueRepository:
             INSERT INTO gods_mlops_gpu_observation_current (
                 node_id, observation_id, observed_at, received_at, observation,
                 failure_code, failure_count, idle_since, idle_observation_count, last_observed_at
-            ) VALUES ('ubuntu', $1::uuid, now(), now(), NULL, $2, 1, NULL, 0, NULL)
+            ) VALUES ($1, $2::uuid, now(), now(), NULL, $3, 1, NULL, 0, NULL)
             ON CONFLICT (node_id) DO UPDATE SET
                 observation_id=EXCLUDED.observation_id, observed_at=EXCLUDED.observed_at,
                 received_at=now(), observation=NULL, failure_code=EXCLUDED.failure_code,
                 failure_count=gods_mlops_gpu_observation_current.failure_count+1,
                 idle_since=NULL, idle_observation_count=0, last_observed_at=NULL
             """,
+            node_id,
             uuid4(),
             failure_code[:128],
         )
@@ -595,7 +612,8 @@ class PostgresJobQueueRepository:
             )
         return _observation_state_dict(row) if row is not None else None
 
-    async def latest_observation(self, node_id: str = "ubuntu") -> ResourceObservation | None:
+    async def latest_observation(self, node_id: str | None = None) -> ResourceObservation | None:
+        node_id = node_id or self.expected_node_id
         state = await self.get_observation_state(node_id)
         if state is None or state["failure_code"] is not None or state["observation"] is None:
             return None

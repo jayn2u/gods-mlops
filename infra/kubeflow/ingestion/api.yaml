@@ -82,6 +82,11 @@ spec:
                 secretKeyRef:
                   name: gods-mlops-ingestion-credentials
                   key: INGESTION_TOKEN
+            - name: GODS_MLOPS_UBUNTU_NODE_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: GODS_MLOPS_UBUNTU_NODE_ID
             - name: GODS_MLOPS_UBUNTU_HOST_IDENTITY
               valueFrom:
                 configMapKeyRef:

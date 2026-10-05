@@ -308,15 +308,18 @@ def test_resource_observer_uses_pinned_ubuntu_ssh_identity_and_never_requests_a_
     app = next(item for item in pod_spec["containers"] if item["name"] == "resource-observer")
     env = {item["name"]: item for item in app["env"]}
     for name, key in (
+        ("GODS_MLOPS_UBUNTU_NODE_ID", "GODS_MLOPS_UBUNTU_NODE_ID"),
+        ("GODS_MLOPS_UBUNTU_HOST_IDENTITY", "GODS_MLOPS_UBUNTU_HOST_IDENTITY"),
         ("GODS_MLOPS_UBUNTU_SSH_TARGET", "GODS_MLOPS_UBUNTU_SSH_TARGET"),
         ("GODS_MLOPS_UBUNTU_SSH_PORT", "GODS_MLOPS_UBUNTU_SSH_PORT"),
         ("GODS_MLOPS_UBUNTU_GPU_UUID", "GODS_MLOPS_UBUNTU_GPU_UUID"),
+        ("GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY", "GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY"),
         ("GODS_MLOPS_UBUNTU_STORAGE_PATH", "GODS_MLOPS_UBUNTU_STORAGE_PATH"),
         ("GODS_MLOPS_UBUNTU_SSH_IDENTITY_FILE", "GODS_MLOPS_UBUNTU_SSH_IDENTITY_FILE"),
         ("GODS_MLOPS_UBUNTU_SSH_KNOWN_HOSTS", "GODS_MLOPS_UBUNTU_SSH_KNOWN_HOSTS"),
         ("GODS_MLOPS_UBUNTU_SSH_TIMEOUT_SECONDS", "GODS_MLOPS_UBUNTU_SSH_TIMEOUT_SECONDS"),
     ):
-        assert env[name]["valueFrom"]["configMapKeyRef"] == {
+        assert env.get(name, {}).get("valueFrom", {}).get("configMapKeyRef") == {
             "name": "gods-mlops-ingestion-config",
             "key": key,
         }
@@ -326,6 +329,9 @@ def test_resource_observer_uses_pinned_ubuntu_ssh_identity_and_never_requests_a_
     assert _find_one(
         rendered_objects, kind="ConfigMap", name="gods-mlops-ingestion-config"
     )["data"]["GODS_MLOPS_UBUNTU_SSH_PORT"] == "2222"
+    assert _find_one(
+        rendered_objects, kind="ConfigMap", name="gods-mlops-ingestion-config"
+    )["data"]["GODS_MLOPS_UBUNTU_NODE_ID"] == "ubuntu"
     assert env["GODS_MLOPS_DATABASE_URL"]["valueFrom"]["secretKeyRef"] == {
         "name": "gods-mlops-ingestion-credentials",
         "key": "DATABASE_URL",
@@ -361,13 +367,14 @@ def test_ingestion_deployment_consumes_the_same_fail_closed_resource_identity(
     )
     env = {item["name"]: item for item in app["env"]}
     for name, key in (
+        ("GODS_MLOPS_UBUNTU_NODE_ID", "GODS_MLOPS_UBUNTU_NODE_ID"),
         ("GODS_MLOPS_UBUNTU_HOST_IDENTITY", "GODS_MLOPS_UBUNTU_HOST_IDENTITY"),
         ("GODS_MLOPS_UBUNTU_GPU_UUID", "GODS_MLOPS_UBUNTU_GPU_UUID"),
         ("GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY", "GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY"),
         ("GODS_MLOPS_UBUNTU_STORAGE_PATH", "GODS_MLOPS_UBUNTU_STORAGE_PATH"),
         ("GODS_MLOPS_UBUNTU_STORAGE_MIN_FREE_BYTES", "GODS_MLOPS_UBUNTU_STORAGE_MIN_FREE_BYTES"),
     ):
-        assert env[name]["valueFrom"]["configMapKeyRef"] == {
+        assert env.get(name, {}).get("valueFrom", {}).get("configMapKeyRef") == {
             "name": "gods-mlops-ingestion-config",
             "key": key,
         }

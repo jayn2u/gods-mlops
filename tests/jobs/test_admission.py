@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Callable
 from uuid import uuid4
 
+import pytest
 from conftest import seed_training_ready_dataset
 from gods_mlops.jobs.admission import GpuAdmission
 from gods_mlops.jobs.models import ExecutionProfile, ProcessIdentity, ResourceObservation
@@ -358,6 +359,227 @@ def test_incomplete_process_observation_is_not_treated_as_gpu_idle(task7_databas
         assert incomplete["state"] == "waiting_gpu"
         assert incomplete["reason_code"] == "ubuntu_observation_incomplete"
         assert await repository.get_active_lease(GPU_UUID) is None
+        await queue.close()
+        await repository.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("invalid_kind", "reason_code"),
+    [
+        ("missing", "ubuntu_observation_unavailable"),
+        ("stale", "ubuntu_observation_stale"),
+        ("identity", "ubuntu_observation_identity_mismatch"),
+        ("incomplete", "ubuntu_observation_incomplete"),
+    ],
+)
+def test_public_invalid_snapshot_resets_history_and_requires_a_new_idle_window(
+    task7_database_url: str,
+    invalid_kind: str,
+    reason_code: str,
+) -> None:
+    async def exercise() -> None:
+        repository, queue, job_id = await _queue_with_probe(task7_database_url)
+        now = [BASE_TIME]
+
+        class FreshObserver:
+            async def observe(self) -> dict:
+                return _observation(now[0] + timedelta(milliseconds=100))
+
+        admission = _admission(repository, queue, now, observer=FreshObserver())
+        for offset in (0, 5, 10, 15):
+            now[0] = BASE_TIME + timedelta(seconds=offset)
+            waiting = await admission.admit(job_id, _observation(now[0]))
+        assert waiting["reason_code"] == "idle_observation_window"
+        prior = await repository.get_observation_state("ubuntu")
+        assert prior["idle_observation_count"] == 4
+
+        now[0] = BASE_TIME + timedelta(seconds=20)
+        invalid: dict
+        if invalid_kind == "missing":
+            invalid = {}
+        elif invalid_kind == "stale":
+            invalid = _observation(now[0] - timedelta(minutes=1))
+        elif invalid_kind == "identity":
+            invalid = _observation(now[0], host_identity="machine-sha256:untrusted")
+        else:
+            invalid = _observation(now[0], process_table_complete=False)
+        rejected = await admission.admit(job_id, invalid)
+        assert rejected["state"] == "waiting_gpu"
+        assert rejected["reason_code"] == reason_code
+        broken = await repository.get_observation_state("ubuntu")
+        assert broken["failure_code"] == reason_code
+        assert broken["idle_since"] is None
+        assert broken["idle_observation_count"] == 0
+
+        restarted = PostgresJobQueueRepository(database_url=task7_database_url)
+        durable = await restarted.get_observation_state("ubuntu")
+        assert durable["failure_code"] == reason_code
+        assert durable["idle_since"] is None
+        assert durable["idle_observation_count"] == 0
+        await restarted.close()
+
+        now[0] = BASE_TIME + timedelta(seconds=25)
+        next_valid = _observation(now[0])
+        waiting = await admission.admit(job_id, next_valid)
+        assert waiting["reason_code"] == "idle_observation_window"
+        restarted_window = await repository.get_observation_state("ubuntu")
+        assert restarted_window["failure_code"] is None
+        assert restarted_window["idle_since"] == next_valid["observed_at"]
+        assert restarted_window["idle_observation_count"] == 1
+
+        for offset in (30, 35, 40, 45, 50):
+            now[0] = BASE_TIME + timedelta(seconds=offset)
+            waiting = await admission.admit(job_id, _observation(now[0]))
+        assert waiting["reason_code"] == "idle_observation_window"
+        assert (await repository.get_observation_state("ubuntu"))["idle_observation_count"] == 6
+        assert await repository.get_active_lease(GPU_UUID) is None
+
+        now[0] = BASE_TIME + timedelta(seconds=55)
+        acquired = await admission.admit(job_id, _observation(now[0]))
+        assert acquired["state"] == "running"
+        assert (await repository.get_active_lease(GPU_UUID))["job_id"] == job_id
+        await queue.close()
+        await repository.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("failure_kind", ["missing", "raises", "stale", "identity", "incomplete"])
+def test_failed_normal_observer_read_resets_history_before_returning(
+    task7_database_url: str,
+    failure_kind: str,
+) -> None:
+    async def exercise() -> None:
+        repository, queue, job_id = await _queue_with_probe(task7_database_url)
+        now = [BASE_TIME]
+
+        class Observer:
+            async def observe(self):
+                if failure_kind == "raises":
+                    raise RuntimeError("observer command failed")
+                if failure_kind == "stale":
+                    return _observation(now[0] - timedelta(minutes=1))
+                if failure_kind == "identity":
+                    return _observation(now[0], filesystem_identity="ext4:uuid:wrong")
+                if failure_kind == "incomplete":
+                    return _observation(now[0], gpu_process_list_complete=False)
+                return _observation(now[0])
+
+        for offset in (0, 5, 10):
+            now[0] = BASE_TIME + timedelta(seconds=offset)
+            await _admission(repository, queue, now).admit(job_id, _observation(now[0]))
+        assert (await repository.get_observation_state("ubuntu"))["idle_observation_count"] == 3
+
+        admission = _admission(
+            repository,
+            queue,
+            now,
+            observer=None if failure_kind == "missing" else Observer(),
+        )
+        with pytest.raises(Exception):
+            await admission.observe_once()
+        failed = await repository.get_observation_state("ubuntu")
+        assert failed["failure_code"] is not None
+        assert failed["idle_since"] is None
+        assert failed["idle_observation_count"] == 0
+
+        now[0] = BASE_TIME + timedelta(seconds=15)
+        result = await admission.admit(job_id, _observation(now[0]))
+        assert result["reason_code"] == "idle_observation_window"
+        restarted = await repository.get_observation_state("ubuntu")
+        assert restarted["idle_since"] == _observation(now[0])["observed_at"]
+        assert restarted["idle_observation_count"] == 1
+        await queue.close()
+        await repository.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("prelaunch_failure", ["missing", "raises", "stale", "identity", "incomplete"])
+def test_failed_prelaunch_observer_read_resets_history_before_waiting(
+    task7_database_url: str,
+    prelaunch_failure: str,
+) -> None:
+    async def exercise() -> None:
+        repository, queue, job_id = await _queue_with_probe(task7_database_url)
+        now = [BASE_TIME]
+
+        class Observer:
+            async def observe(self):
+                if prelaunch_failure == "raises":
+                    raise RuntimeError("observer command failed")
+                if prelaunch_failure == "stale":
+                    return _observation(now[0] - timedelta(minutes=1))
+                if prelaunch_failure == "identity":
+                    return _observation(now[0], host_identity="machine-sha256:untrusted")
+                if prelaunch_failure == "incomplete":
+                    return _observation(now[0], process_table_complete=False)
+                return _observation(now[0] + timedelta(milliseconds=100))
+
+        admission = _admission(
+            repository,
+            queue,
+            now,
+            observer=None if prelaunch_failure == "missing" else Observer(),
+        )
+        for offset in range(0, 31, 5):
+            now[0] = BASE_TIME + timedelta(seconds=offset)
+            waiting = await admission.admit(job_id, _observation(now[0]))
+        assert waiting["state"] == "waiting_gpu"
+        failed = await repository.get_observation_state("ubuntu")
+        assert failed["failure_code"] is not None
+        assert failed["idle_since"] is None
+        assert failed["idle_observation_count"] == 0
+        assert await repository.get_active_lease(GPU_UUID) is None
+
+        now[0] = BASE_TIME + timedelta(seconds=35)
+        fresh = _observation(now[0])
+        waiting = await admission.admit(job_id, fresh)
+        assert waiting["reason_code"] == "idle_observation_window"
+        reset = await repository.get_observation_state("ubuntu")
+        assert reset["failure_code"] is None
+        assert reset["idle_since"] == fresh["observed_at"]
+        assert reset["idle_observation_count"] == 1
+        await queue.close()
+        await repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_invalid_public_observation_keeps_a_live_yield_signal_and_fence(
+    task7_database_url: str,
+) -> None:
+    async def exercise() -> None:
+        repository, queue, job_id = await _queue_with_probe(task7_database_url)
+        now = [BASE_TIME]
+
+        class FreshObserver:
+            async def observe(self) -> dict:
+                return _observation(now[0] + timedelta(milliseconds=100))
+
+        admission = _admission(repository, queue, now, observer=FreshObserver())
+        for offset in range(0, 31, 5):
+            now[0] = BASE_TIME + timedelta(seconds=offset)
+            result = await admission.admit(job_id, _observation(now[0]))
+        assert result["state"] == "running"
+        token = result["lease_token"]
+        assert await queue.bind_process(job_id, token, OWNER)
+        await queue.request_yield(job_id, reason="external_gpu_process_started")
+
+        invalid = await admission.admit(job_id, {})
+        current = await queue.get(job_id)
+        active = await repository.get_active_lease(GPU_UUID)
+        state = await repository.get_observation_state("ubuntu")
+        assert invalid["state"] == "yield_requested"
+        assert current["state"] == "yield_requested"
+        assert current["lease_token"] == token
+        assert current["owner_pid"] == OWNER.pid
+        assert active["lease_token"] == token
+        assert state["failure_code"] == "ubuntu_observation_unavailable"
+        assert state["idle_since"] is None
+        assert state["idle_observation_count"] == 0
         await queue.close()
         await repository.close()
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import posixpath
 import re
 import shlex
 import subprocess
@@ -12,7 +13,11 @@ from typing import Any
 
 from .admission import GPU_MONITOR_INTERVAL_SECONDS
 from .models import ResourceObservation
-from .queue import PostgresJobQueueRepository
+from .queue import (
+    ObservationReplayError,
+    PostgresJobQueueRepository,
+    ResourceObservationRejectedError,
+)
 
 _REMOTE_PROGRAM = r"""
 import datetime, hashlib, json, os, pathlib, subprocess, sys, uuid
@@ -20,6 +25,7 @@ import datetime, hashlib, json, os, pathlib, subprocess, sys, uuid
 settings = json.load(sys.stdin)
 storage_path = settings["storage_path"]
 gpu_uuid = settings["gpu_uuid"]
+node_id = settings["node_id"]
 
 def run(command):
     result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=5)
@@ -81,7 +87,7 @@ filesystem = mount_info[0]
 filesystem_identity = str(filesystem["fstype"]) + ":uuid=" + str(filesystem["uuid"])
 observation = {
     "observation_id": str(uuid.uuid4()),
-    "node_id": "ubuntu",
+    "node_id": node_id,
     "hostname": os.uname().nodename.split(".")[0],
     "host_identity": host_identity,
     "gpu_name": gpu_fields[0],
@@ -111,8 +117,11 @@ class UbuntuResourceObserver:
     def __init__(
         self,
         *,
+        node_id: str,
+        host_identity: str,
         ssh_target: str,
         gpu_uuid: str,
+        filesystem_identity: str,
         storage_path: str,
         ssh_port: int | None = None,
         identity_file: str | None = None,
@@ -120,18 +129,24 @@ class UbuntuResourceObserver:
         timeout_seconds: int = 10,
     ) -> None:
         if (
-            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@:-]{0,254}", ssh_target)
+            not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", node_id)
+            or not host_identity.startswith("machine-sha256:")
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@:-]{0,254}", ssh_target)
             or not gpu_uuid.startswith("GPU-")
+            or ":uuid=" not in filesystem_identity
             or not storage_path.startswith("/")
         ):
-            raise ValueError("observer requires an SSH target, pinned GPU UUID, and absolute storage path")
+            raise ValueError("observer requires pinned node, host, GPU, filesystem, and storage identities")
         if not 1 <= timeout_seconds <= 30:
             raise ValueError("observer timeout must be between 1 and 30 seconds")
         if ssh_port is not None and not 1 <= ssh_port <= 65_535:
             raise ValueError("observer SSH port is invalid")
+        self._node_id = node_id
+        self._host_identity = host_identity
         self._ssh_target = ssh_target
         self._gpu_uuid = gpu_uuid
-        self._storage_path = storage_path
+        self._filesystem_identity = filesystem_identity
+        self._storage_path = posixpath.normpath(storage_path)
         self._ssh_port = ssh_port
         self._identity_file = identity_file
         self._known_hosts_file = known_hosts_file
@@ -156,7 +171,11 @@ class UbuntuResourceObserver:
             command.extend(["-p", str(self._ssh_port)])
         command.extend([self._ssh_target, "python3 -c " + shlex.quote(_REMOTE_PROGRAM)])
         request = json.dumps(
-            {"gpu_uuid": self._gpu_uuid, "storage_path": self._storage_path},
+            {
+                "node_id": self._node_id,
+                "gpu_uuid": self._gpu_uuid,
+                "storage_path": self._storage_path,
+            },
             separators=(",", ":"),
         )
         try:
@@ -176,7 +195,21 @@ class UbuntuResourceObserver:
             observation = ResourceObservation.from_dict(json.loads(result.stdout))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError, OverflowError) as error:
             raise UbuntuObservationUnavailableError("Ubuntu observer returned invalid observation JSON") from error
-        if observation.gpu_uuid != self._gpu_uuid or observation.storage_path != self._storage_path:
+        identity = (
+            observation.node_id,
+            observation.host_identity,
+            observation.gpu_uuid,
+            observation.filesystem_identity,
+            posixpath.normpath(observation.storage_path),
+        )
+        expected = (
+            self._node_id,
+            self._host_identity,
+            self._gpu_uuid,
+            self._filesystem_identity,
+            self._storage_path,
+        )
+        if identity != expected:
             raise UbuntuObservationUnavailableError("Ubuntu observer returned the wrong resource identity")
         return observation
 
@@ -194,9 +227,12 @@ async def run_observer_forever(
         try:
             observation = await asyncio.to_thread(observer.observe)
             await repository.record_observation(observation)
+        except (ObservationReplayError, ResourceObservationRejectedError):
+            # Persistence already reset the durable idle window in the rejecting transaction.
+            pass
         except Exception:  # noqa: BLE001 - leave latest good data stale and fail closed
             await repository.record_observation_failure(
-                node_id="ubuntu",
+                node_id=repository.expected_node_id,
                 failure_code="observer_unreachable",
             )
         await asyncio.sleep(interval_seconds)
@@ -213,9 +249,11 @@ async def observe_once_and_persist(
         observation = await asyncio.to_thread(observer.observe)
         await repository.record_observation(observation)
         return observation
+    except (ObservationReplayError, ResourceObservationRejectedError):
+        raise
     except Exception:
         await repository.record_observation_failure(
-            node_id="ubuntu",
+            node_id=repository.expected_node_id,
             failure_code="observer_unreachable",
         )
         raise
@@ -223,10 +261,18 @@ async def observe_once_and_persist(
 
 def main() -> None:
     database_url = _required("GODS_MLOPS_DATABASE_URL")
+    node_id = _required("GODS_MLOPS_UBUNTU_NODE_ID")
+    host_identity = _required("GODS_MLOPS_UBUNTU_HOST_IDENTITY")
+    gpu_uuid = _required("GODS_MLOPS_UBUNTU_GPU_UUID")
+    filesystem_identity = _required("GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY")
+    storage_path = _required("GODS_MLOPS_UBUNTU_STORAGE_PATH")
     observer = UbuntuResourceObserver(
+        node_id=node_id,
+        host_identity=host_identity,
         ssh_target=_required("GODS_MLOPS_UBUNTU_SSH_TARGET"),
-        gpu_uuid=_required("GODS_MLOPS_UBUNTU_GPU_UUID"),
-        storage_path=_required("GODS_MLOPS_UBUNTU_STORAGE_PATH"),
+        gpu_uuid=gpu_uuid,
+        filesystem_identity=filesystem_identity,
+        storage_path=storage_path,
         ssh_port=int(os.environ["GODS_MLOPS_UBUNTU_SSH_PORT"])
         if os.environ.get("GODS_MLOPS_UBUNTU_SSH_PORT")
         else None,
@@ -234,7 +280,14 @@ def main() -> None:
         known_hosts_file=os.environ.get("GODS_MLOPS_UBUNTU_SSH_KNOWN_HOSTS"),
         timeout_seconds=int(os.environ.get("GODS_MLOPS_UBUNTU_SSH_TIMEOUT_SECONDS", "10")),
     )
-    repository = PostgresJobQueueRepository(database_url=database_url)
+    repository = PostgresJobQueueRepository(
+        database_url=database_url,
+        expected_node_id=node_id,
+        expected_host_identity=host_identity,
+        expected_gpu_uuid=gpu_uuid,
+        expected_filesystem_identity=filesystem_identity,
+        expected_storage_path=storage_path,
+    )
     asyncio.run(_run_and_close(repository, observer))
 
 

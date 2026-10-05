@@ -130,11 +130,8 @@ class GpuJobMonitor:
         """Read and reconcile one host observation from the configured Ubuntu producer."""
         try:
             observation = await self._admission.observe_once()
-        except ValueError as error:
-            await self._repository.record_observation_failure(
-                node_id="ubuntu",
-                failure_code=str(error) or "observer_unreachable",
-            )
+        except ValueError:
+            # Admission already persisted the producer failure and reset its idle window.
             return await self.observe_failure()
         return await self.observe(observation)
 

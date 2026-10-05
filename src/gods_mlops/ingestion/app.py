@@ -35,6 +35,7 @@ class IngestionSettings:
     ubuntu_storage_min_free_bytes: int = MIN_UBUNTU_FILESYSTEM_FREE_BYTES
     bind_host: str = "0.0.0.0"
     port: int = 8080
+    ubuntu_node_id: str | None = None
 
 
 def build_app(
@@ -54,9 +55,17 @@ def build_app(
         bucket=settings.s3_bucket,
         region=settings.s3_region,
     )
-    resource_observations = PostgresJobQueueRepository(database_url=settings.database_url)
+    resource_observations = PostgresJobQueueRepository(
+        database_url=settings.database_url,
+        expected_node_id=settings.ubuntu_node_id,
+        expected_host_identity=settings.ubuntu_host_identity,
+        expected_gpu_uuid=settings.ubuntu_gpu_uuid,
+        expected_filesystem_identity=settings.ubuntu_filesystem_identity,
+        expected_storage_path=settings.ubuntu_storage_path,
+    )
     collection_gate = CollectionStorageGate(
         repository=resource_observations,
+        expected_node_id=settings.ubuntu_node_id,
         expected_host_identity=settings.ubuntu_host_identity,
         expected_gpu_uuid=settings.ubuntu_gpu_uuid,
         expected_filesystem_identity=settings.ubuntu_filesystem_identity,
@@ -103,6 +112,7 @@ def _settings_from_environment() -> IngestionSettings:
         s3_bucket=_required("GODS_MLOPS_S3_BUCKET"),
         s3_region=os.environ.get("GODS_MLOPS_S3_REGION", "us-east-1"),
         bearer_token=_required("GODS_MLOPS_INGESTION_TOKEN"),
+        ubuntu_node_id=os.environ.get("GODS_MLOPS_UBUNTU_NODE_ID"),
         ubuntu_host_identity=os.environ.get("GODS_MLOPS_UBUNTU_HOST_IDENTITY"),
         ubuntu_gpu_uuid=os.environ.get("GODS_MLOPS_UBUNTU_GPU_UUID"),
         ubuntu_filesystem_identity=os.environ.get("GODS_MLOPS_UBUNTU_FILESYSTEM_IDENTITY"),

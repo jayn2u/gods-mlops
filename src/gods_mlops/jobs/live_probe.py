@@ -338,10 +338,13 @@ async def _run(args: argparse.Namespace) -> None:
     repo = PostgresJobQueueRepository(database_url=args.database_url)
     queue = JobQueue(repository=repo, sources=DatasetSourceRegistry(database_url=args.database_url))
     observer = UbuntuResourceObserver(
-        ssh_target=args.ssh_target, gpu_uuid=args.gpu_uuid, storage_path=args.storage_path,
+        node_id=args.node_id, host_identity=args.host_identity,
+        ssh_target=args.ssh_target, gpu_uuid=args.gpu_uuid,
+        filesystem_identity=args.filesystem_identity, storage_path=args.storage_path,
         ssh_port=args.ssh_port, identity_file=args.ssh_identity_file, known_hosts_file=args.ssh_known_hosts,
     )
-    admission = GpuAdmission(repository=repo, queue=queue, expected_host_identity=args.host_identity,
+    admission = GpuAdmission(repository=repo, queue=queue, expected_node_id=args.node_id,
+        expected_host_identity=args.host_identity,
         expected_gpu_uuid=args.gpu_uuid, expected_filesystem_identity=args.filesystem_identity,
         expected_storage_path=args.storage_path, observer=observer)
     monitor = GpuJobMonitor(repository=repo, queue=queue, admission=admission)
@@ -516,6 +519,7 @@ def main() -> None:
                 "filesystem_identity", "training_image", "training_image_id"):
         run.add_argument("--" + key.replace("_", "-"), required=True)
     run.add_argument("--ssh-port", type=int)
+    run.add_argument("--node-id", default="ubuntu")
     run.add_argument("--storage-path", default="/data")
     run.add_argument("--max-wait-seconds", type=int, default=1800)
     run.add_argument("--worker-timeout-seconds", type=int, default=300)

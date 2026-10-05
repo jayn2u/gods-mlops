@@ -8,7 +8,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .models import ResourceObservation
-from .queue import JobQueue, ObservationReplayError, PostgresJobQueueRepository
+from .queue import (
+    JobQueue,
+    ObservationReplayError,
+    PostgresJobQueueRepository,
+    ResourceObservationRejectedError,
+)
 
 GPU_SAFETY_MIB = 4_096
 GPU_IDLE_WINDOW_SECONDS = 30
@@ -33,6 +38,7 @@ class GpuAdmission:
         expected_gpu_uuid: str,
         expected_filesystem_identity: str,
         expected_storage_path: str,
+        expected_node_id: str = "ubuntu",
         observer: Any | None = None,
         clock=None,
         idle_window_seconds: int = GPU_IDLE_WINDOW_SECONDS,
@@ -48,6 +54,7 @@ class GpuAdmission:
         self._expected_gpu_uuid = expected_gpu_uuid
         self._expected_filesystem_identity = expected_filesystem_identity
         self._expected_storage_path = posixpath.normpath(expected_storage_path)
+        self._expected_node_id = expected_node_id
         self._observer = observer
         self._clock = clock or (lambda: datetime.now(UTC))
         self._idle_window_seconds = idle_window_seconds
@@ -57,6 +64,7 @@ class GpuAdmission:
         self._min_filesystem_bytes = min_filesystem_bytes
         self._safety_mib = safety_mib
         self._repository.configure_observation_identity(
+            expected_node_id=expected_node_id,
             expected_host_identity=expected_host_identity,
             expected_gpu_uuid=expected_gpu_uuid,
             expected_filesystem_identity=expected_filesystem_identity,
@@ -69,19 +77,31 @@ class GpuAdmission:
 
     async def observe_once(self) -> ResourceObservation:
         if self._observer is None:
+            await self._record_observation_failure("observer_unreachable")
             raise ValueError("ubuntu_observation_unavailable")
-        method = self._observer.observe if hasattr(self._observer, "observe") else self._observer
-        value = method()
-        if inspect.isawaitable(value):
-            value = await value
+        try:
+            method = self._observer.observe if hasattr(self._observer, "observe") else self._observer
+            value = method()
+            if inspect.isawaitable(value):
+                value = await value
+        except Exception as error:  # noqa: BLE001 - a failed producer read invalidates prior idle proof
+            await self._record_observation_failure("observer_unreachable")
+            raise ValueError("ubuntu_observation_unavailable") from error
         try:
             observation = (
                 value if isinstance(value, ResourceObservation) else ResourceObservation.from_dict(value)
             )
         except (KeyError, TypeError, ValueError, OverflowError) as error:
+            await self._record_observation_failure("ubuntu_observation_unavailable")
             raise ValueError("ubuntu_observation_unavailable") from error
-        reason = self._observation_reason(observation, self._now())
+        try:
+            now = self._now()
+        except ValueError:
+            await self._record_observation_failure("admission_clock_unavailable")
+            raise
+        reason = self._observation_reason(observation, now)
         if reason is not None:
+            await self._record_observation_failure(reason)
             raise ValueError(reason)
         return observation
 
@@ -90,10 +110,12 @@ class GpuAdmission:
         try:
             parsed = ResourceObservation.from_dict(observation)
         except (KeyError, TypeError, ValueError, OverflowError):
+            await self._record_observation_failure("ubuntu_observation_unavailable")
             return await self._wait(job_id, "waiting_gpu", "ubuntu_observation_unavailable")
         now = self._now()
         invalid_reason = self._observation_reason(parsed, now)
         if invalid_reason is not None:
+            await self._record_observation_failure(invalid_reason)
             return await self._wait(job_id, "waiting_gpu", invalid_reason)
         try:
             state = await self._repository.record_observation(
@@ -108,6 +130,13 @@ class GpuAdmission:
                 "ubuntu_observation_replayed",
                 observation_id=parsed.observation_id,
             )
+        except ResourceObservationRejectedError as error:
+            return await self._wait(
+                job_id,
+                "waiting_gpu",
+                error.reason_code,
+                observation_id=parsed.observation_id,
+            )
         return await self._admit_from_current(job_id, parsed, state, now=now, prelaunch=False)
 
     async def record_observation(
@@ -120,16 +149,21 @@ class GpuAdmission:
                 value if isinstance(value, ResourceObservation) else ResourceObservation.from_dict(value)
             )
         except (KeyError, TypeError, ValueError, OverflowError) as error:
+            await self._record_observation_failure("ubuntu_observation_unavailable")
             raise ValueError("ubuntu_observation_unavailable") from error
         now = self._now()
         reason = self._observation_reason(observation, now)
         if reason is not None:
+            await self._record_observation_failure(reason)
             raise ValueError(reason)
-        state = await self._repository.record_observation(
-            observation,
-            max_gap_seconds=_MAX_OBSERVATION_GAP_SECONDS,
-            received_at=now,
-        )
+        try:
+            state = await self._repository.record_observation(
+                observation,
+                max_gap_seconds=_MAX_OBSERVATION_GAP_SECONDS,
+                received_at=now,
+            )
+        except ResourceObservationRejectedError as error:
+            raise ValueError(error.reason_code) from error
         return observation, state
 
     async def _admit_from_current(
@@ -312,6 +346,7 @@ class GpuAdmission:
         previous_observation_id: str,
     ) -> tuple[ResourceObservation, dict[str, Any]] | dict[str, Any]:
         if self._observer is None:
+            await self._record_observation_failure("observer_unreachable")
             return await self._wait(
                 job_id,
                 "waiting_gpu",
@@ -326,7 +361,7 @@ class GpuAdmission:
             observation = value if isinstance(value, ResourceObservation) else ResourceObservation.from_dict(value)
         except Exception:  # noqa: BLE001 - observation failure must only defer GPU work
             await self._repository.record_observation_failure(
-                node_id="ubuntu",
+                node_id=self._expected_node_id,
                 failure_code="observer_unreachable",
             )
             return await self._wait(
@@ -338,6 +373,7 @@ class GpuAdmission:
         now = self._now()
         reason = self._observation_reason(observation, now)
         if reason is not None:
+            await self._record_observation_failure(reason)
             if reason == "ubuntu_observation_identity_mismatch":
                 return await self._wait(
                     job_id,
@@ -365,14 +401,27 @@ class GpuAdmission:
                 "ubuntu_observation_replayed",
                 observation_id=observation.observation_id,
             )
+        except ResourceObservationRejectedError as error:
+            return await self._wait(
+                job_id,
+                "waiting_gpu",
+                error.reason_code,
+                observation_id=observation.observation_id,
+            )
         return observation, state
+
+    async def _record_observation_failure(self, failure_code: str) -> None:
+        await self._repository.record_observation_failure(
+            node_id=self._expected_node_id,
+            failure_code=failure_code,
+        )
 
     def _observation_reason(self, observation: ResourceObservation, now: datetime) -> str | None:
         age = (now - observation.observed_at).total_seconds()
         if age < -OBSERVATION_FUTURE_TOLERANCE_SECONDS or age > self._observation_max_age_seconds:
             return "ubuntu_observation_stale"
         if (
-            observation.node_id != "ubuntu"
+            observation.node_id != self._expected_node_id
             or observation.hostname.lower() != "ubuntu"
             or observation.host_identity != self._expected_host_identity
             or observation.gpu_name != "NVIDIA RTX A6000"

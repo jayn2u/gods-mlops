@@ -293,3 +293,41 @@ def test_public_yield_renew_checkpoint_and_release_share_the_job_lease_lock_orde
             await repository.close()
 
     asyncio.run(exercise())
+
+
+def test_monitor_run_once_preserves_one_durable_failure_before_requesting_own_yield(
+    task7_database_url: str,
+) -> None:
+    async def exercise() -> None:
+        repository, queue, _admission, _monitor, job_id, token, now = await _running_probe(task7_database_url)
+
+        class FailedObserver:
+            async def observe(self) -> dict:
+                raise RuntimeError("SSH producer is unavailable")
+
+        admission = GpuAdmission(
+            repository=repository,
+            queue=queue,
+            expected_host_identity=HOST_IDENTITY,
+            expected_gpu_uuid=GPU_UUID,
+            expected_filesystem_identity=FILESYSTEM_IDENTITY,
+            expected_storage_path=STORAGE_PATH,
+            observer=FailedObserver(),
+            clock=lambda: now[0],
+        )
+        monitor = GpuJobMonitor(repository=repository, queue=queue, admission=admission)
+        result = await monitor.run_once()
+        state = await repository.get_observation_state("ubuntu")
+        active = await repository.get_active_lease(GPU_UUID)
+
+        assert result["state"] == "yield_requested"
+        assert state["failure_count"] == 1
+        assert state["failure_code"] == "observer_unreachable"
+        assert state["idle_since"] is None
+        assert state["idle_observation_count"] == 0
+        assert active["lease_token"] == token
+        assert (await queue.get(job_id))["state"] == "yield_requested"
+        await queue.close()
+        await repository.close()
+
+    asyncio.run(exercise())
