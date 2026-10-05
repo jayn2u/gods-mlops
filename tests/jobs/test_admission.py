@@ -60,6 +60,17 @@ class SequenceObserver:
         return snapshot
 
 
+class TypedSequenceObserver:
+    def __init__(self, clock: Callable[[], datetime], snapshot: Callable[[datetime], dict]):
+        self._clock = clock
+        self._snapshot = snapshot
+        self.calls = 0
+
+    async def observe(self) -> ResourceObservation:
+        self.calls += 1
+        return ResourceObservation.from_dict(self._snapshot(self._clock()))
+
+
 async def _queue_with_probe(database_url: str) -> tuple[PostgresJobQueueRepository, JobQueue, str]:
     dataset_version = await seed_training_ready_dataset(database_url)
     repository = PostgresJobQueueRepository(database_url=database_url)
@@ -135,6 +146,31 @@ def test_stable_idle_window_is_followed_by_a_fresh_prelaunch_external_process_ch
             result = await admission.admit(job_id, _observation(now[0]))
         assert result["state"] == "running"
         assert external_after_idle.calls == 2
+        assert (await repository.get_active_lease(GPU_UUID))["job_id"] == job_id
+        await queue.close()
+        await repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_typed_resource_observation_can_complete_the_fresh_prelaunch_check(
+    task7_database_url: str,
+) -> None:
+    async def exercise() -> None:
+        repository, queue, job_id = await _queue_with_probe(task7_database_url)
+        now = [BASE_TIME]
+        observer = TypedSequenceObserver(
+            lambda: now[0],
+            lambda at: _observation(at + timedelta(milliseconds=100)),
+        )
+        admission = _admission(repository, queue, now, observer=observer)
+
+        for offset in range(0, 31, 5):
+            now[0] = BASE_TIME + timedelta(seconds=offset)
+            result = await admission.admit(job_id, _observation(now[0]))
+
+        assert result["state"] == "running"
+        assert observer.calls == 1
         assert (await repository.get_active_lease(GPU_UUID))["job_id"] == job_id
         await queue.close()
         await repository.close()

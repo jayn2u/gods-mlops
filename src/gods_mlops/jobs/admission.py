@@ -301,7 +301,7 @@ class GpuAdmission:
             value = method()
             if inspect.isawaitable(value):
                 value = await value
-            observation = ResourceObservation.from_dict(value)
+            observation = value if isinstance(value, ResourceObservation) else ResourceObservation.from_dict(value)
         except Exception:  # noqa: BLE001 - observation failure must only defer GPU work
             await self._repository.record_observation_failure(
                 node_id="ubuntu",
