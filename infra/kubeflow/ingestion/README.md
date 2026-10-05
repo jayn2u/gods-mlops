@@ -5,9 +5,9 @@ This Kustomize component adds a private FastAPI receiver and its own retained Po
 Build the API image from the repository root and import both locked images into the Ubuntu node's K3s containerd before applying the platform Kustomization:
 
 ```sh
-docker build -f infra/kubeflow/ingestion/Dockerfile -t gods-mlops-ingestion:0.1.0 .
+docker build -f infra/kubeflow/ingestion/Dockerfile -t gods-mlops-ingestion:0.2.0 .
 docker build -f infra/kubeflow/ingestion/Dockerfile.postgres -t gods-mlops-ingestion-postgres:0.8.1-pg17-10001 .
-docker save gods-mlops-ingestion:0.1.0 gods-mlops-ingestion-postgres:0.8.1-pg17-10001 -o /tmp/gods-mlops-ingestion-images.tar
+docker save gods-mlops-ingestion:0.2.0 gods-mlops-ingestion-postgres:0.8.1-pg17-10001 -o /tmp/gods-mlops-ingestion-images.tar
 ```
 
 Copy that tarball to Ubuntu and import it into K3s containerd with `sudo k3s ctr images import /tmp/gods-mlops-ingestion-images.tar`. Both workloads are pinned to Ubuntu, and `imagePullPolicy: Never` prevents an accidental public image lookup.
@@ -28,4 +28,4 @@ The worker uses `compose.candidate-export.yaml` with `GW_MLOPS_CANDIDATE_EXPORT_
 
 Before Task 3 reclaim, stop this user unit so it cannot reconnect to a stopped cluster. Start it again after reconnect and confirm `/readyz` before enabling product collection. The unit binds only to loopback; it does not add a NodePort, ingress, firewall rule, or public listener.
 
-Retention ownership remains with Task 5. The API stores a seven-day `retention_until`, keeps a stable database tombstone, and returns `410 sample_expired` after object deletion. Task 5 must extend the `selected` guard to its durable annotation and dataset adoption state before invoking `IngestionService.prune_expired`; the API does not run an automatic cleanup loop.
+The receiver stores a seven-day `retention_until`, keeps a stable database tombstone, and returns `410 sample_expired` after object deletion; it still does not run an automatic cleanup loop. The hourly `gods-mlops-retention` CronJob calls the bounded `RetentionService` for frames and unadopted crops, retries terminal Label Studio media deletion, and preserves dataset adoptions, active bbox/caption assignments, and unacknowledged media reservations. See [the Label Studio runbook](../label-studio/README.md) for the 1.23.2 deployment, shared 100 GiB media volume, operator credentials, and project configuration.

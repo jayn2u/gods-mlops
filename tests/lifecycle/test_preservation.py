@@ -34,6 +34,7 @@ def _inventory() -> dict:
             "gods-mlops-objects",
             "gods-mlops-metadata-postgres",
             "gods-mlops-ingestion-postgres",
+            "gods-mlops-label-studio-media",
         ],
         "required_database_restores": [
             "gods-mlops-metadata-postgres",
@@ -44,6 +45,7 @@ def _inventory() -> dict:
             "gods-ingestion-port-forward-kubeconfig",
             "kubeflow-dex-operator",
             "gods-sample-ingestion-credentials",
+            "gods-label-studio-credentials",
         ],
         "nodes": [
             {
@@ -72,6 +74,10 @@ def _inventory() -> dict:
                     {
                         "id": "gods-mlops-ingestion-postgres",
                         "path": "/data/jayn2u/gods-mlops/metadata/ingestion-postgres",
+                    },
+                    {
+                        "id": "gods-mlops-label-studio-media",
+                        "path": "/data/jayn2u/gods-mlops/metadata/label-studio-media",
                     },
                 ],
                 "completion": {"plan_id": None, "steps": []},
@@ -201,6 +207,13 @@ def _retained_manifest(tmp_path: Path) -> dict:
                 "expected_uid": uid,
                 "expected_mode": "0600",
             },
+            {
+                "id": "gods-label-studio-credentials",
+                "path": str(credential),
+                "expected_sha256": credential_hash,
+                "expected_uid": uid,
+                "expected_mode": "0600",
+            },
         ],
     }
 
@@ -291,6 +304,7 @@ def test_verify_retained_checks_content_ownership_restore_and_secret_permissions
             "gods-ingestion-port-forward-kubeconfig",
             "kubeflow-dex-operator",
             "gods-sample-ingestion-credentials",
+            "gods-label-studio-credentials",
         ],
     }
 
@@ -526,6 +540,7 @@ def test_pre_stop_recovery_gate_hashes_the_backup_but_checks_live_source_ownersh
             "gods-ingestion-port-forward-kubeconfig",
             "kubeflow-dex-operator",
             "gods-sample-ingestion-credentials",
+            "gods-label-studio-credentials",
         ],
     }
 
@@ -552,6 +567,7 @@ def test_live_database_path_uses_logical_restore_evidence_then_cold_hash(tmp_pat
             "gods-ingestion-port-forward-kubeconfig",
             "kubeflow-dex-operator",
             "gods-sample-ingestion-credentials",
+            "gods-label-studio-credentials",
         ],
     }
 
@@ -598,6 +614,7 @@ def test_verify_retained_requires_coverage_for_every_inventory_item(tmp_path: Pa
                 "gods-ingestion-port-forward-kubeconfig",
                 "kubeflow-dex-operator",
                 "gods-sample-ingestion-credentials",
+                "gods-label-studio-credentials",
                 "s3-credentials",
             ],
         },

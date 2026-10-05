@@ -6,6 +6,8 @@ resources:
   - gpu-placement-policy.yaml
   - retained-storage.yaml
   - ingestion
+  - label-studio
+  - retention.yaml
 
 patches:
   - target:

@@ -16,6 +16,8 @@ RUN pip install --no-cache-dir --constraint /tmp/uv-constraints.txt --requiremen
 
 COPY src/gods_mlops/__init__.py /opt/gods-mlops/gods_mlops/__init__.py
 COPY src/gods_mlops/ingestion /opt/gods-mlops/gods_mlops/ingestion
+COPY src/gods_mlops/annotations /opt/gods-mlops/gods_mlops/annotations
+COPY src/gods_mlops/retention /opt/gods-mlops/gods_mlops/retention
 
 ENV PYTHONPATH=/opt/gods-mlops
 USER 10001:10001

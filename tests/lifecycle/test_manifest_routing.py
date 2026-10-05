@@ -98,7 +98,7 @@ def test_manifest_routes_each_source_backup_and_restore_check_to_its_owning_node
         "gods-ingestion-port-forward-kubeconfig",
     }
     assert len(ubuntu_slice["database_restores"]) == 5
-    assert len(ubuntu_slice["credentials"]) == 4
+    assert len(ubuntu_slice["credentials"]) == 5
     assert all(item["node"] == "ubuntu" for item in ubuntu_slice["retained_paths"])
 
 

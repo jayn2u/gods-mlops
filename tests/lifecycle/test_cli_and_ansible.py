@@ -30,7 +30,9 @@ def test_repository_inventory_includes_external_model_staging_and_data_roots() -
         "gods-mlops-kfp-mysql",
         "gods-mlops-ingestion-postgres",
     }
-    assert len(inventory["required_retained_paths"]) == 10
+    assert len(inventory["required_retained_paths"]) == 11
+    assert inventory["retained_requirements_by_id"]["gods-mlops-label-studio-media"]["source_path"] == "/data/jayn2u/gods-mlops/metadata/label-studio-media"
+    assert "gods-label-studio-credentials" in inventory["required_credentials"]
 
 
 def test_purge_without_exact_confirmation_is_only_a_dry_run(

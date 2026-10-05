@@ -71,6 +71,7 @@ all:
             - gods-object-store-credentials
             - gods-database-credentials
             - gods-sample-ingestion-credentials
+            - gods-label-studio-credentials
           gods_min_free_gib: 1024
           gods_gpu_model: NVIDIA RTX A6000
           gods_data_directories:
@@ -86,6 +87,9 @@ all:
             - path: /data/jayn2u/gods-mlops/metadata/ingestion-postgres
               capacity: 10Gi
               role: metadata-ingestion-postgres
+            - path: /data/jayn2u/gods-mlops/metadata/label-studio-media
+              capacity: 100Gi
+              role: metadata-label-studio-media
             - path: /data/jayn2u/gods-mlops/metadata/kubeflow-user/gods-mlops/metadata-postgres
               capacity: 10Gi
               role: metadata-postgres

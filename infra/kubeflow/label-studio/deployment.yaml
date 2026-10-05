@@ -1,0 +1,170 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gods-mlops-label-studio
+  namespace: gods-mlops
+  labels:
+    app.kubernetes.io/name: gods-mlops-label-studio
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gods-mlops-label-studio
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP
+    - name: media-cleanup
+      port: 8090
+      targetPort: media-cleanup
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gods-mlops-label-studio
+  namespace: gods-mlops
+  labels:
+    app.kubernetes.io/name: gods-mlops-label-studio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gods-mlops-label-studio
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gods-mlops-label-studio
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: ubuntu
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: label-studio
+          image: docker.io/heartexlabs/label-studio:1.23.2@sha256:afcc516a22775a39d0d66f4c2ddc95d01be3e3d3862b21fcf4f9de34b4ad4e12
+          imagePullPolicy: Never
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: gods-mlops-label-studio-config
+          env:
+            - name: POSTGRE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gods-mlops-ingestion-credentials
+                  key: DATABASE_PASSWORD
+            - name: LABEL_STUDIO_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: gods-label-studio-credentials
+                  key: LABEL_STUDIO_USERNAME
+            - name: LABEL_STUDIO_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gods-label-studio-credentials
+                  key: LABEL_STUDIO_PASSWORD
+            - name: LABEL_STUDIO_USER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gods-label-studio-credentials
+                  key: LABEL_STUDIO_USER_TOKEN
+          readinessProbe:
+            httpGet:
+              path: /user/login/
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /user/login/
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: media
+              mountPath: /label-studio/data
+            - name: tmp
+              mountPath: /tmp
+        - name: media-cleanup
+          image: gods-mlops-ingestion:0.2.0
+          imagePullPolicy: Never
+          command:
+            - python
+            - -m
+            - gods_mlops.annotations.media_cleanup
+          ports:
+            - name: media-cleanup
+              containerPort: 8090
+              protocol: TCP
+          env:
+            - name: GODS_MLOPS_LABEL_STUDIO_UPLOAD_ROOT
+              value: /label-studio/data/media/upload
+            - name: GODS_MLOPS_LABEL_MEDIA_CLEANUP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gods-label-studio-credentials
+                  key: MEDIA_CLEANUP_TOKEN
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: media-cleanup
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /readyz
+              port: media-cleanup
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 2
+            failureThreshold: 4
+          resources:
+            requests:
+              cpu: 25m
+              memory: 48Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: media
+              mountPath: /label-studio/data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: media
+          persistentVolumeClaim:
+            claimName: gods-mlops-label-studio-media
+        - name: tmp
+          emptyDir: {}

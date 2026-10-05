@@ -180,6 +180,34 @@ spec:
 apiVersion: v1
 kind: PersistentVolume
 metadata:
+  name: gods-mlops-label-studio-media
+  labels:
+    gods.io/managed-storage: "true"
+    gods.io/recovery-kind: media
+    gods.io/pv: gods-mlops-label-studio-media
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: gods-mlops-local-retain
+  volumeMode: Filesystem
+  claimRef:
+    namespace: gods-mlops
+    name: gods-mlops-label-studio-media
+  local:
+    path: /data/jayn2u/gods-mlops/metadata/label-studio-media
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [ubuntu]
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
   name: gods-mlops-katib-mysql
   labels:
     gods.io/managed-storage: "true"
@@ -363,3 +391,18 @@ spec:
   resources:
     requests:
       storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: gods-mlops-label-studio-media
+  namespace: gods-mlops
+  labels:
+    gods.io/managed-storage: "true"
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: gods-mlops-local-retain
+  volumeName: gods-mlops-label-studio-media
+  resources:
+    requests:
+      storage: 100Gi

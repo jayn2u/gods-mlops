@@ -55,6 +55,110 @@ def _configured_backends(
     return repository, objects, database_url
 
 
+def test_postgres_accepts_a_valid_64_character_sample_sha256() -> None:
+    database_url = os.environ.get("GODS_MLOPS_TEST_DATABASE_URL")
+    if not database_url:
+        pytest.skip("isolated PostgreSQL test endpoint is not configured")
+    repository = PostgresIngestionRepository(database_url=database_url)
+    image_sha256 = "b" * 64
+    metadata = CandidateMetadata(
+        sample_id=uuid4(),
+        camera_id=uuid4(),
+        captured_at_utc="2026-10-05T00:00:00Z",
+        reason="periodic",
+        sha256=image_sha256,
+        model_revision="runtime-detector-test",
+        processor_revision="runtime-processor-test",
+    )
+
+    async def exercise() -> None:
+        await repository.ensure_schema()
+        connection = await asyncpg.connect(database_url)
+        try:
+            await connection.execute(
+                "ALTER TABLE ingestion_samples DROP CONSTRAINT ingestion_samples_sha256_check"
+            )
+            await connection.execute(
+                """
+                ALTER TABLE ingestion_samples ADD CONSTRAINT ingestion_samples_sha256_check
+                CHECK (sha256 ~ '^[0-9a-f]64$') NOT VALID
+                """
+            )
+        finally:
+            await connection.close()
+        await repository.ensure_schema()
+        reserved = await repository.reserve(
+            metadata,
+            f"samples/{metadata.camera_id}/{metadata.sample_id}/{image_sha256}.jpg",
+            128,
+        )
+        assert reserved.state == "pending"
+        await repository.close()
+
+    asyncio.run(exercise())
+
+
+def test_failed_sha256_check_upgrade_keeps_the_previous_constraint() -> None:
+    database_url = os.environ.get("GODS_MLOPS_TEST_DATABASE_URL")
+    if not database_url:
+        pytest.skip("isolated PostgreSQL test endpoint is not configured")
+    repository = PostgresIngestionRepository(database_url=database_url)
+    invalid_sample_id = uuid4()
+
+    async def exercise() -> None:
+        await repository.ensure_schema()
+        connection = await asyncpg.connect(database_url)
+        try:
+            await connection.execute(
+                "ALTER TABLE ingestion_samples DROP CONSTRAINT ingestion_samples_sha256_check"
+            )
+            await connection.execute(
+                """
+                ALTER TABLE ingestion_samples ADD CONSTRAINT ingestion_samples_sha256_check
+                CHECK (sha256 = sha256)
+                """
+            )
+            await connection.execute(
+                """
+                INSERT INTO ingestion_samples (
+                    sample_id, camera_id, capture_day, captured_at_utc, reason, sha256,
+                    model_revision, processor_revision, object_key, object_size_bytes,
+                    receipt_id, state
+                ) VALUES ($1, $2, DATE '2026-10-05', TIMESTAMPTZ '2026-10-05 00:00:00+00',
+                    'periodic', 'invalid', 'detector-test', 'processor-test', 'invalid-sample',
+                    1, $3, 'pending')
+                """,
+                invalid_sample_id,
+                uuid4(),
+                uuid4(),
+            )
+        finally:
+            await connection.close()
+
+        with pytest.raises(asyncpg.CheckViolationError):
+            await repository.ensure_schema()
+
+        connection = await asyncpg.connect(database_url)
+        try:
+            definition = await connection.fetchval(
+                """
+                SELECT pg_get_constraintdef(oid) FROM pg_constraint
+                WHERE conrelid = 'ingestion_samples'::regclass
+                  AND conname = 'ingestion_samples_sha256_check'
+                """
+            )
+            assert definition == "CHECK ((sha256 = sha256))"
+            await connection.execute(
+                "DELETE FROM ingestion_samples WHERE sample_id = $1", invalid_sample_id
+            )
+        finally:
+            await connection.close()
+        await repository.ensure_schema()
+        await repository.close()
+
+    asyncio.run(exercise())
+
+
 def test_lost_ack_is_idempotent() -> None:
     configured = _configured_backends()
     if configured is None:

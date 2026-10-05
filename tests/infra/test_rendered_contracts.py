@@ -177,6 +177,7 @@ def test_gods_local_volumes_are_retained_and_use_only_new_paths(
         ("gods-mlops", "gods-mlops-metadata"): ("gods-mlops-metadata", "50Gi", "/data/jayn2u/gods-mlops/metadata/platform", "metadata"),
         ("gods-mlops", "gods-mlops-spool"): ("gods-mlops-spool", "20Gi", "/mnt/data/gods-mlops-runtime/spool", "spool"),
         ("gods-mlops", "gods-mlops-ingestion-postgres"): ("gods-mlops-ingestion-postgres", "10Gi", "/data/jayn2u/gods-mlops/metadata/ingestion-postgres", "database"),
+        ("gods-mlops", "gods-mlops-label-studio-media"): ("gods-mlops-label-studio-media", "100Gi", "/data/jayn2u/gods-mlops/metadata/label-studio-media", "media"),
         ("gods-mlops", "metadata-postgres"): ("gods-mlops-kfp-metadata-postgres", "10Gi", "/data/jayn2u/gods-mlops/metadata/kubeflow-user/gods-mlops/metadata-postgres", "database"),
         ("kubeflow", "katib-mysql"): ("gods-mlops-katib-mysql", "10Gi", "/data/jayn2u/gods-mlops/metadata/kubeflow/katib-mysql", "database"),
         ("kubeflow", "model-catalog-postgres"): ("gods-mlops-model-catalog-postgres", "5Gi", "/data/jayn2u/gods-mlops/metadata/kubeflow/model-catalog-postgres", "database"),
@@ -239,6 +240,82 @@ def test_gods_local_volumes_are_retained_and_use_only_new_paths(
         assert "ReadWriteOnce" in spec["accessModes"]
         volume_spec = volumes_by_name[volume_name]["spec"]
         assert volume_spec["capacity"]["storage"] == expected_size
+
+
+def test_label_studio_uses_private_postgres_backed_single_operator_service_and_shared_media(
+    rendered_objects: list[dict],
+) -> None:
+    service = _find_one(rendered_objects, kind="Service", name="gods-mlops-label-studio")
+    assert service["spec"]["type"] == "ClusterIP"
+    assert {port["port"] for port in service["spec"]["ports"]} == {8080, 8090}
+
+    deployment = _find_one(rendered_objects, kind="Deployment", name="gods-mlops-label-studio")
+    pod = deployment["spec"]["template"]["spec"]
+    assert pod["nodeSelector"]["kubernetes.io/hostname"] == "ubuntu"
+    assert pod["automountServiceAccountToken"] is False
+    assert pod["securityContext"]["runAsNonRoot"] is True
+    assert pod["securityContext"]["runAsUser"] == 10001
+    assert pod["securityContext"]["runAsGroup"] == 10001
+    containers = {container["name"]: container for container in pod["containers"]}
+    assert set(containers) == {"label-studio", "media-cleanup"}
+    app = containers["label-studio"]
+    assert app["image"] == (
+        "docker.io/heartexlabs/label-studio:1.23.2"
+        "@sha256:afcc516a22775a39d0d66f4c2ddc95d01be3e3d3862b21fcf4f9de34b4ad4e12"
+    )
+    app_env = {entry["name"]: entry for entry in app["env"]}
+    assert app_env["POSTGRE_PASSWORD"]["valueFrom"]["secretKeyRef"]["name"] == "gods-mlops-ingestion-credentials"
+    assert app_env["LABEL_STUDIO_USER_TOKEN"]["valueFrom"]["secretKeyRef"]["name"] == "gods-label-studio-credentials"
+    cleanup = containers["media-cleanup"]
+    cleanup_env = {entry["name"]: entry for entry in cleanup["env"]}
+    assert cleanup_env["GODS_MLOPS_LABEL_STUDIO_UPLOAD_ROOT"]["value"] == "/label-studio/data/media/upload"
+    assert cleanup_env["GODS_MLOPS_LABEL_MEDIA_CLEANUP_TOKEN"]["valueFrom"]["secretKeyRef"]["name"] == "gods-label-studio-credentials"
+    app_data_mount = next(item for item in app["volumeMounts"] if item["name"] == "media")
+    cleanup_data_mount = next(item for item in cleanup["volumeMounts"] if item["name"] == "media")
+    assert app_data_mount["mountPath"] == cleanup_data_mount["mountPath"] == "/label-studio/data"
+    media_volume = next(item for item in pod["volumes"] if item["name"] == "media")
+    assert media_volume["persistentVolumeClaim"]["claimName"] == "gods-mlops-label-studio-media"
+
+    config = _find_one(rendered_objects, kind="ConfigMap", name="gods-mlops-label-studio-config")["data"]
+    assert config["DJANGO_DB"] == "default"
+    assert config["POSTGRE_NAME"] == "gods_ingestion"
+    assert config["POSTGRE_HOST"] == "gods-mlops-ingestion-postgres"
+    assert config["LABEL_STUDIO_BASE_DATA_DIR"] == "/label-studio/data"
+    assert config["DISABLE_SIGNUP_WITHOUT_LINK"] == "true"
+    assert config["SSRF_PROTECTION_ENABLED"] == "true"
+    assert config["DEBUG"] == "false"
+    assert config["COLLECT_ANALYTICS"] == "false"
+
+
+def test_retention_cronjob_is_bounded_serial_and_uses_the_ingestion_image(
+    rendered_objects: list[dict],
+) -> None:
+    cron = _find_one(rendered_objects, kind="CronJob", name="gods-mlops-retention")
+    spec = cron["spec"]
+    assert spec["schedule"] == "17 * * * *"
+    assert spec["timeZone"] == "Asia/Seoul"
+    assert spec["concurrencyPolicy"] == "Forbid"
+    assert spec["suspend"] is True
+    job = spec["jobTemplate"]["spec"]
+    assert job["backoffLimit"] == 2
+    assert job["activeDeadlineSeconds"] <= 900
+    pod = job["template"]["spec"]
+    assert pod["restartPolicy"] == "Never"
+    assert pod["automountServiceAccountToken"] is False
+    worker = pod["containers"][0]
+    assert worker["image"] == "gods-mlops-ingestion:0.2.0"
+    assert worker["command"] == ["python", "-m", "gods_mlops.retention.runner"]
+    names = {entry["name"] for entry in worker["env"]}
+    assert {
+        "GODS_MLOPS_DATABASE_URL",
+        "GODS_MLOPS_S3_ENDPOINT_URL",
+        "GODS_MLOPS_S3_ACCESS_KEY",
+        "GODS_MLOPS_S3_SECRET_KEY",
+        "GODS_MLOPS_LABEL_STUDIO_API_TOKEN",
+        "GODS_MLOPS_LABEL_MEDIA_CLEANUP_TOKEN",
+    }.issubset(names)
+    api_token_ref = next(entry for entry in worker["env"] if entry["name"] == "GODS_MLOPS_LABEL_STUDIO_API_TOKEN")
+    assert api_token_ref["valueFrom"]["secretKeyRef"]["key"] == "LABEL_STUDIO_API_TOKEN"
 
 
 def test_render_has_no_external_service_or_ingress_exposure(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from hashlib import sha256
 from typing import Any
 from uuid import UUID, uuid4
@@ -23,7 +23,8 @@ from .schemas import (
 )
 
 _DAILY_LIMIT = 2_000
-_GLOBAL_OBJECT_LIMIT = 1024**4
+GLOBAL_OBJECT_LIMIT = 1024**4
+_GLOBAL_OBJECT_LIMIT = GLOBAL_OBJECT_LIMIT
 _RETENTION_DAYS = 7
 _CAPTURE_TIMEZONE = ZoneInfo("Asia/Seoul")
 
@@ -34,7 +35,7 @@ CREATE TABLE IF NOT EXISTS ingestion_samples (
     capture_day DATE NOT NULL,
     captured_at_utc TIMESTAMPTZ NOT NULL,
     reason TEXT NOT NULL CHECK (reason IN ('periodic', 'low_confidence', 'operator')),
-    sha256 CHAR(64) NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    sha256 CHAR(64) NOT NULL CHECK (sha256 ~ '^[0-9a-f]{{64}}$'),
     model_revision VARCHAR(255) NOT NULL,
     processor_revision VARCHAR(255) NOT NULL,
     object_key TEXT NOT NULL,
@@ -53,6 +54,9 @@ ALTER TABLE ingestion_samples ADD COLUMN IF NOT EXISTS retention_until TIMESTAMP
 ALTER TABLE ingestion_samples DROP CONSTRAINT IF EXISTS ingestion_samples_state_check;
 ALTER TABLE ingestion_samples ADD CONSTRAINT ingestion_samples_state_check
     CHECK (state IN ('pending', 'received', 'storage_limited', 'purge_pending', 'expired'));
+ALTER TABLE ingestion_samples DROP CONSTRAINT IF EXISTS ingestion_samples_sha256_check;
+ALTER TABLE ingestion_samples ADD CONSTRAINT ingestion_samples_sha256_check
+    CHECK (sha256 ~ '^[0-9a-f]{{64}}$');
 CREATE INDEX IF NOT EXISTS ix_ingestion_samples_camera_day
     ON ingestion_samples (camera_id, capture_day);
 CREATE TABLE IF NOT EXISTS ingestion_daily_usage (
@@ -121,6 +125,14 @@ class PostgresIngestionRepository:
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             await connection.execute(_CREATE_TABLES)
+        # Annotation state shares this retained database and its object usage ledger.
+        from gods_mlops.annotations.storage import PostgresAnnotationRepository
+
+        annotations = PostgresAnnotationRepository(database_url=self._database_url)
+        try:
+            await annotations.ensure_schema()
+        finally:
+            await annotations.close()
 
     async def reserve(
         self,
@@ -281,21 +293,41 @@ class PostgresIngestionRepository:
             )
         return int(count or 0)
 
-    async def claim_expired(self, *, limit: int = 100) -> tuple[ExpiredSample, ...]:
+    async def claim_expired(
+        self,
+        *,
+        now: datetime | None = None,
+        limit: int = 100,
+    ) -> tuple[ExpiredSample, ...]:
         """Claim unselected seven-day objects for retryable deletion, retaining DB tombstones."""
+        claim_time = now or datetime.now(timezone.utc)
+        if claim_time.tzinfo is None:
+            raise ValueError("retention claim time must be timezone-aware")
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
                 rows = await connection.fetch(
                     """
-                    SELECT sample_id, object_key, object_size_bytes, state
-                    FROM ingestion_samples
-                    WHERE state = 'purge_pending'
-                       OR (state = 'received' AND selected = FALSE AND retention_until <= now())
-                    ORDER BY COALESCE(retention_until, created_at), sample_id
-                    LIMIT $1
+                    SELECT sample.sample_id, sample.object_key, sample.object_size_bytes, sample.state
+                    FROM ingestion_samples AS sample
+                    WHERE (sample.state = 'purge_pending'
+                       OR (sample.state = 'received' AND sample.retention_until <= $1))
+                      AND sample.selected = FALSE
+                      AND NOT EXISTS (
+                          SELECT 1 FROM review_assignments AS assignment
+                          WHERE assignment.sample_id = sample.sample_id
+                            AND assignment.stage = 'bbox'
+                            AND assignment.state IN ('active', 'provisioning')
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM dataset_adoptions AS adoption
+                          WHERE adoption.sample_id = sample.sample_id AND adoption.target = 'detr'
+                      )
+                    ORDER BY COALESCE(sample.retention_until, sample.created_at), sample.sample_id
+                    LIMIT $2
                     FOR UPDATE SKIP LOCKED
                     """,
+                    claim_time,
                     limit,
                 )
                 samples: list[ExpiredSample] = []
@@ -330,6 +362,14 @@ class PostgresIngestionRepository:
                 )
                 if deleted is None:
                     return False
+                await connection.execute(
+                    """
+                    UPDATE annotation_crops
+                    SET parent_available = FALSE, regeneration_available = FALSE, updated_at = now()
+                    WHERE sample_id = $1
+                    """,
+                    sample_id,
+                )
                 usage = await connection.fetchrow(
                     """
                     UPDATE ingestion_storage_usage
@@ -342,6 +382,13 @@ class PostgresIngestionRepository:
                 if usage is None:
                     raise RuntimeError("object quota accounting is inconsistent during retention")
                 return True
+
+    async def sample_state(self, sample_id: UUID) -> str | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            return await connection.fetchval(
+                "SELECT state FROM ingestion_samples WHERE sample_id = $1", sample_id
+            )
 
     async def ready(self) -> None:
         """Check that PostgreSQL accepts a process-owned query."""
@@ -421,6 +468,34 @@ class S3SampleStore:
     def delete_object(self, object_key: str) -> None:
         """Delete one receiver-owned object idempotently after metadata is purge-pending."""
         self._client.delete_object(Bucket=self._bucket, Key=object_key)
+
+    def read_object(self, *, object_key: str, expected_sha256: str) -> bytes:
+        """Read one receiver-owned object and verify its immutable source digest."""
+        try:
+            response: dict[str, Any] = self._client.get_object(
+                Bucket=self._bucket,
+                Key=object_key,
+            )
+        except ClientError as error:
+            response_code = str(error.response.get("Error", {}).get("Code", ""))
+            if response_code in {"NoSuchKey", "NotFound", "404"}:
+                raise FileNotFoundError(f"object is missing: {object_key}") from error
+            raise
+        body = response["Body"]
+        digest = sha256()
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := body.read(1024 * 1024):
+            size += len(chunk)
+            if size > 20 * 1024 * 1024:
+                body.close()
+                raise OSError("source frame exceeds the 20 MiB candidate limit")
+            digest.update(chunk)
+            chunks.append(chunk)
+        body.close()
+        if digest.hexdigest() != expected_sha256:
+            raise OSError("source object failed SHA-256 verification")
+        return b"".join(chunks)
 
     def _matches(self, object_key: str, expected_length: int, expected_sha256: str) -> bool:
         try:

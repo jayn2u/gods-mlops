@@ -40,7 +40,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: ingestion-api
-          image: gods-mlops-ingestion:0.1.0
+          image: gods-mlops-ingestion:0.2.0
           imagePullPolicy: Never
           ports:
             - name: http
