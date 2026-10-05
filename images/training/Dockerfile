@@ -10,6 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PROJECT_ENVIRONMENT=/opt/venv \
+    UV_CACHE_DIR=/tmp/uv-cache \
     GODS_MODEL_CACHE=/mnt/model-cache \
     GODS_MLOPS_ROOT=/app \
     HOME=/home/gods \
@@ -24,17 +25,19 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
+RUN --mount=type=cache,target=/tmp/uv-cache,sharing=locked \
+    uv sync --frozen --no-dev --no-install-project
 
 COPY src ./src
 COPY models/lock.json ./models/lock.json
 COPY infra/versions.lock.yaml ./infra/versions.lock.yaml
-RUN uv sync --frozen --no-dev --no-editable \
+RUN --mount=type=cache,target=/tmp/uv-cache,sharing=locked \
+    uv sync --frozen --no-dev --no-editable \
     && printf 'gods:x:10001:10001:Gods MLOps:/home/gods:/usr/sbin/nologin\n' >> /etc/passwd \
     && printf 'gods:x:10001:\n' >> /etc/group \
     && mkdir -p /home/gods \
     && mkdir -p /mnt/model-cache \
-    && chown -R 10001:10001 /home/gods /mnt/model-cache
+    && chown 10001:10001 /home/gods /mnt/model-cache
 
 ENV PATH="/opt/venv/bin:${PATH}"
 USER 10001:10001
