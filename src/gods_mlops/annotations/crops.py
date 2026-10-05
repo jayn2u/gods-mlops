@@ -70,7 +70,23 @@ class CropService:
                     expected_sha256=crop["sha256"],
                 )
             )
-            await self._repository.mark_crop_ready(UUID(crop["crop_id"]))
+            try:
+                await self._repository.mark_crop_ready(UUID(crop["crop_id"]))
+            except ReviewAssignmentConflictError:
+                try:
+                    await anyio.to_thread.run_sync(
+                        partial(self._objects.delete_object, crop["object_key"])
+                    )
+                except Exception as error:  # noqa: BLE001 - retain a retryable tombstone for late PUTs
+                    await self._repository.mark_crop_cleanup_pending(UUID(crop["crop_id"]))
+                    await self._repository.record_retention_event(
+                        sample_id=sample_id,
+                        action="crop_expiry_deferred",
+                        reason="late_crop_writer_cleanup_failed",
+                        details={"crop_id": crop["crop_id"], "error_type": type(error).__name__},
+                    )
+                    raise
+                raise
         return _crop_batch(
             sample_id,
             bbox_revision_id,

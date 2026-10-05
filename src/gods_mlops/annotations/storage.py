@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from hashlib import sha256
-from pathlib import Path
+from importlib.resources import files
 from pathlib import PurePosixPath
 import re
 from typing import Any
@@ -35,8 +35,10 @@ _MIGRATIONS = (
     (6, "0006_dataset_adoptions.sql"),
     (7, "0007_revisioned_relevance.sql"),
     (8, "0008_label_studio_media_state.sql"),
+    (9, "0009_crop_expiry_reconciliation.sql"),
+    (10, "0010_relevance_review_dependencies.sql"),
 )
-_MIGRATIONS_DIRECTORY = Path(__file__).resolve().parents[3] / "migrations"
+_MIGRATION_RESOURCES = files("gods_mlops.migrations")
 
 
 class PostgresAnnotationRepository:
@@ -72,7 +74,7 @@ class PostgresAnnotationRepository:
                     )
                     if applied:
                         continue
-                    migration_sql = (_MIGRATIONS_DIRECTORY / filename).read_text(encoding="utf-8")
+                    migration_sql = _MIGRATION_RESOURCES.joinpath(filename).read_text(encoding="utf-8")
                     await connection.execute(migration_sql)
                     await connection.execute(
                         "INSERT INTO gods_mlops_schema_migrations(version) VALUES ($1)", version
@@ -87,9 +89,12 @@ class PostgresAnnotationRepository:
         bbox_revision: str | None,
         media_object_key: str,
         required_bytes: int,
+        expected_caption_revision_id: str | None = None,
     ) -> ReviewAssignment:
         if stage not in {"bbox", "caption", "relevance"}:
             raise ValueError("review stage must be bbox, caption, or relevance")
+        if expected_caption_revision_id is not None and stage != "caption":
+            raise ValueError("only caption assignments can replace a caption revision")
         if (label_studio_task_id is not None and label_studio_task_id <= 0) or required_bytes <= 0:
             raise ValueError("task ID and required media bytes must be positive")
         assignment_state = "provisioning" if label_studio_task_id is None else "active"
@@ -115,7 +120,8 @@ class PostgresAnnotationRepository:
                         raise ReviewAssignmentConflictError("caption review requires a bbox revision")
                     crop = await connection.fetchrow(
                         """
-                        SELECT bbox_revision, object_size_bytes, state, caption_state
+                        SELECT bbox_revision, object_size_bytes, state, caption_state,
+                               caption_revision_id
                         FROM annotation_crops
                         WHERE sample_id = $1 AND object_key = $2 FOR UPDATE
                         """,
@@ -125,10 +131,29 @@ class PostgresAnnotationRepository:
                     if (
                         crop is None
                         or crop["state"] != "ready"
-                        or crop["caption_state"] != "needs_review"
                         or crop["bbox_revision"] != UUID(bbox_revision)
                         or required_bytes != crop["object_size_bytes"]
                     ):
+                        raise ReviewAssignmentConflictError(
+                            "caption review must reference a stored crop from this bbox revision"
+                        )
+                    if expected_caption_revision_id is not None:
+                        if (
+                            crop["caption_state"] != "reviewed"
+                            or crop["caption_revision_id"] != UUID(expected_caption_revision_id)
+                        ):
+                            raise ReviewAssignmentConflictError("caption revision changed before edit")
+                        await connection.execute(
+                            "UPDATE annotation_crops SET caption_state = 'needs_review', updated_at = now() WHERE sample_id = $1 AND object_key = $2",
+                            sample_id,
+                            media_object_key,
+                        )
+                        await self._invalidate_pending_caption_source_reviews(
+                            connection,
+                            UUID(expected_caption_revision_id),
+                            reason="query_caption_revision_changed",
+                        )
+                    elif crop["caption_state"] != "needs_review":
                         raise ReviewAssignmentConflictError(
                             "caption review must reference an unreviewed stored crop"
                         )
@@ -270,7 +295,7 @@ class PostgresAnnotationRepository:
                     INSERT INTO review_assignments (
                         assignment_id, revision, sample_id, stage, bbox_revision,
                         label_studio_task_id, media_object_key, required_bytes, state
-                    ) VALUES ($1, $2, $3, 'bbox', $4, $5, $6, $7, 'active')
+                    ) VALUES ($1, $2, $3, 'bbox', $4, NULL, $5, $6, 'provisioning')
                     RETURNING assignment_id, revision, sample_id, stage, bbox_revision,
                               label_studio_task_id, media_object_key, required_bytes, state
                     """,
@@ -278,7 +303,6 @@ class PostgresAnnotationRepository:
                     new_revision,
                     sample_id,
                     old["bbox_revision"],
-                    old["label_studio_task_id"],
                     sample["object_key"],
                     required_bytes,
                 )
@@ -488,6 +512,11 @@ class PostgresAnnotationRepository:
                     or head["current_bbox_assignment_revision"] is not None
                 ):
                     raise ReviewAssignmentConflictError("bbox revision changed before crop reservation")
+                await self._invalidate_pending_bbox_crop_reviews(
+                    connection,
+                    sample_id=sample_id,
+                    current_bbox_revision=bbox_revision,
+                )
                 existing = await connection.fetch(
                     """
                     SELECT crop_id, sample_id, bbox_revision, region_index, region_id,
@@ -625,6 +654,8 @@ class PostgresAnnotationRepository:
                     FROM annotation_crops AS crop
                     JOIN ingestion_samples AS sample ON sample.sample_id = crop.sample_id
                     WHERE (crop.state = 'purge_pending'
+                           OR (crop.state = 'pending' AND
+                               sample.state IN ('purge_pending', 'expired'))
                            OR (crop.state = 'ready' AND (
                                sample.state IN ('purge_pending', 'expired')
                                OR crop.caption_state IN ('cancelled', 'rejected')
@@ -637,7 +668,8 @@ class PostgresAnnotationRepository:
                       AND NOT EXISTS (
                           SELECT 1 FROM review_assignments AS assignment
                           WHERE assignment.sample_id = crop.sample_id
-                            AND assignment.stage = 'caption' AND assignment.state = 'active'
+                            AND assignment.stage = 'caption'
+                            AND assignment.state IN ('provisioning', 'active')
                             AND assignment.media_object_key = crop.object_key
                       )
                     ORDER BY crop.created_at, crop.crop_id
@@ -648,10 +680,11 @@ class PostgresAnnotationRepository:
                 )
                 claimed: list[dict[str, Any]] = []
                 for row in rows:
-                    if row["state"] == "ready":
+                    if row["state"] in {"pending", "ready"}:
                         await connection.execute(
-                            "UPDATE annotation_crops SET state = 'purge_pending', updated_at = now() WHERE crop_id = $1",
+                            "UPDATE annotation_crops SET state = 'purge_pending', updated_at = now() WHERE crop_id = $1 AND state = $2",
                             row["crop_id"],
+                            row["state"],
                         )
                     claimed.append(
                         {
@@ -669,35 +702,64 @@ class PostgresAnnotationRepository:
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
-                deleted = await connection.fetchrow(
+                row = await connection.fetchrow(
                     """
-                    UPDATE annotation_crops
-                    SET state = 'deleted', crop_set_ready = FALSE, updated_at = now()
+                    SELECT sample_id, bbox_revision, object_size_bytes, quota_released
+                    FROM annotation_crops
                     WHERE crop_id = $1 AND state = 'purge_pending'
-                    RETURNING sample_id, bbox_revision, object_size_bytes
+                    FOR UPDATE
                     """,
                     crop_id,
                 )
-                if deleted is None:
+                if row is None:
                     return False
-                usage = await connection.fetchrow(
+                if not row["quota_released"]:
+                    usage = await connection.fetchrow(
+                        """
+                        UPDATE ingestion_storage_usage SET used_bytes = used_bytes - $1
+                        WHERE singleton = TRUE AND used_bytes >= $1 RETURNING used_bytes
+                        """,
+                        row["object_size_bytes"],
+                    )
+                    if usage is None:
+                        raise RuntimeError("object quota accounting is inconsistent during crop retention")
+                await connection.execute(
                     """
-                    UPDATE ingestion_storage_usage SET used_bytes = used_bytes - $1
-                    WHERE singleton = TRUE AND used_bytes >= $1 RETURNING used_bytes
+                    UPDATE annotation_crops
+                    SET state = 'deleted', quota_released = TRUE,
+                        crop_set_ready = FALSE, updated_at = now()
+                    WHERE crop_id = $1
                     """,
-                    deleted["object_size_bytes"],
+                    crop_id,
                 )
-                if usage is None:
-                    raise RuntimeError("object quota accounting is inconsistent during crop retention")
                 await connection.execute(
                     """
                     UPDATE annotation_crops SET crop_set_ready = FALSE, updated_at = now()
                     WHERE sample_id = $1 AND bbox_revision = $2
                     """,
-                    deleted["sample_id"],
-                    deleted["bbox_revision"],
+                    row["sample_id"],
+                    row["bbox_revision"],
                 )
                 return True
+
+    async def mark_crop_cleanup_pending(self, crop_id: UUID) -> None:
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    "SELECT state, quota_released FROM annotation_crops WHERE crop_id = $1 FOR UPDATE",
+                    crop_id,
+                )
+                if row is None:
+                    raise ReviewAssignmentNotFoundError("crop cleanup reservation does not exist")
+                if row["state"] == "purge_pending":
+                    return
+                if row["state"] != "deleted" or not row["quota_released"]:
+                    raise ReviewAssignmentConflictError("late crop cleanup is not eligible for reconciliation")
+                await connection.execute(
+                    "UPDATE annotation_crops SET state = 'purge_pending', updated_at = now() WHERE crop_id = $1",
+                    crop_id,
+                )
 
     async def adopt_for_dataset(
         self,
@@ -852,7 +914,9 @@ class PostgresAnnotationRepository:
         gallery: list[dict[str, str]],
         judgments: list[dict[str, str]],
         provenance: dict[str, Any],
+        query_source_caption_revision_id: str | None = None,
     ) -> dict[str, Any]:
+        """Prepare and immediately freeze a submitted human matrix through the review seam."""
         if not query_id or len(query_id) > 255 or not query_text.strip() or len(query_text) > 4096:
             raise ValueError("query ID and exact query text are required within the stored bounds")
         if not query_revision or len(query_revision) > 255:
@@ -863,6 +927,62 @@ class PostgresAnnotationRepository:
             raise ValueError("relevance truth must identify its submitted Label Studio annotation")
         if not (provenance.get("reviewer_id") or provenance.get("completed_by")):
             raise ValueError("relevance truth must record the human reviewer")
+
+        gallery_ids: set[UUID] = set()
+        for item in gallery:
+            if not isinstance(item, dict) or not isinstance(item.get("sha256"), str):
+                raise ValueError("each gallery crop requires its ID and SHA-256")
+            crop_id = UUID(item["crop_id"])
+            if crop_id in gallery_ids:
+                raise ValueError("gallery contains a duplicate crop ID")
+            gallery_ids.add(crop_id)
+        judgment_by_id: dict[UUID, str] = {}
+        for item in judgments:
+            if not isinstance(item, dict):
+                raise ValueError("each relevance judgment must be an object")
+            crop_id = UUID(item["crop_id"])
+            label = item.get("judgment")
+            if label not in {"relevant", "not_relevant", "uncertain"}:
+                raise ValueError("judgment must be relevant, not_relevant, or uncertain")
+            if crop_id in judgment_by_id:
+                raise ValueError("relevance matrix contains a duplicate crop judgment")
+            judgment_by_id[crop_id] = label
+        if set(judgment_by_id) != gallery_ids:
+            raise ValueError("every selected gallery crop must have exactly one human judgment")
+        labels = list(judgment_by_id.values())
+        if "relevant" not in labels or "not_relevant" not in labels:
+            raise ValueError("evaluation truth requires at least one positive and one negative")
+
+        draft = await self.prepare_relevance_review(
+            query_id=query_id,
+            query_text=query_text,
+            query_revision=query_revision,
+            gallery=gallery,
+            query_source_caption_revision_id=query_source_caption_revision_id,
+        )
+        return await self.freeze_relevance_review(
+            review_id=draft["review_id"],
+            judgments=judgments,
+            provenance=provenance,
+        )
+
+    async def prepare_relevance_review(
+        self,
+        *,
+        query_id: str,
+        query_text: str,
+        query_revision: str,
+        gallery: list[dict[str, str]],
+        query_source_caption_revision_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Snapshot exact gallery and optional caption-source dependencies for later freeze."""
+        if not query_id or len(query_id) > 255 or not query_text.strip() or len(query_text) > 4096:
+            raise ValueError("query ID and exact query text are required within the stored bounds")
+        if not query_revision or len(query_revision) > 255:
+            raise ValueError("query_revision must contain 1 to 255 characters")
+        if not gallery:
+            raise ValueError("a complete gallery is required before relevance review")
+        source_caption_id = UUID(query_source_caption_revision_id) if query_source_caption_revision_id else None
 
         gallery_by_id: dict[UUID, str] = {}
         for item in gallery:
@@ -875,7 +995,246 @@ class PostgresAnnotationRepository:
             if crop_id in gallery_by_id:
                 raise ValueError("gallery contains a duplicate crop ID")
             gallery_by_id[crop_id] = crop_sha
+        gallery_records = [
+            {"crop_id": str(crop_id), "sha256": gallery_by_id[crop_id]}
+            for crop_id in sorted(gallery_by_id, key=str)
+        ]
+        query_sha256 = sha256(
+            json.dumps(
+                {"query_id": query_id, "query_revision": query_revision, "query_text": query_text},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        gallery_sha256 = sha256(
+            json.dumps(gallery_records, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                stale_reason = await self._lock_current_relevance_dependencies(
+                    connection,
+                    gallery=gallery_records,
+                    query_source_caption_revision_id=source_caption_id,
+                )
+                if stale_reason is not None:
+                    raise ReviewAssignmentConflictError(stale_reason)
+                review_id = uuid4()
+                record = await connection.fetchrow(
+                    """
+                    INSERT INTO relevance_matrix_review_drafts (
+                        review_id, query_id, query_text, query_revision,
+                        query_source_caption_revision_id, query_sha256, gallery_sha256, state
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+                    RETURNING review_id, query_id, query_text, query_revision,
+                              query_source_caption_revision_id, query_sha256, gallery_sha256,
+                              state, invalidation_reason, frozen_relevance_revision_id, created_at
+                    """,
+                    review_id,
+                    query_id,
+                    query_text,
+                    query_revision,
+                    source_caption_id,
+                    query_sha256,
+                    gallery_sha256,
+                )
+                await connection.executemany(
+                    """
+                    INSERT INTO relevance_matrix_review_crops (review_id, crop_id, crop_sha256)
+                    VALUES ($1, $2, $3)
+                    """,
+                    [
+                        (review_id, crop_id, gallery_by_id[crop_id])
+                        for crop_id in sorted(gallery_by_id, key=str)
+                    ],
+                )
+        return {
+            "review_id": str(record["review_id"]),
+            "query_id": record["query_id"],
+            "query_text": record["query_text"],
+            "query_revision": record["query_revision"],
+            "query_source_caption_revision_id": (
+                str(record["query_source_caption_revision_id"])
+                if record["query_source_caption_revision_id"] is not None
+                else None
+            ),
+            "query_sha256": record["query_sha256"].strip(),
+            "gallery_sha256": record["gallery_sha256"].strip(),
+            "state": record["state"],
+            "invalidation_reason": record["invalidation_reason"],
+            "frozen_relevance_revision_id": None,
+            "created_at": record["created_at"].isoformat(),
+            "gallery": gallery_records,
+        }
+
+    async def relevance_review(self, review_id: str) -> dict[str, Any]:
+        """Return current-selection state, invalidating stale pending dependencies on read."""
+        review_uuid = UUID(review_id)
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                review = await connection.fetchrow(
+                    "SELECT * FROM relevance_matrix_review_drafts WHERE review_id = $1",
+                    review_uuid,
+                )
+                if review is None:
+                    raise ReviewAssignmentNotFoundError("relevance review draft does not exist")
+                gallery_rows = await connection.fetch(
+                    """
+                    SELECT crop_id, crop_sha256 FROM relevance_matrix_review_crops
+                    WHERE review_id = $1 ORDER BY crop_id
+                    """,
+                    review_uuid,
+                )
+                gallery = [
+                    {"crop_id": str(row["crop_id"]), "sha256": row["crop_sha256"].strip()}
+                    for row in gallery_rows
+                ]
+                if review["state"] == "pending":
+                    stale_reason = await self._lock_current_relevance_dependencies(
+                        connection,
+                        gallery=gallery,
+                        query_source_caption_revision_id=review["query_source_caption_revision_id"],
+                    )
+                    current = await connection.fetchrow(
+                        "SELECT * FROM relevance_matrix_review_drafts WHERE review_id = $1 FOR UPDATE",
+                        review_uuid,
+                    )
+                    if current["state"] == "pending" and stale_reason is not None:
+                        await connection.execute(
+                            """
+                            UPDATE relevance_matrix_review_drafts
+                            SET state = 'needs_review', invalidation_reason = $2, updated_at = now()
+                            WHERE review_id = $1 AND state = 'pending'
+                            """,
+                            review_uuid,
+                            stale_reason,
+                        )
+                        review = await connection.fetchrow(
+                            "SELECT * FROM relevance_matrix_review_drafts WHERE review_id = $1",
+                            review_uuid,
+                        )
+                    else:
+                        review = current
+        return _relevance_review_dict(review, gallery)
+
+    async def freeze_relevance_review(
+        self,
+        *,
+        review_id: str,
+        judgments: list[dict[str, str]],
+        provenance: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Freeze a pending matrix in its own transaction for non-publication callers."""
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                result = await self.freeze_relevance_review_in_transaction(
+                    connection,
+                    review_id=review_id,
+                    judgments=judgments,
+                    provenance=provenance,
+                )
+        if result["state"] == "needs_review":
+            raise ReviewAssignmentConflictError(result["invalidation_reason"])
+        if result.get("revision") is not None:
+            return result["revision"]
+        return await self.relevance_revision(result["frozen_relevance_revision_id"])
+
+    async def freeze_relevance_review_in_transaction(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        review_id: str,
+        judgments: list[dict[str, str]],
+        provenance: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Freeze truth on a caller-owned publication transaction and return its outcome.
+
+        Lock order is sample rows by UUID, annotation heads by sample UUID, crop rows by
+        crop UUID, then this draft row. Caption and bbox edits use the same order before
+        invalidating drafts. A publisher must call this helper inside its transaction,
+        publish only when the returned state is ``frozen``, and commit its publication rows
+        together with the returned frozen revision. A ``needs_review`` result is a durable
+        stop signal; the caller must not publish that draft.
+        """
+        if not isinstance(provenance, dict):
+            raise ValueError("human provenance is required")
+        if provenance.get("source") != "label_studio" or not provenance.get("label_studio_annotation_id"):
+            raise ValueError("relevance truth must identify its submitted Label Studio annotation")
+        if not (provenance.get("reviewer_id") or provenance.get("completed_by")):
+            raise ValueError("relevance truth must record the human reviewer")
+
+        review_uuid = UUID(review_id)
+        review = await connection.fetchrow(
+            "SELECT * FROM relevance_matrix_review_drafts WHERE review_id = $1",
+            review_uuid,
+        )
+        if review is None:
+            raise ReviewAssignmentNotFoundError("relevance review draft does not exist")
+        if review["state"] == "frozen":
+            return {
+                "state": "frozen",
+                "review_id": str(review_uuid),
+                "frozen_relevance_revision_id": str(review["frozen_relevance_revision_id"]),
+                "revision": None,
+            }
+        gallery_rows = await connection.fetch(
+            """
+            SELECT crop_id, crop_sha256 FROM relevance_matrix_review_crops
+            WHERE review_id = $1 ORDER BY crop_id
+            """,
+            review_uuid,
+        )
+        gallery = [
+            {"crop_id": str(row["crop_id"]), "sha256": row["crop_sha256"].strip()}
+            for row in gallery_rows
+        ]
+        stale_reason = await self._lock_current_relevance_dependencies(
+            connection,
+            gallery=gallery,
+            query_source_caption_revision_id=review["query_source_caption_revision_id"],
+        )
+        current = await connection.fetchrow(
+            "SELECT * FROM relevance_matrix_review_drafts WHERE review_id = $1 FOR UPDATE",
+            review_uuid,
+        )
+        if current["state"] == "frozen":
+            return {
+                "state": "frozen",
+                "review_id": str(review_uuid),
+                "frozen_relevance_revision_id": str(current["frozen_relevance_revision_id"]),
+                "revision": None,
+            }
+        if current["state"] != "pending":
+            return {
+                "state": current["state"],
+                "review_id": str(review_uuid),
+                "invalidation_reason": current["invalidation_reason"],
+                "frozen_relevance_revision_id": None,
+                "revision": None,
+            }
+        if stale_reason is not None:
+            await connection.execute(
+                """
+                UPDATE relevance_matrix_review_drafts
+                SET state = 'needs_review', invalidation_reason = $2, updated_at = now()
+                WHERE review_id = $1 AND state = 'pending'
+                """,
+                review_uuid,
+                stale_reason,
+            )
+            return {
+                "state": "needs_review",
+                "review_id": str(review_uuid),
+                "invalidation_reason": stale_reason,
+                "frozen_relevance_revision_id": None,
+                "revision": None,
+            }
+
+        gallery_by_id = {UUID(item["crop_id"]): item["sha256"] for item in gallery}
         judgment_by_id: dict[UUID, str] = {}
         for item in judgments:
             if not isinstance(item, dict):
@@ -905,10 +1264,18 @@ class PostgresAnnotationRepository:
             }
             for crop_id in sorted(judgment_by_id, key=str)
         ]
-        gallery_json = json.dumps(gallery_records, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        judgments_json = json.dumps(judgments_records, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        gallery_json = json.dumps(
+            gallery_records, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        judgments_json = json.dumps(
+            judgments_records, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
         query_json = json.dumps(
-            {"query_id": query_id, "query_revision": query_revision, "query_text": query_text},
+            {
+                "query_id": current["query_id"],
+                "query_revision": current["query_revision"],
+                "query_text": current["query_text"],
+            },
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -918,7 +1285,6 @@ class PostgresAnnotationRepository:
         judgments_sha256 = sha256(judgments_json.encode("utf-8")).hexdigest()
         unresolved_count = labels.count("uncertain")
         status = "unresolved" if unresolved_count else "complete"
-        evaluation_eligible = status == "complete"
         revision_id = uuid4()
         saved_provenance = {
             **provenance,
@@ -926,69 +1292,172 @@ class PostgresAnnotationRepository:
             "gallery_sha256": gallery_sha256,
             "judgments_sha256": judgments_sha256,
             "gallery_count": len(gallery_records),
+            "query_source_caption_revision_id": (
+                str(current["query_source_caption_revision_id"])
+                if current["query_source_caption_revision_id"] is not None
+                else None
+            ),
+        }
+        revision_record = await connection.fetchrow(
+            """
+            INSERT INTO relevance_matrix_revisions (
+                relevance_revision_id, query_id, query_text, query_revision,
+                query_sha256, gallery_sha256, judgments_sha256, status,
+                evaluation_eligible, provenance
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+            RETURNING relevance_revision_id, query_id, query_text, query_revision,
+                      query_sha256, gallery_sha256, judgments_sha256, status,
+                      evaluation_eligible, provenance, created_at
+            """,
+            revision_id,
+            current["query_id"],
+            current["query_text"],
+            current["query_revision"],
+            query_sha256,
+            gallery_sha256,
+            judgments_sha256,
+            status,
+            status == "complete",
+            json.dumps(saved_provenance, ensure_ascii=False, sort_keys=True),
+        )
+        await connection.executemany(
+            """
+            INSERT INTO relevance_judgments (
+                relevance_revision_id, crop_id, crop_sha256, judgment
+            ) VALUES ($1, $2, $3, $4)
+            """,
+            [
+                (revision_id, crop_id, gallery_by_id[crop_id], judgment_by_id[crop_id])
+                for crop_id in sorted(judgment_by_id, key=str)
+            ],
+        )
+        await connection.execute(
+            """
+            UPDATE relevance_matrix_review_drafts
+            SET state = 'frozen', frozen_relevance_revision_id = $2,
+                invalidation_reason = NULL, updated_at = now()
+            WHERE review_id = $1 AND state = 'pending'
+            """,
+            review_uuid,
+            revision_id,
+        )
+        revision = _relevance_revision_dict(
+            revision_record,
+            positive_count=labels.count("relevant"),
+            negative_count=labels.count("not_relevant"),
+            uncertain_count=unresolved_count,
+        )
+        return {
+            "state": "frozen",
+            "review_id": str(review_uuid),
+            "frozen_relevance_revision_id": str(revision_id),
+            "revision": revision,
         }
 
-        pool = await self._get_pool()
-        async with pool.acquire() as connection:
-            async with connection.transaction():
-                actual = await connection.fetch(
-                    """
-                    SELECT crop_id, sha256, state, crop_set_ready
-                    FROM annotation_crops WHERE crop_id = ANY($1::uuid[])
-                    ORDER BY crop_id FOR SHARE
-                    """,
-                    list(gallery_by_id),
-                )
-                actual_by_id = {row["crop_id"]: row for row in actual}
-                if set(actual_by_id) != set(gallery_by_id):
-                    raise ReviewAssignmentConflictError("gallery includes a missing or deleted crop")
-                for crop_id, expected_sha in gallery_by_id.items():
-                    row = actual_by_id[crop_id]
-                    if (
-                        row["sha256"].strip() != expected_sha
-                        or row["state"] != "ready"
-                        or not row["crop_set_ready"]
-                    ):
-                        raise ReviewAssignmentConflictError("gallery crop bytes or revision changed")
-                record = await connection.fetchrow(
-                    """
-                    INSERT INTO relevance_matrix_revisions (
-                        relevance_revision_id, query_id, query_text, query_revision,
-                        query_sha256, gallery_sha256, judgments_sha256, status,
-                        evaluation_eligible, provenance
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
-                    RETURNING relevance_revision_id, query_id, query_text, query_revision,
-                              query_sha256, gallery_sha256, judgments_sha256, status,
-                              evaluation_eligible, provenance, created_at
-                    """,
-                    revision_id,
-                    query_id,
-                    query_text,
-                    query_revision,
-                    query_sha256,
-                    gallery_sha256,
-                    judgments_sha256,
-                    status,
-                    evaluation_eligible,
-                    json.dumps(saved_provenance, ensure_ascii=False, sort_keys=True),
-                )
-                await connection.executemany(
-                    """
-                    INSERT INTO relevance_judgments (
-                        relevance_revision_id, crop_id, crop_sha256, judgment
-                    ) VALUES ($1, $2, $3, $4)
-                    """,
-                    [
-                        (revision_id, crop_id, gallery_by_id[crop_id], judgment_by_id[crop_id])
-                        for crop_id in sorted(judgment_by_id, key=str)
-                    ],
-                )
-                return _relevance_revision_dict(
-                    record,
-                    positive_count=labels.count("relevant"),
-                    negative_count=labels.count("not_relevant"),
-                    uncertain_count=unresolved_count,
-                )
+    async def _lock_current_relevance_dependencies(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        gallery: list[dict[str, str]],
+        query_source_caption_revision_id: UUID | None,
+    ) -> str | None:
+        gallery_ids = [UUID(item["crop_id"]) for item in gallery]
+        gallery_id_set = set(gallery_ids)
+        gallery_sources = await connection.fetch(
+            "SELECT crop_id, sample_id FROM annotation_crops WHERE crop_id = ANY($1::uuid[])",
+            gallery_ids,
+        )
+        if len(gallery_sources) != len(gallery_id_set):
+            return "gallery_crop_revision_changed"
+        sample_ids = {row["sample_id"] for row in gallery_sources}
+        source_revision = None
+        source_crop_ids: set[UUID] = set()
+        if query_source_caption_revision_id is not None:
+            source_revision = await connection.fetchrow(
+                """
+                SELECT sample_id, stage FROM annotation_revisions
+                WHERE annotation_revision_id = $1
+                """,
+                query_source_caption_revision_id,
+            )
+            if source_revision is None or source_revision["stage"] != "caption":
+                return "query_caption_revision_changed"
+            sample_ids.add(source_revision["sample_id"])
+            source_crops = await connection.fetch(
+                "SELECT crop_id FROM annotation_crops WHERE caption_revision_id = $1",
+                query_source_caption_revision_id,
+            )
+            source_crop_ids = {row["crop_id"] for row in source_crops}
+
+        sorted_samples = sorted(sample_ids, key=str)
+        if sorted_samples:
+            await connection.fetch(
+                """
+                SELECT sample_id FROM ingestion_samples
+                WHERE sample_id = ANY($1::uuid[])
+                ORDER BY sample_id FOR SHARE
+                """,
+                sorted_samples,
+            )
+        head_rows = await connection.fetch(
+            """
+            SELECT sample_id, latest_bbox_revision, current_bbox_assignment_revision
+            FROM sample_annotation_heads
+            WHERE sample_id = ANY($1::uuid[])
+            ORDER BY sample_id FOR SHARE
+            """,
+            sorted_samples,
+        ) if sorted_samples else []
+        heads = {row["sample_id"]: row for row in head_rows}
+        dependency_ids = sorted(gallery_id_set | source_crop_ids, key=str)
+        crop_rows = await connection.fetch(
+            """
+            SELECT crop_id, sample_id, bbox_revision, sha256, state, caption_state,
+                   caption_revision_id, crop_set_ready
+            FROM annotation_crops
+            WHERE crop_id = ANY($1::uuid[])
+            ORDER BY crop_id FOR SHARE
+            """,
+            dependency_ids,
+        ) if dependency_ids else []
+        crops = {row["crop_id"]: row for row in crop_rows}
+
+        for item in gallery:
+            crop_id = UUID(item["crop_id"])
+            crop = crops.get(crop_id)
+            if (
+                crop is None
+                or crop["sha256"].strip() != item["sha256"]
+                or crop["state"] != "ready"
+                or not crop["crop_set_ready"]
+            ):
+                return "gallery_crop_revision_changed"
+            head = heads.get(crop["sample_id"])
+            if (
+                head is None
+                or head["latest_bbox_revision"] != crop["bbox_revision"]
+                or head["current_bbox_assignment_revision"] is not None
+            ):
+                return "gallery_crop_revision_changed"
+
+        if query_source_caption_revision_id is not None:
+            matching = [
+                crop for crop in crops.values()
+                if crop["caption_revision_id"] == query_source_caption_revision_id
+            ]
+            if len(matching) != 1:
+                return "query_caption_revision_changed"
+            crop = matching[0]
+            head = heads.get(crop["sample_id"])
+            if (
+                crop["state"] != "ready"
+                or crop["caption_state"] != "reviewed"
+                or head is None
+                or head["latest_bbox_revision"] != crop["bbox_revision"]
+                or head["current_bbox_assignment_revision"] is not None
+            ):
+                return "query_caption_revision_changed"
+        return None
 
     async def relevance_revision(self, revision_id: str) -> dict[str, Any]:
         pool = await self._get_pool()
@@ -1042,21 +1511,6 @@ class PostgresAnnotationRepository:
             )
         if record is None:
             raise ReviewAssignmentNotFoundError("review revision does not exist for this sample")
-        return assignment_from_record(record)
-
-    async def assignment_by_revision(self, revision: str) -> ReviewAssignment:
-        pool = await self._get_pool()
-        async with pool.acquire() as connection:
-            record = await connection.fetchrow(
-                """
-                SELECT assignment_id, revision, sample_id, stage, bbox_revision,
-                       label_studio_task_id, media_object_key, required_bytes, state
-                FROM review_assignments WHERE revision = $1
-                """,
-                UUID(revision),
-            )
-        if record is None:
-            raise ReviewAssignmentNotFoundError("review revision does not exist")
         return assignment_from_record(record)
 
     async def assignment_by_revision(self, revision: str) -> ReviewAssignment:
@@ -1242,7 +1696,11 @@ class PostgresAnnotationRepository:
                     revision_id,
                 )
                 assignment = await connection.fetchrow(
-                    "SELECT state FROM review_assignments WHERE revision = $1 FOR UPDATE",
+                    """
+                    SELECT sample_id, stage, bbox_revision, state,
+                           media_object_key, required_bytes
+                    FROM review_assignments WHERE revision = $1 FOR UPDATE
+                    """,
                     revision_id,
                 )
                 if media is None or assignment is None:
@@ -1257,6 +1715,24 @@ class PostgresAnnotationRepository:
                     return _label_studio_upload_dict(media)
                 if assignment["state"] != "provisioning" or media["state"] != "reserved":
                     raise ReviewAssignmentConflictError("review assignment cannot bind Label Studio media")
+                if assignment["stage"] == "caption":
+                    crop = await connection.fetchrow(
+                        """
+                        SELECT bbox_revision, state, caption_state, object_size_bytes
+                        FROM annotation_crops
+                        WHERE sample_id = $1 AND object_key = $2 FOR UPDATE
+                        """,
+                        assignment["sample_id"],
+                        assignment["media_object_key"],
+                    )
+                    if (
+                        crop is None
+                        or crop["state"] != "ready"
+                        or crop["caption_state"] != "needs_review"
+                        or crop["bbox_revision"] != UUID(assignment["bbox_revision"])
+                        or crop["object_size_bytes"] != assignment["required_bytes"]
+                    ):
+                        raise ReviewAssignmentConflictError("caption crop expired or changed before media bind")
                 media = await connection.fetchrow(
                     """
                     UPDATE label_studio_media_uploads
@@ -1569,7 +2045,7 @@ class PostgresAnnotationRepository:
                 elif current["stage"] == "caption":
                     crop = await connection.fetchrow(
                         """
-                        SELECT bbox_revision, state, caption_state
+                        SELECT bbox_revision, state, caption_state, caption_revision_id
                         FROM annotation_crops
                         WHERE sample_id = $1 AND object_key = $2 FOR UPDATE
                         """,
@@ -1614,6 +2090,11 @@ class PostgresAnnotationRepository:
                     UUID(assignment.revision),
                 )
                 if assignment.stage == "bbox":
+                    await self._invalidate_pending_bbox_crop_reviews(
+                        connection,
+                        sample_id=assignment.sample_id,
+                        current_bbox_revision=annotation_revision_id,
+                    )
                     await connection.execute(
                         """
                         UPDATE sample_annotation_heads
@@ -1629,6 +2110,13 @@ class PostgresAnnotationRepository:
                         assignment.sample_id,
                     )
                 elif assignment.stage == "caption":
+                    prior_caption_revision_id = crop["caption_revision_id"]
+                    if prior_caption_revision_id is not None and prior_caption_revision_id != annotation_revision_id:
+                        await self._invalidate_pending_caption_source_reviews(
+                            connection,
+                            prior_caption_revision_id,
+                            reason="query_caption_revision_changed",
+                        )
                     updated = await connection.execute(
                         """
                         UPDATE annotation_crops
@@ -1667,6 +2155,51 @@ class PostgresAnnotationRepository:
                 "SELECT count(*) FROM annotation_revisions WHERE sample_id = $1", sample_id
             )
         return int(count)
+
+    async def _invalidate_pending_caption_source_reviews(
+        self,
+        connection: asyncpg.Connection,
+        caption_revision_id: UUID,
+        *,
+        reason: str,
+    ) -> None:
+        await connection.execute(
+            """
+            UPDATE relevance_matrix_review_drafts
+            SET state = 'needs_review', invalidation_reason = $2, updated_at = now()
+            WHERE state = 'pending'
+              AND query_source_caption_revision_id = $1
+            """,
+            caption_revision_id,
+            reason,
+        )
+
+    async def _invalidate_pending_bbox_crop_reviews(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        sample_id: UUID,
+        current_bbox_revision: UUID,
+    ) -> None:
+        await connection.execute(
+            """
+            UPDATE relevance_matrix_review_drafts AS review
+            SET state = 'needs_review',
+                invalidation_reason = 'gallery_crop_revision_changed',
+                updated_at = now()
+            WHERE review.state = 'pending'
+              AND EXISTS (
+                  SELECT 1
+                  FROM relevance_matrix_review_crops AS dependency
+                  JOIN annotation_crops AS crop ON crop.crop_id = dependency.crop_id
+                  WHERE dependency.review_id = review.review_id
+                    AND crop.sample_id = $1
+                    AND crop.bbox_revision <> $2
+              )
+            """,
+            sample_id,
+            current_bbox_revision,
+        )
 
     async def close(self) -> None:
         if self._pool is not None:
@@ -1793,6 +2326,32 @@ def _relevance_revision_dict(
         "positive_count": positive_count,
         "negative_count": negative_count,
         "uncertain_count": uncertain_count,
+    }
+
+
+def _relevance_review_dict(record: Any, gallery: list[dict[str, str]]) -> dict[str, Any]:
+    return {
+        "review_id": str(record["review_id"]),
+        "query_id": record["query_id"],
+        "query_text": record["query_text"],
+        "query_revision": record["query_revision"],
+        "query_source_caption_revision_id": (
+            str(record["query_source_caption_revision_id"])
+            if record["query_source_caption_revision_id"] is not None
+            else None
+        ),
+        "query_sha256": record["query_sha256"].strip(),
+        "gallery_sha256": record["gallery_sha256"].strip(),
+        "state": record["state"],
+        "invalidation_reason": record["invalidation_reason"],
+        "frozen_relevance_revision_id": (
+            str(record["frozen_relevance_revision_id"])
+            if record["frozen_relevance_revision_id"] is not None
+            else None
+        ),
+        "created_at": record["created_at"].isoformat(),
+        "is_current": record["state"] == "pending",
+        "gallery": gallery,
     }
 
 

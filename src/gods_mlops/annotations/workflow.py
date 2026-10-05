@@ -39,6 +39,7 @@ class LabelStudioReviewWorkflow:
         bbox_revision: str | None,
         media_object_key: str,
         required_bytes: int,
+        expected_caption_revision_id: str | None = None,
     ) -> ReviewAssignment:
         """Reserve source media and review quota before any Label Studio upload."""
         if project_id <= 0:
@@ -50,6 +51,7 @@ class LabelStudioReviewWorkflow:
             bbox_revision=bbox_revision,
             media_object_key=media_object_key,
             required_bytes=required_bytes,
+            expected_caption_revision_id=expected_caption_revision_id,
         )
 
     async def provision_task(

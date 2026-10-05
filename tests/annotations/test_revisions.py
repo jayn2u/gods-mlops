@@ -253,7 +253,7 @@ def test_bbox_edit_wins_race_with_old_finalize_without_mixing_revisions() -> Non
             assert edited.revision != assignment.revision
             assert edited.bbox_revision == assignment.bbox_revision
             assert await repository.assignment_state(assignment.revision) == "superseded"
-            assert await repository.assignment_state(edited.revision) == "active"
+            assert await repository.assignment_state(edited.revision) == "provisioning"
             assert await repository.annotation_revision_count(sample_id) == 0
         finally:
             await repository.close()

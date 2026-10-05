@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import io
 import os
+import threading
+from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -12,9 +14,13 @@ import pytest
 from PIL import Image, ImageDraw
 
 from gods_mlops.annotations.crops import CropService
+from gods_mlops.annotations.label_studio import LabelStudioTaskReference
+from gods_mlops.annotations.models import ReviewAssignmentConflictError
 from gods_mlops.annotations.service import AnnotationService
 from gods_mlops.annotations.storage import PostgresAnnotationRepository
+from gods_mlops.annotations.workflow import LabelStudioReviewWorkflow
 from gods_mlops.ingestion.storage import PostgresIngestionRepository, S3SampleStore
+from gods_mlops.retention.service import RetentionService
 
 
 class SubmittedBBoxTask:
@@ -36,6 +42,100 @@ def _configured() -> tuple[str, str, str, str, str] | None:
     )
     values = tuple(os.environ.get(key, "") for key in keys)
     return values if all(values) else None
+
+
+async def _seed_single_bbox_source(
+    *,
+    database_url: str,
+    objects: S3SampleStore,
+) -> tuple[PostgresIngestionRepository, PostgresAnnotationRepository, UUID, str, bytes, str, int]:
+    ingestion = PostgresIngestionRepository(database_url=database_url)
+    await ingestion.ensure_schema()
+    annotations = PostgresAnnotationRepository(database_url=database_url)
+    await annotations.ensure_schema()
+    initial_usage = await ingestion.storage_bytes()
+    sample_id, camera_id = uuid4(), uuid4()
+    image = Image.new("RGB", (100, 50), "white")
+    frame_buffer = io.BytesIO()
+    image.save(frame_buffer, format="JPEG", quality=92)
+    frame_bytes = frame_buffer.getvalue()
+    frame_sha = hashlib.sha256(frame_bytes).hexdigest()
+    frame_key = f"samples/{camera_id}/{sample_id}/{frame_sha}.jpg"
+    objects.ensure_object(object_key=frame_key, image=frame_bytes, expected_sha256=frame_sha)
+    connection = await asyncpg.connect(database_url)
+    try:
+        await connection.execute(
+            """
+            INSERT INTO ingestion_samples (
+                sample_id, camera_id, capture_day, captured_at_utc, reason, sha256,
+                model_revision, processor_revision, object_key, object_size_bytes,
+                receipt_id, state, received_at, retention_until
+            ) VALUES ($1, $2, DATE '2026-10-05', $3, 'periodic', $4,
+                'detector-test', 'processor-test', $5, $6, $7, 'received', $3, $8)
+            """,
+            sample_id,
+            camera_id,
+            datetime.now(timezone.utc),
+            frame_sha,
+            frame_key,
+            len(frame_bytes),
+            uuid4(),
+            datetime.now(timezone.utc) + timedelta(days=7),
+        )
+        await connection.execute(
+            "UPDATE ingestion_storage_usage SET used_bytes = used_bytes + $1 WHERE singleton = TRUE",
+            len(frame_bytes),
+        )
+    finally:
+        await connection.close()
+    task_id = uuid4().int % 2_000_000_000 + 1
+    assignment = await annotations.create_review_assignment(
+        sample_id=sample_id,
+        stage="bbox",
+        label_studio_task_id=task_id,
+        bbox_revision="detector-draft-0",
+        media_object_key=frame_key,
+        required_bytes=len(frame_bytes),
+    )
+    bbox_task = {
+        "id": task_id,
+        "annotations": [
+            {
+                "id": uuid4().int % 2_000_000_000 + 1,
+                "was_cancelled": False,
+                "completed_by": {"id": 11, "email": "reviewer@example.invalid"},
+                "result": [
+                    {
+                        "id": "person",
+                        "from_name": "bbox",
+                        "type": "rectanglelabels",
+                        "original_width": 100,
+                        "original_height": 50,
+                        "value": {
+                            "x": 10,
+                            "y": 10,
+                            "width": 70,
+                            "height": 80,
+                            "rectanglelabels": ["person"],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+    bbox_revision = await AnnotationService(
+        repository=annotations,
+        label_studio=SubmittedBBoxTask(bbox_task),
+    ).finalize_annotation(str(sample_id), assignment.revision)
+    return (
+        ingestion,
+        annotations,
+        sample_id,
+        frame_key,
+        frame_bytes,
+        bbox_revision["annotation_revision_id"],
+        initial_usage,
+    )
 
 
 def test_create_crop_writes_verified_s3_media_with_bbox_revision_provenance() -> None:
@@ -398,6 +498,332 @@ def test_crop_retry_reuses_reserved_bytes_and_hides_incomplete_crop_set() -> Non
             assert await ingestion.storage_bytes() == usage_after_failed_response
         finally:
             await repository.close()
+            await ingestion.close()
+
+    asyncio.run(exercise())
+
+
+def test_unadopted_pending_crop_expiry_removes_lost_ack_object_and_releases_bytes() -> None:
+    configured = _configured()
+    if configured is None:
+        pytest.skip("isolated PostgreSQL and S3 test endpoints are not configured")
+    database_url, s3_endpoint, access_key, secret_key, bucket = configured
+    objects = S3SampleStore(
+        endpoint_url=s3_endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
+        bucket=bucket,
+        region="us-east-1",
+    )
+    now = datetime.now(timezone.utc)
+
+    class LoseCropPutResponse(S3SampleStore):
+        def ensure_object(self, *, object_key: str, image: bytes, expected_sha256: str) -> None:
+            super().ensure_object(object_key=object_key, image=image, expected_sha256=expected_sha256)
+            if object_key.startswith("crops/"):
+                raise OSError("injected crop PUT acknowledgment loss")
+
+    async def exercise() -> None:
+        ingestion, annotations, sample_id, frame_key, frame_bytes, bbox_revision, initial_usage = (
+            await _seed_single_bbox_source(database_url=database_url, objects=objects)
+        )
+        flaky_store = LoseCropPutResponse(
+            endpoint_url=s3_endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            bucket=bucket,
+            region="us-east-1",
+        )
+        try:
+            with pytest.raises(OSError, match="acknowledgment loss"):
+                await CropService(repository=annotations, objects=flaky_store).create_crop(
+                    str(sample_id), bbox_revision
+                )
+            pending = await annotations.crops_for_revision(
+                sample_id=sample_id,
+                bbox_revision=UUID(bbox_revision),
+            )
+            assert len(pending) == 1
+            assert pending[0]["state"] == "pending"
+            assert pending[0]["crop_set_ready"] is False
+            assert objects.read_object(
+                object_key=pending[0]["object_key"],
+                expected_sha256=pending[0]["sha256"],
+            )
+
+            connection = await asyncpg.connect(database_url)
+            try:
+                await connection.execute(
+                    "UPDATE ingestion_samples SET retention_until = $2 WHERE sample_id = $1",
+                    sample_id,
+                    now - timedelta(seconds=1),
+                )
+            finally:
+                await connection.close()
+
+            await RetentionService(
+                repository=ingestion,
+                objects=objects,
+                annotations=annotations,
+            ).expire_candidates(now)
+
+            expired = await annotations.crops_for_revision(
+                sample_id=sample_id,
+                bbox_revision=UUID(bbox_revision),
+            )
+            assert expired[0]["state"] == "deleted"
+            assert await ingestion.sample_state(sample_id) == "expired"
+            with pytest.raises(FileNotFoundError):
+                objects.read_object(object_key=frame_key, expected_sha256=hashlib.sha256(frame_bytes).hexdigest())
+            with pytest.raises(FileNotFoundError):
+                objects.read_object(
+                    object_key=expired[0]["object_key"],
+                    expected_sha256=expired[0]["sha256"],
+                )
+            assert await ingestion.storage_bytes() == initial_usage
+        finally:
+            await annotations.close()
+            await ingestion.close()
+
+    asyncio.run(exercise())
+
+
+def test_expiry_fences_a_late_crop_writer_and_retries_failed_cleanup() -> None:
+    configured = _configured()
+    if configured is None:
+        pytest.skip("isolated PostgreSQL and S3 test endpoints are not configured")
+    database_url, s3_endpoint, access_key, secret_key, bucket = configured
+    objects = S3SampleStore(
+        endpoint_url=s3_endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
+        bucket=bucket,
+        region="us-east-1",
+    )
+    now = datetime.now(timezone.utc)
+    write_started = threading.Event()
+    release_write = threading.Event()
+
+    class BlockLateCropPut(S3SampleStore):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.fail_delete_once = True
+
+        def ensure_object(self, *, object_key: str, image: bytes, expected_sha256: str) -> None:
+            if object_key.startswith("crops/"):
+                write_started.set()
+                if not release_write.wait(timeout=10):
+                    raise TimeoutError("crop upload test writer was not released")
+            super().ensure_object(object_key=object_key, image=image, expected_sha256=expected_sha256)
+
+        def delete_object(self, object_key: str) -> None:
+            if object_key.startswith("crops/") and self.fail_delete_once:
+                self.fail_delete_once = False
+                raise OSError("injected late crop cleanup failure")
+            super().delete_object(object_key)
+
+    async def exercise() -> None:
+        ingestion, annotations, sample_id, frame_key, frame_bytes, bbox_revision, initial_usage = (
+            await _seed_single_bbox_source(database_url=database_url, objects=objects)
+        )
+        late_store = BlockLateCropPut(
+            endpoint_url=s3_endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            bucket=bucket,
+            region="us-east-1",
+        )
+        writer = None
+        try:
+            writer = asyncio.create_task(
+                CropService(repository=annotations, objects=late_store).create_crop(
+                    str(sample_id), bbox_revision
+                )
+            )
+            assert await asyncio.wait_for(asyncio.to_thread(write_started.wait, 5), timeout=6)
+            connection = await asyncpg.connect(database_url)
+            try:
+                await connection.execute(
+                    "UPDATE ingestion_samples SET retention_until = $2 WHERE sample_id = $1",
+                    sample_id,
+                    now - timedelta(seconds=1),
+                )
+            finally:
+                await connection.close()
+
+            await RetentionService(
+                repository=ingestion,
+                objects=objects,
+                annotations=annotations,
+            ).expire_candidates(now)
+            release_write.set()
+            outcome = await asyncio.gather(writer, return_exceptions=True)
+            assert isinstance(outcome[0], OSError)
+
+            queued = await annotations.crops_for_revision(
+                sample_id=sample_id,
+                bbox_revision=UUID(bbox_revision),
+            )
+            assert queued[0]["state"] == "purge_pending"
+            assert await ingestion.storage_bytes() == initial_usage
+            with pytest.raises(FileNotFoundError):
+                objects.read_object(object_key=frame_key, expected_sha256=hashlib.sha256(frame_bytes).hexdigest())
+            assert objects.read_object(
+                object_key=queued[0]["object_key"],
+                expected_sha256=queued[0]["sha256"],
+            )
+
+            retried = await RetentionService(
+                repository=ingestion,
+                objects=objects,
+                annotations=annotations,
+            ).expire_candidates(now)
+            assert retried["crops_deleted"] >= 1
+            final_rows = await annotations.crops_for_revision(
+                sample_id=sample_id,
+                bbox_revision=UUID(bbox_revision),
+            )
+            assert final_rows[0]["state"] == "deleted"
+            with pytest.raises(FileNotFoundError):
+                objects.read_object(
+                    object_key=final_rows[0]["object_key"],
+                    expected_sha256=final_rows[0]["sha256"],
+                )
+            assert await ingestion.storage_bytes() == initial_usage
+        finally:
+            release_write.set()
+            if writer is not None and not writer.done():
+                await asyncio.gather(writer, return_exceptions=True)
+            await annotations.close()
+            await ingestion.close()
+
+    asyncio.run(exercise())
+
+
+def test_caption_provisioning_protects_crop_until_label_studio_media_binds() -> None:
+    configured = _configured()
+    if configured is None:
+        pytest.skip("isolated PostgreSQL and S3 test endpoints are not configured")
+    database_url, s3_endpoint, access_key, secret_key, bucket = configured
+    objects = S3SampleStore(
+        endpoint_url=s3_endpoint,
+        access_key=access_key,
+        secret_key=secret_key,
+        bucket=bucket,
+        region="us-east-1",
+    )
+    import_started = asyncio.Event()
+    allow_bind = asyncio.Event()
+    now = datetime.now(timezone.utc)
+
+    class PausedLabelStudio:
+        async def import_media_task(
+            self,
+            *,
+            project_id: int,
+            filename: str,
+            image: bytes,
+            prediction: dict | None = None,
+        ) -> LabelStudioTaskReference:
+            import_started.set()
+            await allow_bind.wait()
+            return LabelStudioTaskReference(
+                project_id=project_id,
+                task_id=uuid4().int % 2_000_000_000 + 1,
+                file_upload_id=uuid4().int % 2_000_000_000 + 1,
+                media_path=f"/data/upload/{project_id}/{filename}",
+                filename=filename,
+            )
+
+        async def delete_review_task(self, **_kwargs) -> None:
+            return None
+
+    class LocalMediaCleanup:
+        async def delete_upload(self, **_kwargs) -> dict[str, bool]:
+            return {"deleted": True, "already_absent": False}
+
+    async def exercise() -> None:
+        ingestion, annotations, sample_id, frame_key, frame_bytes, bbox_revision, initial_usage = (
+            await _seed_single_bbox_source(database_url=database_url, objects=objects)
+        )
+        crop_batch = await CropService(repository=annotations, objects=objects).create_crop(
+            str(sample_id), bbox_revision
+        )
+        crop = crop_batch["crops"][0]
+        workflow = LabelStudioReviewWorkflow(
+            repository=annotations,
+            objects=objects,
+            label_studio=PausedLabelStudio(),
+            media_cleanup=LocalMediaCleanup(),
+        )
+        assignment = await workflow.prepare_assignment(
+            sample_id=sample_id,
+            stage="caption",
+            project_id=31,
+            bbox_revision=bbox_revision,
+            media_object_key=crop["object_key"],
+            required_bytes=crop["object_size_bytes"],
+        )
+        assert assignment.state == "provisioning"
+        connection = await asyncpg.connect(database_url)
+        try:
+            await connection.execute(
+                "UPDATE ingestion_samples SET retention_until = $2 WHERE sample_id = $1",
+                sample_id,
+                now - timedelta(seconds=1),
+            )
+        finally:
+            await connection.close()
+
+        provision = asyncio.create_task(
+            workflow.provision_task(revision=assignment.revision, project_id=31)
+        )
+        try:
+            await asyncio.wait_for(import_started.wait(), timeout=5)
+            await RetentionService(
+                repository=ingestion,
+                objects=objects,
+                annotations=annotations,
+            ).expire_candidates(now)
+            assert await ingestion.sample_state(sample_id) == "expired"
+
+            allow_bind.set()
+            bound = await provision
+            assert bound["state"] == "active"
+            assert bound["label_studio_task_id"] > 0
+            current_crop = await annotations.crops_for_revision(
+                sample_id=sample_id,
+                bbox_revision=UUID(bbox_revision),
+            )
+            assert current_crop[0]["state"] == "ready"
+            assert current_crop[0]["caption_state"] == "needs_review"
+            assert current_crop[0]["parent_available"] is False
+            assert current_crop[0]["parent_regenerable"] is False
+            assert objects.read_object(
+                object_key=crop["object_key"],
+                expected_sha256=crop["sha256"],
+            )
+            with pytest.raises(FileNotFoundError):
+                objects.read_object(object_key=frame_key, expected_sha256=hashlib.sha256(frame_bytes).hexdigest())
+            assert await ingestion.storage_bytes() == initial_usage + 2 * crop["object_size_bytes"]
+
+            await workflow.close_assignment(
+                sample_id=sample_id,
+                revision=assignment.revision,
+                outcome="rejected",
+                reason="test_cleanup",
+            )
+            await RetentionService(
+                repository=ingestion,
+                objects=objects,
+                annotations=annotations,
+            ).expire_candidates(now)
+            assert await ingestion.storage_bytes() == initial_usage
+        finally:
+            allow_bind.set()
+            if not provision.done():
+                await asyncio.gather(provision, return_exceptions=True)
+            await annotations.close()
             await ingestion.close()
 
     asyncio.run(exercise())

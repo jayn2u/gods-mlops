@@ -8,6 +8,7 @@ import pytest
 import yaml
 
 from gods_mlops.infra_locks import load_image_lock
+from gods_mlops.lifecycle.recovery import validate_emptydir_policy
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -285,6 +286,56 @@ def test_label_studio_uses_private_postgres_backed_single_operator_service_and_s
     assert config["SSRF_PROTECTION_ENABLED"] == "true"
     assert config["DEBUG"] == "false"
     assert config["COLLECT_ANALYTICS"] == "false"
+
+
+def test_label_studio_tmp_is_disposable_but_credentials_and_media_remain_retained(
+    rendered_objects: list[dict],
+) -> None:
+    deployment = _find_one(rendered_objects, kind="Deployment", name="gods-mlops-label-studio")
+    pod_spec = deployment["spec"]["template"]["spec"]
+    volume_by_name = {volume["name"]: volume for volume in pod_spec["volumes"]}
+    media = volume_by_name["media"]
+
+    assert media["persistentVolumeClaim"]["claimName"] == "gods-mlops-label-studio-media"
+    assert volume_by_name["tmp"]["emptyDir"] == {}
+    app = next(container for container in pod_spec["containers"] if container["name"] == "label-studio")
+    username = next(item for item in app["env"] if item["name"] == "LABEL_STUDIO_USERNAME")
+    assert username["valueFrom"]["secretKeyRef"]["name"] == "gods-label-studio-credentials"
+    assert username["valueFrom"]["secretKeyRef"]["key"] == "LABEL_STUDIO_USERNAME"
+
+    probe_pod = {
+        "metadata": {
+            "namespace": deployment["metadata"]["namespace"],
+            "name": "label-studio-emptydir-policy-probe",
+            "labels": deployment["spec"]["selector"]["matchLabels"],
+        },
+        "spec": {
+            "nodeName": "ubuntu",
+            "containers": pod_spec["containers"],
+            "volumes": pod_spec["volumes"],
+        },
+        "status": {"phase": "Running"},
+    }
+
+    verdict = validate_emptydir_policy({"items": [probe_pod]})
+
+    assert verdict["status"] == "verified"
+    assert verdict["approved_pods"][0]["volumes"] == ["tmp"]
+    assert verdict["blockers"] == []
+
+    unsafe_pod = {
+        **probe_pod,
+        "metadata": {**probe_pod["metadata"], "name": "label-studio-unsafe-emptydir-probe"},
+        "spec": {
+            **probe_pod["spec"],
+            "volumes": [*pod_spec["volumes"], {"name": "auth-state", "emptyDir": {}}],
+        },
+    }
+
+    unsafe_verdict = validate_emptydir_policy({"items": [unsafe_pod]})
+
+    assert unsafe_verdict["status"] == "blocked"
+    assert unsafe_verdict["blockers"][0]["volumes"] == ["auth-state", "tmp"]
 
 
 def test_retention_cronjob_is_bounded_serial_and_uses_the_ingestion_image(

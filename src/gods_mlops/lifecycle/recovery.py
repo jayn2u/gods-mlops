@@ -346,6 +346,7 @@ def validate_emptydir_policy(document: dict[str, Any]) -> dict[str, Any]:
         ("istio-system", {"app": "cluster-local-gateway"}, {"workload-socket", "credential-socket", "workload-certs", "istio-envoy", "istio-data"}),
         ("istio-system", {"app": "istio-ingressgateway"}, {"workload-socket", "credential-socket", "workload-certs", "istio-envoy", "istio-data"}),
         ("istio-system", {"app": "istiod"}, {"local-certs"}),
+        ("gods-mlops", {"app.kubernetes.io/name": "gods-mlops-label-studio"}, {"tmp"}),
         ("kubeflow", {"app.kubernetes.io/name": "model-catalog", "app.kubernetes.io/component": "server"}, {"perf-data"}),
         ("kubeflow", {"app.kubernetes.io/instance": "spark-operator", "app.kubernetes.io/component": "controller"}, {"tmp"}),
         ("kubeflow", {"app.kubernetes.io/instance": "spark-operator", "app.kubernetes.io/component": "webhook"}, {"serving-certs"}),

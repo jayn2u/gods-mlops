@@ -1,0 +1,2 @@
+ALTER TABLE annotation_crops
+    ADD COLUMN IF NOT EXISTS quota_released BOOLEAN NOT NULL DEFAULT FALSE;
