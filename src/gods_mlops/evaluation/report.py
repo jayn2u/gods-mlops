@@ -703,6 +703,86 @@ def decode_evaluation_cursor(
     return value
 
 
+def encode_evaluation_probe_cursor(
+    *,
+    identity: Mapping[str, Any],
+    candidate_checkpoint_sha256: str,
+    manifest_sha256: str,
+    config_sha256: str,
+    next_index: int,
+    predictions: list[dict[str, Any]] | dict[str, Any],
+) -> bytes:
+    """Serialize only probe-evaluation progress, bound to its source checkpoint."""
+    _validate_evaluation_probe_cursor_identity(identity)
+    _validate_digest(candidate_checkpoint_sha256, "candidate checkpoint")
+    _validate_digest(manifest_sha256, "evaluation probe manifest")
+    _validate_digest(config_sha256, "evaluation probe config")
+    if identity.get("input_sha256") != manifest_sha256 or identity.get("config_sha256") != config_sha256:
+        raise ValueError("evaluation probe cursor identity differs from its manifest or config")
+    if type(next_index) is not int or next_index < 0:
+        raise ValueError("evaluation probe cursor index must be a non-negative integer")
+    if not isinstance(predictions, (list, dict)):
+        raise ValueError("evaluation probe cursor predictions must be a JSON array or object")
+    return canonical_json(
+        {
+            "format": "gods-mlops-evaluation-probe-cursor-v1",
+            "identity": dict(identity),
+            "candidate_checkpoint_sha256": candidate_checkpoint_sha256,
+            "manifest_sha256": manifest_sha256,
+            "config_sha256": config_sha256,
+            "next_index": next_index,
+            "predictions": predictions,
+        }
+    )
+
+
+def decode_evaluation_probe_cursor(
+    payload: bytes,
+    *,
+    expected_identity: Mapping[str, Any],
+    expected_candidate_checkpoint_sha256: str,
+    expected_manifest_sha256: str,
+    expected_config_sha256: str,
+) -> dict[str, Any]:
+    """Resume only the current null-dataset probe's inference cursor and source weights."""
+    _validate_evaluation_probe_cursor_identity(expected_identity)
+    _validate_digest(expected_candidate_checkpoint_sha256, "candidate checkpoint")
+    _validate_digest(expected_manifest_sha256, "evaluation probe manifest")
+    _validate_digest(expected_config_sha256, "evaluation probe config")
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("evaluation probe cursor payload is missing")
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("evaluation probe cursor payload is not valid JSON") from error
+    expected_keys = {
+        "format",
+        "identity",
+        "candidate_checkpoint_sha256",
+        "manifest_sha256",
+        "config_sha256",
+        "next_index",
+        "predictions",
+    }
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError("evaluation probe cursor payload fields are unsupported")
+    if value.get("format") != "gods-mlops-evaluation-probe-cursor-v1":
+        raise ValueError("payload is not an evaluation probe cursor")
+    if value.get("identity") != dict(expected_identity):
+        raise ValueError("evaluation probe cursor job identity changed during resume")
+    if value.get("candidate_checkpoint_sha256") != expected_candidate_checkpoint_sha256:
+        raise ValueError("evaluation probe cursor prior checkpoint changed during resume")
+    if value.get("manifest_sha256") != expected_manifest_sha256:
+        raise ValueError("evaluation probe cursor manifest changed during resume")
+    if value.get("config_sha256") != expected_config_sha256:
+        raise ValueError("evaluation probe cursor config changed during resume")
+    if type(value.get("next_index")) is not int or value["next_index"] < 0:
+        raise ValueError("evaluation probe cursor index is invalid")
+    if not isinstance(value.get("predictions"), (list, dict)):
+        raise ValueError("evaluation probe cursor predictions are invalid")
+    return value
+
+
 def _reason_set(value: Any) -> set[str]:
     if not isinstance(value, (list, tuple)):
         return set()
@@ -810,6 +890,38 @@ def _validate_evaluation_identity(identity: Mapping[str, Any]) -> None:
         raise ValueError("evaluation cursor must be scoped to its own evaluation job")
     _validate_digest(identity.get("input_sha256"), "evaluation identity input")
     _validate_digest(identity.get("config_sha256"), "evaluation identity config")
+
+
+def _validate_evaluation_probe_cursor_identity(identity: Mapping[str, Any]) -> None:
+    from gods_mlops.jobs.checkpoints import CheckpointIdentity
+
+    required = {
+        "job_id",
+        "input_kind",
+        "input_id",
+        "input_sha256",
+        "phase",
+        "model_kind",
+        "config_version",
+        "config_sha256",
+        "dataset_version",
+    }
+    if not isinstance(identity, Mapping) or set(identity) != required:
+        raise ValueError("evaluation probe cursor needs a complete Task 7 job identity")
+    try:
+        canonical = CheckpointIdentity.from_dict(dict(identity)).as_dict()
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("evaluation probe cursor identity is invalid") from error
+    if (
+        canonical != dict(identity)
+        or identity.get("phase") != "probe"
+        or identity.get("input_kind") != "probe_input"
+        or identity.get("dataset_version") is not None
+        or identity.get("model_kind") not in {"detr", "clip"}
+    ):
+        raise ValueError("evaluation probe cursor must be scoped to its own null-dataset probe job")
+    _validate_digest(identity.get("input_sha256"), "evaluation probe identity input")
+    _validate_digest(identity.get("config_sha256"), "evaluation probe identity config")
 
 
 def _validate_digest(value: Any, name: str) -> None:

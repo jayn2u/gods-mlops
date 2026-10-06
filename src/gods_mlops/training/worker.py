@@ -14,7 +14,7 @@ from typing import Any
 
 from gods_mlops.datasets.manifest import canonical_json
 from gods_mlops.datasets.publish import DatasetPublisher
-from gods_mlops.jobs.models import EvaluationCheckpointSource, ProbeInput
+from gods_mlops.jobs.models import EvaluationCheckpointSource, EvaluationProbeCheckpointSource, ProbeInput
 from gods_mlops.jobs.queue import JobQueue, PostgresJobQueueRepository
 from gods_mlops.jobs.sources import DatasetSourceRegistry
 
@@ -136,6 +136,29 @@ async def run_worker() -> int:
             if evaluation_resume is not None:
                 config["_evaluation_resume_payload"] = evaluation_resume.payload
             config["_evaluation_job_identity"] = identity.as_dict()
+        elif claim.phase == "probe" and claim.target_phase == "evaluation":
+            source_refs = job.get("source_refs")
+            try:
+                probe_input = ProbeInput.from_dict(source_refs)
+                checkpoint_source = probe_input.evaluation_checkpoint_source
+            except (TypeError, ValueError) as error:
+                raise WorkerAuthorizationError("evaluation probe checkpoint source is invalid") from error
+            if checkpoint_source is None or checkpoint_source.model_revision != model.revision:
+                raise WorkerAuthorizationError("evaluation probe has no matching locked prior checkpoint")
+            prior_checkpoint = await _load_verified_evaluation_probe_checkpoint(
+                queue,
+                checkpoint_store,
+                checkpoint_source,
+            )
+            config["_evaluation_checkpoint_payload"] = prior_checkpoint.payload
+            config["_evaluation_checkpoint_identity"] = prior_checkpoint.identity.as_dict()
+            config["_evaluation_checkpoint_sha256"] = prior_checkpoint.sha256
+            config["_evaluation_checkpoint_model_revision"] = checkpoint_source.model_revision
+            config["_evaluation_probe_checkpoint_source"] = checkpoint_source.as_dict()
+            config["_evaluation_job_identity"] = identity.as_dict()
+            evaluation_resume = await queue.load_checkpoint(store=checkpoint_store, job_id=job_id)
+            if evaluation_resume is not None:
+                config["_evaluation_resume_payload"] = evaluation_resume.payload
 
         event_loop = asyncio.get_running_loop()
 
@@ -300,6 +323,15 @@ async def run_worker() -> int:
             )
             checkpoint_digest = verified.sha256
         result_payload = result.get("result_artifact_payload")
+        if claim.phase == "probe" and claim.target_phase == "evaluation":
+            if not _evaluation_probe_result_source_verified(
+                result_payload,
+                result.get("hash"),
+                config.get("_evaluation_probe_checkpoint_source"),
+            ):
+                raise WorkerAuthorizationError(
+                    "evaluation probe result provenance differs from its typed checkpoint source"
+                )
         if isinstance(result_payload, bytes) and result_payload:
             artifact = await queue.save_result_artifact(
                 store=result_store,
@@ -314,7 +346,14 @@ async def run_worker() -> int:
 
         measurements = result["resource_measurements"]
         if claim.phase == "probe":
-            verification = _probe_verification(claim, result, measurements, checkpoint_digest)
+            verification = _probe_verification(
+                claim,
+                result,
+                measurements,
+                checkpoint_digest,
+                result_artifact_payload=result.get("result_artifact_payload"),
+                evaluation_probe_checkpoint_source=config.get("_evaluation_probe_checkpoint_source"),
+            )
             measured = await queue.record_probe_measurement(
                 job_id=job_id,
                 lease_token=lease_token,
@@ -516,6 +555,102 @@ async def _load_verified_evaluation_checkpoint(queue, store, source: EvaluationC
     return verified
 
 
+async def _load_verified_evaluation_probe_checkpoint(
+    queue,
+    store,
+    source: EvaluationProbeCheckpointSource,
+):
+    """Read weights from a successful training-target probe without its optimizer state."""
+    try:
+        training_probe = await queue.get(source.training_probe_job_id)
+        actual_identity = await queue.repository.checkpoint_identity(source.training_probe_job_id)
+        metadata = await queue.repository.checkpoint_metadata_for(source.training_probe_job_id)
+        probe_profile = await queue.repository.get_profile(
+            phase="probe",
+            model_kind=source.model_kind,
+            config_version=source.checkpoint_identity["config_version"],
+        )
+        training_profile = await queue.repository.get_profile(
+            phase="training",
+            model_kind=source.model_kind,
+            config_version=source.checkpoint_identity["config_version"],
+        )
+        measurement = await queue.repository.profile_measurement_for_job(source.training_probe_job_id)
+    except Exception as error:  # noqa: BLE001 - keep source metadata out of worker logs
+        raise WorkerAuthorizationError("evaluation probe training checkpoint metadata is unavailable") from error
+    if metadata is None or measurement is None or probe_profile is None or training_profile is None:
+        raise WorkerAuthorizationError("evaluation probe training checkpoint origin is incomplete")
+    source.validate_training_probe_origin(
+        training_probe,
+        probe_profile,
+        training_profile,
+        measurement,
+        metadata,
+    )
+    if actual_identity.as_dict() != source.checkpoint_identity:
+        raise WorkerAuthorizationError("evaluation probe checkpoint identity differs from its DB origin")
+    try:
+        verified = store.load_uri(
+            source.checkpoint_uri,
+            expected_identity=actual_identity,
+            expected_sha256=source.checkpoint_sha256,
+            expected_size_bytes=source.checkpoint_size_bytes,
+        )
+    except Exception as error:  # noqa: BLE001 - map storage details to a bounded authorization failure
+        raise WorkerAuthorizationError("evaluation probe checkpoint bytes failed immutable verification") from error
+    if verified.identity != actual_identity or verified.sha256 != source.checkpoint_sha256:
+        raise WorkerAuthorizationError("verified evaluation probe checkpoint identity changed during load")
+    return verified
+
+
+def apply_verified_evaluation_probe_checkpoint_weights(
+    model: Any,
+    config: dict[str, Any],
+    *,
+    model_kind: str,
+    model_revision: str,
+) -> None:
+    """Load only the verified model state from a training probe checkpoint."""
+    import io
+    import torch
+    from collections.abc import Mapping
+
+    try:
+        source = EvaluationProbeCheckpointSource.from_dict(
+            config.get("_evaluation_probe_checkpoint_source")
+        )
+        payload = config.get("_evaluation_checkpoint_payload")
+        expected_identity = config.get("_evaluation_checkpoint_identity")
+        if (
+            not isinstance(payload, bytes)
+            or sha256(payload).hexdigest() != source.checkpoint_sha256
+            or source.model_kind != model_kind
+            or source.model_revision != model_revision
+            or source.checkpoint_identity != expected_identity
+            or config.get("_evaluation_checkpoint_sha256") != source.checkpoint_sha256
+        ):
+            raise ValueError("evaluation probe checkpoint binding changed before model load")
+        checkpoint = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=False)
+    except Exception as error:  # noqa: BLE001 - prevent fallback to pretrained weights
+        raise WorkerAuthorizationError("evaluation probe checkpoint bytes failed model-state validation") from error
+    if (
+        not isinstance(checkpoint, Mapping)
+        or checkpoint.get("format") != "gods-mlops-training-checkpoint-v1"
+        or checkpoint.get("identity") != source.checkpoint_identity
+        or checkpoint.get("model_revision") != source.model_revision
+    ):
+        raise WorkerAuthorizationError("evaluation probe checkpoint payload provenance is invalid")
+    state = checkpoint.get("model_state_dict")
+    if not isinstance(state, Mapping) or not state:
+        raise WorkerAuthorizationError("evaluation probe checkpoint contains no model weights")
+    try:
+        model.load_state_dict(state, strict=True)
+    except Exception as error:  # noqa: BLE001 - architecture mismatch fails before inference
+        raise WorkerAuthorizationError("evaluation probe checkpoint weights do not match the locked model") from error
+
+
+
+
 async def _recover_committed_result(
     *,
     job: dict[str, Any],
@@ -571,11 +706,26 @@ async def _recover_committed_result(
     await validate_current_worker_claim(queue, claim, object_store=objects)
 
     if claim.phase == "probe":
+        result_payload = objects.read_source(
+            object_key=verified.object_key,
+            sha256_digest=verified.sha256,
+            size_bytes=verified.size_bytes,
+        )
+        evaluation_probe_source = None
+        if claim.target_phase == "evaluation":
+            try:
+                evaluation_probe_source = ProbeInput.from_dict(job.get("source_refs")).evaluation_checkpoint_source
+            except (TypeError, ValueError) as error:
+                raise WorkerAuthorizationError("evaluation probe checkpoint source is invalid during result recovery") from error
         verification = _probe_verification(
             claim,
             {"hash": verified.sha256},
             measurements,
             checkpoint_sha256,
+            result_artifact_payload=result_payload,
+            evaluation_probe_checkpoint_source=(
+                evaluation_probe_source.as_dict() if evaluation_probe_source is not None else None
+            ),
         )
         measured = await queue.record_probe_measurement(
             job_id=claim.job_id,
@@ -722,6 +872,9 @@ def _probe_verification(
     result: dict[str, Any],
     measurements: dict[str, Any],
     checkpoint_digest: str | None,
+    *,
+    result_artifact_payload: bytes | None = None,
+    evaluation_probe_checkpoint_source: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     result_hash = result.get("hash")
     result_hash_valid = isinstance(result_hash, str) and len(result_hash) == 64 and all(
@@ -744,18 +897,51 @@ def _probe_verification(
     inference_verified = claim.target_phase in {"preparation", "evaluation"} and int(
         measurements.get("inference_steps", 0)
     ) >= 1
+    evaluation_probe_checkpoint_verified: bool | None = None
+    if claim.phase == "probe" and claim.target_phase == "evaluation":
+        evaluation_probe_checkpoint_verified = _evaluation_probe_result_source_verified(
+            result_artifact_payload,
+            result_hash,
+            evaluation_probe_checkpoint_source,
+        )
     if claim.model_kind == "clip" and claim.target_phase == "training":
         losses = measurements.get("losses")
         training_verified = training_verified and isinstance(losses, list) and bool(losses) and all(
             isinstance(loss, (int, float)) and loss > 0 for loss in losses
         )
     return {
-        "passed": result_hash_valid and (training_verified or inference_verified),
+        "passed": result_hash_valid
+        and (training_verified or inference_verified)
+        and evaluation_probe_checkpoint_verified is not False,
         "model_kind": claim.model_kind,
         "target_phase": claim.target_phase,
         "result_sha256": result_hash,
         "learning_signal_verified": weights_updated if claim.target_phase == "training" else None,
         "checkpoint_resume_verified": resumed,
+        "evaluation_probe_checkpoint_verified": evaluation_probe_checkpoint_verified,
+    }
+
+
+def _evaluation_probe_result_source_verified(
+    payload: bytes | None,
+    result_sha256: Any,
+    source_value: dict[str, Any] | None,
+) -> bool:
+    """Require the immutable probe result to name the exact bound training checkpoint."""
+    if not isinstance(payload, bytes) or not payload:
+        return False
+    if not isinstance(result_sha256, str) or sha256(payload).hexdigest() != result_sha256:
+        return False
+    try:
+        source = EvaluationProbeCheckpointSource.from_dict(source_value)
+        document = json.loads(payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    recorded = document.get("evaluation_probe_checkpoint") if isinstance(document, dict) else None
+    return isinstance(recorded, dict) and recorded == {
+        "training_probe_job_id": source.training_probe_job_id,
+        "checkpoint_sha256": source.checkpoint_sha256,
+        "model_revision": source.model_revision,
     }
 
 

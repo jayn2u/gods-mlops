@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -138,7 +139,10 @@ def validate_worker_claim(
         if isinstance(source_refs, dict) and source_refs.get("schema") == "gods-mlops-probe-input-v1":
             from gods_mlops.jobs.models import ProbeInput
 
-            probe_input = ProbeInput.from_dict(source_refs)
+            try:
+                probe_input = ProbeInput.from_dict(source_refs)
+            except (TypeError, ValueError) as error:
+                raise WorkerAuthorizationError("typed probe checkpoint/source reference is invalid") from error
             if (
                 probe_input.probe_input_id != claim.input_id
                 or probe_input.input_sha256 != claim.input_sha256
@@ -147,6 +151,24 @@ def validate_worker_claim(
                 or probe_input.config_version != claim.config_version
             ):
                 raise WorkerAuthorizationError("typed probe source identity differs from the admitted job")
+            if claim.target_phase == "evaluation":
+                checkpoint_source = probe_input.evaluation_checkpoint_source
+                profile_config = profile.get("config_json", {})
+                if isinstance(profile_config, str):
+                    try:
+                        profile_config = json.loads(profile_config)
+                    except json.JSONDecodeError as error:
+                        raise WorkerAuthorizationError("evaluation probe profile config is invalid") from error
+                if (
+                    checkpoint_source is None
+                    or checkpoint_source.model_kind != claim.model_kind
+                    or not isinstance(profile_config, dict)
+                    or checkpoint_source.model_id != profile_config.get("model_id")
+                    or checkpoint_source.model_revision != profile_config.get("model_revision")
+                ):
+                    raise WorkerAuthorizationError(
+                        "evaluation probe has no matching typed training-probe checkpoint source"
+                    )
     else:
         if profile_state != "measured":
             raise WorkerAuthorizationError("training worker profile is not measured and allowlisted")
@@ -243,9 +265,16 @@ async def validate_current_worker_claim(
             if object_store is None:
                 raise WorkerAuthorizationError("typed probe manifest object store is unavailable")
             try:
-                ProbeInput.from_dict(source_refs).verify(object_store)
+                probe_input = ProbeInput.from_dict(source_refs)
+                probe_input.verify(object_store)
             except Exception as error:
                 raise WorkerAuthorizationError("immutable probe manifest bytes changed") from error
+            if claim.target_phase == "evaluation":
+                reasons = await queue.evaluation_probe_source_block_reasons(claim.job_id)
+                if reasons:
+                    raise WorkerAuthorizationError(
+                        "evaluation probe checkpoint source changed: " + ", ".join(reasons)
+                    )
     return job, lease
 
 

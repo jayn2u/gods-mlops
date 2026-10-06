@@ -715,6 +715,23 @@ class PostgresJobQueueRepository:
         result["job_id"] = str(result["job_id"])
         return result
 
+    async def evaluation_probe_source_block_reasons(self, job_id: str) -> tuple[str, ...]:
+        """Revalidate the immutable training-probe checkpoint bound to an eval probe."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction(readonly=True):
+                job = await connection.fetchrow(
+                    "SELECT * FROM gods_mlops_jobs WHERE job_id=$1::uuid",
+                    job_id,
+                )
+                if job is None:
+                    return ("evaluation_probe_checkpoint_source_invalid",)
+                if job["phase"] != "probe" or job["target_phase"] != "evaluation":
+                    return ()
+                reason = await _evaluation_probe_checkpoint_source_error(connection, job)
+        return (reason,) if reason else ()
+
     async def bind_lease_process(
         self,
         job_id: str,
@@ -1486,6 +1503,12 @@ class PostgresJobQueueRepository:
                     checkpoint_error = await _evaluation_checkpoint_source_error(connection, job)
                     if checkpoint_error:
                         raise CheckpointIdentityError("evaluation checkpoint source changed before artifact write")
+                elif identity.phase == "probe" and job.get("target_phase") == "evaluation":
+                    checkpoint_error = await _evaluation_probe_checkpoint_source_error(connection, job)
+                    if checkpoint_error:
+                        raise CheckpointIdentityError(
+                            "evaluation probe checkpoint source changed before artifact intent"
+                        )
                 if (
                     operation == "checkpoint"
                     and str(job["checkpoint_uri"] or "") == uri
@@ -1714,6 +1737,12 @@ class PostgresJobQueueRepository:
                     checkpoint_error = await _evaluation_checkpoint_source_error(connection, job)
                     if checkpoint_error:
                         raise CheckpointIdentityError("evaluation checkpoint source changed before checkpoint commit")
+                elif identity.phase == "probe" and job.get("target_phase") == "evaluation":
+                    checkpoint_error = await _evaluation_probe_checkpoint_source_error(connection, job)
+                    if checkpoint_error:
+                        raise CheckpointIdentityError(
+                            "evaluation probe checkpoint source changed before checkpoint commit"
+                        )
                 checkpoint_uri_expected = _prepared_artifact_uri(prepared, store)
                 existing_marker = (
                     str(job["checkpoint_uri"]) == checkpoint_uri_expected
@@ -2218,6 +2247,12 @@ class PostgresJobQueueRepository:
                     checkpoint_error = await _evaluation_checkpoint_source_error(connection, job)
                     if checkpoint_error:
                         raise CheckpointIdentityError("evaluation checkpoint source changed before result commit")
+                elif identity.phase == "probe" and job.get("target_phase") == "evaluation":
+                    checkpoint_error = await _evaluation_probe_checkpoint_source_error(connection, job)
+                    if checkpoint_error:
+                        raise CheckpointIdentityError(
+                            "evaluation probe checkpoint source changed before result commit"
+                        )
                 profile = await connection.fetchrow(
                     """SELECT result_reservation_bytes FROM gods_mlops_resource_profiles
                        WHERE phase=$1 AND model_kind=$2 AND config_version=$3""",
@@ -2740,6 +2775,10 @@ class PostgresJobQueueRepository:
                 if candidate is None or candidate["profile_state"] != "candidate":
                     raise ResourceProfileConflictError("probe is not backed by an immutable candidate profile")
                 target_phase = candidate["target_phase"]
+                if target_phase == "evaluation":
+                    checkpoint_source_error = await _evaluation_probe_checkpoint_source_error(connection, job)
+                    if checkpoint_source_error:
+                        raise ValueError("evaluation probe checkpoint source changed before measurement commit")
                 measurement_id = uuid4()
                 details = verification_details or {}
                 memory_measurement_ok = (
@@ -3134,6 +3173,34 @@ class PostgresJobQueueRepository:
                             _canonical_json({source_reasons_key: list(source_reasons), "lease_not_granted": True}),
                         )
                         return _job_dict(updated)
+                if job["phase"] == "probe" and job["target_phase"] == "evaluation":
+                    checkpoint_source_error = await _evaluation_probe_checkpoint_source_error(connection, job)
+                    if checkpoint_source_error:
+                        updated = await connection.fetchrow(
+                            """UPDATE gods_mlops_jobs SET state='failed', reason_code=$2,
+                                      reason_detail=$3::jsonb, retryable=FALSE,
+                                      completed_at=now(), updated_at=now()
+                               WHERE job_id=$1::uuid AND lease_token IS NULL
+                               RETURNING *""",
+                            job_id,
+                            checkpoint_source_error,
+                            _canonical_json({
+                                "evaluation_probe_checkpoint_source_error": checkpoint_source_error
+                            }),
+                        )
+                        if updated is not None:
+                            await connection.execute(
+                                """INSERT INTO gods_mlops_job_events(
+                                       job_id,event_type,state,reason_code,details
+                                   ) VALUES($1::uuid,'source_readiness_failed','failed',$2,$3::jsonb)""",
+                                job_id,
+                                checkpoint_source_error,
+                                _canonical_json({
+                                    "evaluation_probe_checkpoint_source_error": checkpoint_source_error,
+                                    "lease_not_granted": True,
+                                }),
+                            )
+                            return _job_dict(updated)
                 reservation = await connection.fetchrow(
                     "SELECT * FROM gods_mlops_artifact_reservations WHERE job_id = $1::uuid FOR UPDATE",
                     job_id,
@@ -3430,13 +3497,31 @@ class JobQueue:
         if probe_input is not None:
             if probe_input.model_kind != model_kind:
                 raise ValueError("probe input model kind does not match the requested model")
+            if (
+                probe_input.target_phase == "evaluation"
+                and probe_input.evaluation_checkpoint_source is None
+            ):
+                raise ValueError("evaluation profile probes require a verified training-probe checkpoint")
+            if (
+                probe_input.evaluation_checkpoint_source is not None
+                and probe_input.evaluation_checkpoint_source.model_kind != model_kind
+            ):
+                raise ValueError("evaluation probe checkpoint model kind does not match the requested model")
             probe_input_id = probe_input.probe_input_id
             input_sha256 = probe_input.input_sha256
             source_refs = probe_input.as_dict()
+            stable_source_identity = (
+                {
+                    "evaluation_checkpoint_source": probe_input.evaluation_checkpoint_source.as_dict()
+                }
+                if probe_input.evaluation_checkpoint_source is not None
+                else None
+            )
         else:
             if not isinstance(probe_input_id, str) or not probe_input_id.strip() or len(probe_input_id) > 255:
                 raise ValueError("probe_input_id must contain 1 to 255 characters")
             source_refs = {"probe_input_id": probe_input_id, "input_sha256": input_sha256}
+            stable_source_identity = None
         if not isinstance(input_sha256, str):
             raise ValueError("probe input SHA-256 is missing")
         _validate_digest(input_sha256, "input_sha256")
@@ -3449,6 +3534,22 @@ class JobQueue:
             raise ValueError("resource probes require an unmeasured candidate profile")
         if probe_input is not None and profile["target_phase"] != probe_input.target_phase:
             raise ValueError("probe input target phase does not match its candidate profile")
+        if probe_input is not None and probe_input.evaluation_checkpoint_source is not None:
+            from gods_mlops.jobs.models import EvaluationProbeCheckpointSource
+
+            checkpoint_source = EvaluationProbeCheckpointSource.from_dict(
+                probe_input.evaluation_checkpoint_source.as_dict()
+            )
+            profile_config = profile.get("config_json")
+            if isinstance(profile_config, str):
+                profile_config = json.loads(profile_config)
+            if (
+                not isinstance(profile_config, dict)
+                or checkpoint_source.model_kind != model_kind
+                or checkpoint_source.model_id != profile_config.get("model_id")
+                or checkpoint_source.model_revision != profile_config.get("model_revision")
+            ):
+                raise ValueError("evaluation probe checkpoint source differs from its immutable candidate profile")
         return await self._repository.enqueue(
             phase="probe",
             input_kind="probe_input",
@@ -3459,6 +3560,7 @@ class JobQueue:
             model_kind=model_kind,
             profile=profile,
             rerun=rerun,
+            stable_source_identity=stable_source_identity,
         )
 
     async def submit_preparation(
@@ -3846,6 +3948,9 @@ class JobQueue:
             reasons.add(f"dataset_target_not_{job['model_kind']}")
         return tuple(sorted(reasons))
 
+    async def evaluation_probe_source_block_reasons(self, job_id: str) -> tuple[str, ...]:
+        return await self._repository.evaluation_probe_source_block_reasons(job_id)
+
     async def fail_for_source_readiness(
         self,
         job_id: str,
@@ -3910,6 +4015,123 @@ async def _phase_source_block_reasons_in_transaction(
             model_kind=model_kind,
         )
     return ()
+
+
+async def _evaluation_probe_checkpoint_source_error(
+    connection: asyncpg.Connection,
+    evaluation_probe_job: Any,
+) -> str | None:
+    """Revalidate a probe-only prior checkpoint without loosening public evaluation origins."""
+    from gods_mlops.jobs.models import EvaluationProbeCheckpointSource, ProbeInput
+
+    job = dict(evaluation_probe_job)
+    source_refs = _json_value(job.get("source_refs", {}))
+    if (
+        job.get("phase") != "probe"
+        or job.get("target_phase") != "evaluation"
+        or not isinstance(source_refs, dict)
+        or source_refs.get("schema") != "gods-mlops-probe-input-v1"
+    ):
+        return "evaluation_probe_checkpoint_source_invalid"
+    try:
+        probe_input = ProbeInput.from_dict(source_refs)
+        source = probe_input.evaluation_checkpoint_source
+    except (TypeError, ValueError):
+        return "evaluation_probe_checkpoint_source_invalid"
+    if (
+        source is None
+        or probe_input.probe_input_id != job.get("input_id")
+        or probe_input.model_kind != job.get("model_kind")
+        or probe_input.target_phase != job.get("target_phase")
+        or probe_input.config_version != job.get("config_version")
+        or probe_input.input_sha256 != str(job.get("input_sha256", "")).strip()
+    ):
+        return "evaluation_probe_checkpoint_source_invalid"
+
+    stable_identity = {
+        "phase": job["phase"],
+        "target_phase": job["target_phase"],
+        "input_kind": job["input_kind"],
+        "input_id": job["input_id"],
+        "input_sha256": str(job["input_sha256"]).strip(),
+        "dataset_version": job["dataset_version"],
+        "model_kind": job["model_kind"],
+        "config_version": job["config_version"],
+        "config_sha256": str(job["config_sha256"]).strip(),
+    }
+    stable_source_identity = {"evaluation_checkpoint_source": source.as_dict()}
+    dedupe_key = str(job.get("dedupe_key") or "").strip()
+    if (
+        (not job.get("rerun") and dedupe_key != _enqueue_dedupe_key(stable_identity, stable_source_identity))
+        or (job.get("rerun") and dedupe_key)
+    ):
+        return "evaluation_probe_checkpoint_source_invalid"
+
+    prior_row = await connection.fetchrow(
+        "SELECT * FROM gods_mlops_jobs WHERE job_id=$1::uuid",
+        source.training_probe_job_id,
+    )
+    if prior_row is None:
+        return "evaluation_probe_checkpoint_source_invalid"
+    prior_job = dict(prior_row)
+    prior_job["checkpoint_identity"] = _json_value(prior_job.get("checkpoint_identity"))
+    probe_profile_row = await connection.fetchrow(
+        """SELECT phase,target_phase,model_kind,config_version,config_sha256,
+                  profile_state,config_json
+           FROM gods_mlops_resource_profiles
+           WHERE phase='probe' AND model_kind=$1 AND config_version=$2""",
+        source.model_kind,
+        source.checkpoint_identity["config_version"],
+    )
+    training_profile_row = await connection.fetchrow(
+        """SELECT phase,target_phase,model_kind,config_version,config_sha256,
+                  profile_state,config_json
+           FROM gods_mlops_resource_profiles
+           WHERE phase='training' AND model_kind=$1 AND config_version=$2""",
+        source.model_kind,
+        source.checkpoint_identity["config_version"],
+    )
+    measurement_row = await connection.fetchrow(
+        """SELECT result_state,target_phase,model_kind,input_sha256,config_sha256,
+                  optimizer_steps,checkpoint_resumed,checkpoint_sha256,exit_code,
+                  verification_details
+           FROM gods_mlops_profile_measurements WHERE job_id=$1::uuid""",
+        source.training_probe_job_id,
+    )
+    commit_row = await connection.fetchrow(
+        """SELECT details FROM gods_mlops_job_events
+           WHERE job_id=$1::uuid AND event_type='checkpoint_committed'
+             AND details->>'checkpoint_uri'=$2 AND details->>'sha256'=$3
+           ORDER BY event_id DESC LIMIT 1""",
+        source.training_probe_job_id,
+        source.checkpoint_uri,
+        source.checkpoint_sha256,
+    )
+    if any(item is None for item in (probe_profile_row, training_profile_row, measurement_row, commit_row)):
+        return "evaluation_probe_checkpoint_source_invalid"
+    probe_profile = dict(probe_profile_row)
+    training_profile = dict(training_profile_row)
+    probe_profile["config_json"] = _json_value(probe_profile["config_json"])
+    training_profile["config_json"] = _json_value(training_profile["config_json"])
+    measurement = dict(measurement_row)
+    measurement["input_sha256"] = str(measurement["input_sha256"]).strip()
+    measurement["config_sha256"] = str(measurement["config_sha256"]).strip()
+    measurement["checkpoint_sha256"] = (
+        str(measurement["checkpoint_sha256"]).strip() if measurement["checkpoint_sha256"] else None
+    )
+    measurement["verification_details"] = _json_value(measurement["verification_details"])
+    checkpoint_commit = _json_value(commit_row["details"])
+    try:
+        source.validate_training_probe_origin(
+            prior_job,
+            probe_profile,
+            training_profile,
+            measurement,
+            checkpoint_commit,
+        )
+    except (TypeError, ValueError):
+        return "evaluation_probe_checkpoint_source_invalid"
+    return None
 
 
 async def _evaluation_checkpoint_source_error(connection: asyncpg.Connection, evaluation_job: Any) -> str | None:

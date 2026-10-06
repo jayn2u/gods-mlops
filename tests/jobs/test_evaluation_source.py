@@ -5,8 +5,10 @@ import hashlib
 import importlib
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from gods_mlops.datasets.manifest import canonical_json, content_sha256
 from gods_mlops.jobs.checkpoints import CheckpointIdentity
 from gods_mlops.jobs.models import DatasetTrainingSource, ExecutionProfile, ProbeInput
 
@@ -48,6 +50,160 @@ def _checkpoint_source():
         checkpoint_size_bytes=2048,
         checkpoint_identity=identity,
         model_revision="immutable-clip-revision",
+    )
+
+
+def _evaluation_probe_checkpoint_source(
+    checkpoint_sha: str = "b" * 64,
+    *,
+    model_kind: str = "detr",
+    checkpoint_size_bytes: int = 244_331_513,
+):
+    source_type = _require("gods_mlops.jobs.models", "EvaluationProbeCheckpointSource")
+    from gods_mlops.training.contracts import locked_model
+
+    locked = locked_model(model_kind)
+    probe_job_id = (
+        "d4d6e1a4-d788-4722-8de8-25b9ccfe87bd"
+        if model_kind == "detr"
+        else "a0320b59-663c-4cdc-b893-086bb970ea60"
+    )
+    model_id = locked.model_id
+    model_revision = locked.revision
+    input_id = "task8-detr-synthetic-probe-v1" if model_kind == "detr" else "task8-clip-synthetic-probe-v1"
+    config_version = (
+        "task8-detr-640-microbatch1-probe-v1"
+        if model_kind == "detr"
+        else "task8-clip-224-microbatch2-explicit-negative-probe-v1"
+    )
+    config_sha = "7" * 64 if model_kind == "detr" else "8" * 64
+    worker_image_id = "sha256:" + "a" * 64
+    source_commit = "fa092fe485a47932eff1ebcf66f31957ee34ad12"
+    runtime_evidence = {
+        "event": "task8_real_model_probe_complete",
+        "job_id": probe_job_id,
+        "model_kind": model_kind,
+        "target_phase": "training",
+        "config_version": config_version,
+        "input_sha256": "3" * 64,
+        "docker_image_id": worker_image_id,
+        "image_source_commit": source_commit,
+        "source_commit": source_commit,
+    }
+    identity = {
+        "job_id": probe_job_id,
+        "input_kind": "probe_input",
+        "input_id": input_id,
+        "input_sha256": "3" * 64,
+        "phase": "probe",
+        "model_kind": model_kind,
+        "config_version": config_version,
+        "config_sha256": config_sha,
+        "dataset_version": None,
+    }
+    return source_type(
+        training_probe_job_id=probe_job_id,
+        model_kind=model_kind,
+        model_id=model_id,
+        model_revision=model_revision,
+        checkpoint_uri=(
+            f"s3://gods-task8-test/jobs/{probe_job_id}/checkpoints/"
+            + "0" * 64
+            + f"/{checkpoint_sha}.checkpoint"
+        ),
+        checkpoint_sha256=checkpoint_sha,
+        checkpoint_size_bytes=checkpoint_size_bytes,
+        checkpoint_identity=identity,
+        worker_image_id=worker_image_id,
+        source_commit=source_commit,
+        runtime_evidence_sha256=content_sha256(canonical_json(runtime_evidence)),
+    )
+
+
+def _evaluation_probe_origin(source):
+    identity = source.checkpoint_identity
+    config = {
+        "model_id": source.model_id,
+        "model_revision": source.model_revision,
+        "input_size": 640,
+        "micro_batch": 1,
+        "optimizer_steps": 3,
+        "learning_rate": 1e-5,
+        "weight_decay": 1e-4,
+    }
+    job = {
+        "job_id": source.training_probe_job_id,
+        "state": "completed",
+        "phase": "probe",
+        "target_phase": "training",
+        "profile_state_snapshot": "candidate",
+        "input_kind": "probe_input",
+        "input_id": identity["input_id"],
+        "input_sha256": identity["input_sha256"],
+        "dataset_version": None,
+        "model_kind": source.model_kind,
+        "config_version": identity["config_version"],
+        "config_sha256": identity["config_sha256"],
+        "checkpoint_uri": source.checkpoint_uri,
+        "checkpoint_sha256": source.checkpoint_sha256,
+        "checkpoint_identity": identity,
+    }
+    probe_profile = {
+        "phase": "probe",
+        "target_phase": "training",
+        "model_kind": source.model_kind,
+        "config_version": identity["config_version"],
+        "config_sha256": identity["config_sha256"],
+        "profile_state": "candidate",
+        "config_json": config,
+    }
+    training_profile = {
+        **probe_profile,
+        "phase": "training",
+        "target_phase": None,
+        "profile_state": "measured",
+    }
+    measurement = {
+        "result_state": "succeeded",
+        "target_phase": "training",
+        "model_kind": source.model_kind,
+        "input_sha256": identity["input_sha256"],
+        "config_sha256": identity["config_sha256"],
+        "optimizer_steps": 4,
+        "checkpoint_resumed": True,
+        "checkpoint_sha256": source.checkpoint_sha256,
+        "exit_code": 0,
+        "verification_details": {
+            "passed": True,
+            "learning_signal_verified": True,
+            "checkpoint_resume_verified": True,
+        },
+    }
+    commit = {
+        "uri": source.checkpoint_uri,
+        "sha256": source.checkpoint_sha256,
+        "size_bytes": source.checkpoint_size_bytes,
+        "identity": identity,
+    }
+    runtime_evidence = {
+        "event": "task8_real_model_probe_complete",
+        "job_id": source.training_probe_job_id,
+        "model_kind": source.model_kind,
+        "target_phase": "training",
+        "config_version": identity["config_version"],
+        "input_sha256": identity["input_sha256"],
+        "docker_image_id": source.worker_image_id,
+        "image_source_commit": source.source_commit,
+        "source_commit": source.source_commit,
+    }
+    return (
+        job,
+        probe_profile,
+        training_profile,
+        measurement,
+        commit,
+        runtime_evidence,
+        content_sha256(canonical_json(runtime_evidence)),
     )
 
 
@@ -155,6 +311,605 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "commit marker"):
             source.validate_training_origin(training_job, profile, {**commit, "sha256": "0" * 64})
 
+    def test_probe_checkpoint_source_accepts_verified_null_dataset_training_probe(self) -> None:
+        source = _evaluation_probe_checkpoint_source()
+        restored = type(source).from_dict(source.as_dict())
+        origin = _evaluation_probe_origin(source)
+
+        self.assertEqual(restored, source)
+        self.assertEqual(restored.as_dict()["schema"], "gods-mlops-evaluation-probe-checkpoint-v1")
+        self.assertIsNone(restored.checkpoint_identity["dataset_version"])
+        source.validate_training_probe_origin(*origin)
+
+    def test_probe_checkpoint_source_rejects_wrong_origin_profile_measurement_or_evidence(self) -> None:
+        source = _evaluation_probe_checkpoint_source()
+        origin = _evaluation_probe_origin(source)
+        job, probe_profile, training_profile, measurement, commit, runtime_evidence, evidence_sha256 = origin
+        invalid_origins = (
+            ({**job, "state": "failed"}, probe_profile, training_profile, measurement, commit, runtime_evidence, evidence_sha256),
+            ({**job, "target_phase": "evaluation"}, probe_profile, training_profile, measurement, commit, runtime_evidence, evidence_sha256),
+            ({**job, "dataset_version": "forged-dataset"}, probe_profile, training_profile, measurement, commit, runtime_evidence, evidence_sha256),
+            (job, probe_profile, {**training_profile, "profile_state": "candidate"}, measurement, commit, runtime_evidence, evidence_sha256),
+            (job, probe_profile, training_profile, {**measurement, "optimizer_steps": 0}, commit, runtime_evidence, evidence_sha256),
+            (job, probe_profile, training_profile, measurement, {**commit, "size_bytes": 1}, runtime_evidence, evidence_sha256),
+            (job, probe_profile, training_profile, measurement, commit, {**runtime_evidence, "docker_image_id": "sha256:" + "c" * 64}, evidence_sha256),
+        )
+        for invalid_origin in invalid_origins:
+            with self.subTest(invalid_origin=invalid_origin):
+                with self.assertRaises(ValueError):
+                    source.validate_training_probe_origin(*invalid_origin)
+
+    def test_probe_checkpoint_source_never_relaxes_public_dataset_training_source(self) -> None:
+        source = _evaluation_probe_checkpoint_source()
+        identity = source.checkpoint_identity
+        public_source = _require("gods_mlops.jobs.models", "EvaluationCheckpointSource")
+
+        with self.assertRaisesRegex(ValueError, "dataset/model identity"):
+            public_source(
+                training_job_id=source.training_probe_job_id,
+                dataset_version=identity["input_id"],
+                model_kind=source.model_kind,
+                training_manifest_sha256=identity["input_sha256"],
+                checkpoint_uri=source.checkpoint_uri,
+                checkpoint_sha256=source.checkpoint_sha256,
+                checkpoint_size_bytes=source.checkpoint_size_bytes,
+                checkpoint_identity=identity,
+                model_revision=source.model_revision,
+            )
+
+    def test_task8_probe_inputs_keep_exact_legacy_ids_hashes_and_wire_shape(self) -> None:
+        create_probe_input = _require("gods_mlops.training.probe_setup", "create_probe_input")
+
+        class Objects:
+            def __init__(self):
+                self.values = {}
+
+            def write_immutable(self, *, object_key, content, sha256_digest, content_type):
+                previous = self.values.get(object_key)
+                if previous is not None and previous != content:
+                    raise AssertionError("legacy Task 8 probe object was rewritten")
+                self.values[object_key] = content
+
+        expected = {
+            "training": {
+                "probe_input_id": "task8-detr-synthetic-probe-v1",
+                "config_version": "task8-detr-640-microbatch1-probe-v1",
+                "input_sha256": "360eaf37b568049b82504a38980c8ad6a929028a167b640256247ecc639de7d5",
+            },
+            "preparation": {
+                "probe_input_id": "task8-detr-preparation-synthetic-probe-v1",
+                "config_version": "task8-detr-640-frame-drafts-preparation-probe-v1",
+                "input_sha256": "abd8dcb6d0cd379af0499b5d1015430b57c1fc105f0399a57c2d59f330323a1b",
+            },
+        }
+        for phase, expected_input in expected.items():
+            probe = create_probe_input(objects=Objects(), model_kind="detr", target_phase=phase)
+            wire = probe.as_dict()
+            self.assertEqual(probe.probe_input_id, expected_input["probe_input_id"])
+            self.assertEqual(probe.config_version, expected_input["config_version"])
+            self.assertEqual(probe.input_sha256, expected_input["input_sha256"])
+            self.assertEqual(
+                set(wire),
+                {
+                    "schema", "probe_input_id", "input_kind", "model_kind", "target_phase",
+                    "config_version", "manifest_object_key", "input_sha256", "object_size_bytes",
+                    "fixture", "dataset_version",
+                },
+            )
+            self.assertEqual(ProbeInput.from_dict(wire).as_dict(), wire)
+
+    def test_probe_input_serializes_optional_evaluation_checkpoint_only_when_present(self) -> None:
+        source = _evaluation_probe_checkpoint_source()
+        probe = ProbeInput(
+            probe_input_id="task9-detr-evaluation-probe-bbbbbbbbbbbb",
+            model_kind="detr",
+            target_phase="evaluation",
+            config_version="task9-detr-person-coco-evaluation-probe-v1",
+            manifest_object_key="probe-inputs/task9-evaluation/manifest.json",
+            input_sha256="e" * 64,
+            object_size_bytes=512,
+            evaluation_checkpoint_source=source,
+        )
+
+        wire = probe.as_dict()
+        self.assertEqual(wire["evaluation_checkpoint_source"], source.as_dict())
+        self.assertEqual(ProbeInput.from_dict(wire).as_dict(), wire)
+
+    def test_evaluation_probe_manifest_id_is_checkpoint_specific(self) -> None:
+        create_probe_input = _require("gods_mlops.training.probe_setup", "create_probe_input")
+
+        class Objects:
+            def __init__(self):
+                self.values = {}
+
+            def write_immutable(self, *, object_key, content, sha256_digest, content_type):
+                previous = self.values.get(object_key)
+                if previous is not None and previous != content:
+                    raise AssertionError("evaluation probe attempted to rewrite a frozen manifest")
+                self.values[object_key] = content
+
+        first_source = _evaluation_probe_checkpoint_source("b" * 64)
+        second_source = _evaluation_probe_checkpoint_source("c" * 64)
+        first_store, second_store = Objects(), Objects()
+        first = create_probe_input(
+            objects=first_store,
+            model_kind="detr",
+            target_phase="evaluation",
+            evaluation_checkpoint_source=first_source,
+        )
+        second = create_probe_input(
+            objects=second_store,
+            model_kind="detr",
+            target_phase="evaluation",
+            evaluation_checkpoint_source=second_source,
+        )
+
+        self.assertEqual(first.probe_input_id, "task9-detr-evaluation-probe-" + "b" * 64)
+        self.assertEqual(second.probe_input_id, "task9-detr-evaluation-probe-" + "c" * 64)
+        self.assertNotEqual(first.manifest_object_key, second.manifest_object_key)
+        self.assertNotEqual(first.input_sha256, second.input_sha256)
+        self.assertEqual(first.evaluation_checkpoint_source, first_source)
+        self.assertEqual(second.evaluation_checkpoint_source, second_source)
+
+    def test_cpu_probe_source_builder_uses_recorded_origin_and_reads_committed_s3_bytes(self) -> None:
+        from gods_mlops.jobs.checkpoints import CheckpointIdentity
+        from gods_mlops.training.probe_setup import load_evaluation_probe_checkpoint_source
+
+        payload = b"verified training-probe checkpoint bytes"
+        source = _evaluation_probe_checkpoint_source(
+            hashlib.sha256(payload).hexdigest(),
+            checkpoint_size_bytes=len(payload),
+        )
+        job, probe_profile, training_profile, measurement, commit, runtime_evidence, evidence_sha = (
+            _evaluation_probe_origin(source)
+        )
+        identity = CheckpointIdentity.from_dict(source.checkpoint_identity)
+
+        class Repository:
+            async def get_job(self, _job_id):
+                return job
+
+            async def checkpoint_identity(self, _job_id):
+                return identity
+
+            async def checkpoint_metadata_for(self, _job_id):
+                return commit
+
+            async def get_profile(self, *, phase, **_kwargs):
+                return probe_profile if phase == "probe" else training_profile
+
+            async def profile_measurement_for_job(self, _job_id):
+                return measurement
+
+        class Objects:
+            def __init__(self):
+                self.reads = []
+
+            def read_source(self, *, object_key, sha256_digest, size_bytes):
+                self.reads.append((object_key, sha256_digest, size_bytes))
+                if sha256_digest != hashlib.sha256(payload).hexdigest() or size_bytes != len(payload):
+                    raise AssertionError("builder did not verify the checkpoint commit bytes")
+                return payload
+
+        objects = Objects()
+        with patch(
+            "gods_mlops.training.probe_setup._recorded_training_probe_evidence",
+            return_value=(runtime_evidence, evidence_sha),
+        ):
+            resolved = asyncio.run(
+                load_evaluation_probe_checkpoint_source(
+                    repository=Repository(),
+                    objects=objects,
+                    bucket="gods-task8-test",
+                    training_probe_job_id=source.training_probe_job_id,
+                    model_kind=source.model_kind,
+                )
+            )
+
+        self.assertEqual(resolved, source)
+        self.assertEqual(len(objects.reads), 1)
+        self.assertEqual(objects.reads[0][1:], (source.checkpoint_sha256, len(payload)))
+
+    def test_probe_submit_binds_checkpoint_source_into_dedupe_only_for_calibration(self) -> None:
+        from gods_mlops.jobs.queue import JobQueue
+
+        source = _evaluation_probe_checkpoint_source()
+        profile = {
+            "phase": "probe",
+            "target_phase": "evaluation",
+            "model_kind": "detr",
+            "config_version": "task9-detr-person-coco-evaluation-probe-v1",
+            "config_sha256": "f" * 64,
+            "profile_state": "candidate",
+            "config_json": {
+                "model_id": source.model_id,
+                "model_revision": source.model_revision,
+                "input_size": 640,
+                "micro_batch": 1,
+                "score_threshold": 0.3,
+                "max_detections": 100,
+                "max_evaluation_frames": 1,
+            },
+        }
+
+        class Repository:
+            def __init__(self):
+                self.enqueued = []
+
+            async def get_profile(self, *, phase, model_kind, config_version):
+                self.requested_profile = (phase, model_kind, config_version)
+                if config_version == "task8-detr-640-microbatch1-probe-v1":
+                    return {
+                        "phase": "probe",
+                        "target_phase": "training",
+                        "model_kind": "detr",
+                        "config_version": config_version,
+                        "config_sha256": "7" * 64,
+                        "profile_state": "candidate",
+                    }
+                return profile
+
+            async def enqueue(self, **kwargs):
+                self.enqueued.append(kwargs)
+                return f"job-{len(self.enqueued)}"
+
+        async def submit(probe):
+            repository = Repository()
+            queue = JobQueue(repository=repository, sources=object())
+            job_id = await queue.submit_probe(
+                model_kind="detr",
+                config_version=profile["config_version"],
+                probe_input=probe,
+            )
+            return job_id, repository.enqueued[0]
+
+        legacy_probe = ProbeInput(
+            probe_input_id="task8-detr-synthetic-probe-v1",
+            model_kind="detr",
+            target_phase="training",
+            config_version="task8-detr-640-microbatch1-probe-v1",
+            manifest_object_key="probe-inputs/task8-training/manifest.json",
+            input_sha256="3" * 64,
+            object_size_bytes=512,
+        )
+        legacy_repository = Repository()
+        legacy_queue = JobQueue(repository=legacy_repository, sources=object())
+        asyncio.run(
+            legacy_queue.submit_probe(
+                model_kind="detr",
+                config_version=legacy_probe.config_version,
+                probe_input=legacy_probe,
+            )
+        )
+        self.assertIsNone(legacy_repository.enqueued[0].get("stable_source_identity"))
+
+        evaluation_probe = ProbeInput(
+            probe_input_id="task9-detr-evaluation-probe-bbbbbbbbbbbb",
+            model_kind="detr",
+            target_phase="evaluation",
+            config_version=profile["config_version"],
+            manifest_object_key="probe-inputs/task9-evaluation/manifest.json",
+            input_sha256="e" * 64,
+            object_size_bytes=512,
+            evaluation_checkpoint_source=source,
+        )
+        _, submitted = asyncio.run(submit(evaluation_probe))
+        self.assertEqual(
+            submitted["stable_source_identity"],
+            {"evaluation_checkpoint_source": source.as_dict()},
+        )
+        second_source = _evaluation_probe_checkpoint_source("c" * 64)
+        second_probe = ProbeInput(
+            probe_input_id="task9-detr-evaluation-probe-cccccccccccc",
+            model_kind="detr",
+            target_phase="evaluation",
+            config_version=profile["config_version"],
+            manifest_object_key="probe-inputs/task9-evaluation-cccc/manifest.json",
+            input_sha256="c" * 64,
+            object_size_bytes=512,
+            evaluation_checkpoint_source=second_source,
+        )
+        _, second_submission = asyncio.run(submit(second_probe))
+        self.assertNotEqual(submitted["stable_source_identity"], second_submission["stable_source_identity"])
+
+    def test_legacy_task8_probe_dedupe_key_is_unchanged_without_calibration_source(self) -> None:
+        from gods_mlops.jobs.queue import _enqueue_dedupe_key
+
+        stable_identity = {
+            "phase": "probe",
+            "target_phase": "training",
+            "input_kind": "probe_input",
+            "input_id": "task8-detr-synthetic-probe-v1",
+            "input_sha256": "360eaf37b568049b82504a38980c8ad6a929028a167b640256247ecc639de7d5",
+            "dataset_version": None,
+            "model_kind": "detr",
+            "config_version": "task8-detr-640-microbatch1-probe-v1",
+            "config_sha256": "7aee75e99a4f5b96ffc8c2373048f64dbf6d69ce4bd10949f0b42f12f5eb5a3b",
+        }
+
+        self.assertEqual(
+            _enqueue_dedupe_key(stable_identity, None),
+            "5e1a88c09115058b66290af4755fd75ba1818737cbb3d6ecd5294461386ff236",
+        )
+
+    def test_queue_origin_fence_checks_probe_source_and_checkpoint_commit_before_write(self) -> None:
+        from gods_mlops.jobs.queue import _enqueue_dedupe_key, _evaluation_probe_checkpoint_source_error
+
+        source = _evaluation_probe_checkpoint_source()
+        eval_probe_input = ProbeInput(
+            probe_input_id="task9-detr-evaluation-probe-" + source.checkpoint_sha256,
+            model_kind="detr",
+            target_phase="evaluation",
+            config_version="task9-detr-person-coco-evaluation-probe-v1",
+            manifest_object_key="probe-inputs/task9-evaluation/manifest.json",
+            input_sha256="e" * 64,
+            object_size_bytes=512,
+            evaluation_checkpoint_source=source,
+        )
+        eval_probe_job = {
+            "job_id": "e4d82c26-8f0a-4f45-8b88-5fe84302d948",
+            "phase": "probe",
+            "target_phase": "evaluation",
+            "input_kind": "probe_input",
+            "input_id": eval_probe_input.probe_input_id,
+            "input_sha256": eval_probe_input.input_sha256,
+            "dataset_version": None,
+            "model_kind": "detr",
+            "config_version": eval_probe_input.config_version,
+            "config_sha256": "f" * 64,
+            "rerun": False,
+            "dedupe_key": None,
+            "source_refs": eval_probe_input.as_dict(),
+        }
+        stable_identity = {
+            "phase": "probe",
+            "target_phase": "evaluation",
+            "input_kind": "probe_input",
+            "input_id": eval_probe_job["input_id"],
+            "input_sha256": eval_probe_job["input_sha256"],
+            "dataset_version": None,
+            "model_kind": "detr",
+            "config_version": eval_probe_job["config_version"],
+            "config_sha256": eval_probe_job["config_sha256"],
+        }
+        eval_probe_job["dedupe_key"] = _enqueue_dedupe_key(
+            stable_identity,
+            {"evaluation_checkpoint_source": source.as_dict()},
+        )
+        prior_job, probe_profile, training_profile, measurement, commit, _evidence, _evidence_sha = (
+            _evaluation_probe_origin(source)
+        )
+
+        class Connection:
+            async def fetchrow(self, query, *_args):
+                if "FROM gods_mlops_jobs" in query:
+                    return prior_job
+                if "FROM gods_mlops_resource_profiles" in query:
+                    return probe_profile if "phase='probe'" in query else training_profile
+                if "FROM gods_mlops_profile_measurements" in query:
+                    return measurement
+                if "checkpoint_committed" in query:
+                    return {"details": commit}
+                raise AssertionError("unexpected query in probe-source fence")
+
+        connection = Connection()
+        self.assertIsNone(asyncio.run(_evaluation_probe_checkpoint_source_error(connection, eval_probe_job)))
+        self.assertEqual(
+            asyncio.run(
+                _evaluation_probe_checkpoint_source_error(
+                    connection,
+                    {**eval_probe_job, "dedupe_key": "0" * 64},
+                )
+            ),
+            "evaluation_probe_checkpoint_source_invalid",
+        )
+        bad_measurement = {**measurement, "result_state": "failed"}
+
+        async def fetch_bad_measurement(query, *_args):
+            if "FROM gods_mlops_jobs" in query:
+                return prior_job
+            if "FROM gods_mlops_resource_profiles" in query:
+                return probe_profile if "phase='probe'" in query else training_profile
+            if "FROM gods_mlops_profile_measurements" in query:
+                return bad_measurement
+            return {"details": commit}
+
+        connection.fetchrow = fetch_bad_measurement
+        self.assertEqual(
+            asyncio.run(_evaluation_probe_checkpoint_source_error(connection, eval_probe_job)),
+            "evaluation_probe_checkpoint_source_invalid",
+        )
+
+    def test_probe_checkpoint_intent_then_origin_change_blocks_s3_commit_and_stale_owner(self) -> None:
+        from gods_mlops.jobs.checkpoints import CheckpointIdentity, CheckpointIdentityError, StaleCheckpointOwnerError
+        from gods_mlops.jobs.queue import PostgresJobQueueRepository
+
+        source = _evaluation_probe_checkpoint_source()
+        prior_job, probe_profile, training_profile, measurement, commit, _evidence, _evidence_sha = (
+            _evaluation_probe_origin(source)
+        )
+        current_config_sha = "f" * 64
+        current_config_version = "task9-detr-person-coco-evaluation-probe-v1"
+        probe_input = ProbeInput(
+            probe_input_id="task9-detr-evaluation-probe-" + source.checkpoint_sha256,
+            model_kind="detr",
+            target_phase="evaluation",
+            config_version=current_config_version,
+            manifest_object_key="probe-inputs/task9-evaluation/manifest.json",
+            input_sha256="e" * 64,
+            object_size_bytes=512,
+            evaluation_checkpoint_source=source,
+        )
+        job = {
+            "job_id": "e4d82c26-8f0a-4f45-8b88-5fe84302d948",
+            "state": "running",
+            "lease_token": "8ad96890-3434-4f07-85bb-8cde17a2b009",
+            "phase": "probe",
+            "target_phase": "evaluation",
+            "input_kind": "probe_input",
+            "input_id": probe_input.probe_input_id,
+            "input_sha256": probe_input.input_sha256,
+            "dataset_version": None,
+            "model_kind": "detr",
+            "config_version": current_config_version,
+            "config_sha256": current_config_sha,
+            "rerun": False,
+            "source_refs": probe_input.as_dict(),
+            "checkpoint_uri": None,
+            "checkpoint_sha256": None,
+            "checkpoint_identity": None,
+        }
+        from gods_mlops.jobs.queue import _enqueue_dedupe_key
+
+        stable_identity = {
+            "phase": "probe",
+            "target_phase": "evaluation",
+            "input_kind": "probe_input",
+            "input_id": job["input_id"],
+            "input_sha256": job["input_sha256"],
+            "dataset_version": None,
+            "model_kind": "detr",
+            "config_version": current_config_version,
+            "config_sha256": current_config_sha,
+        }
+        job["dedupe_key"] = _enqueue_dedupe_key(
+            stable_identity,
+            {"evaluation_checkpoint_source": source.as_dict()},
+        )
+        identity = CheckpointIdentity.from_dict(
+            {
+                "job_id": job["job_id"],
+                "input_kind": job["input_kind"],
+                "input_id": job["input_id"],
+                "input_sha256": job["input_sha256"],
+                "phase": job["phase"],
+                "model_kind": job["model_kind"],
+                "config_version": job["config_version"],
+                "config_sha256": job["config_sha256"],
+                "dataset_version": None,
+            }
+        )
+        lease = {"job_id": job["job_id"], "lease_token": job["lease_token"], "fencing_token": 1}
+        reservation = {"job_id": job["job_id"], "reserved_bytes": 4096, "consumed_bytes": 0, "state": "reserved"}
+        changes = {"origin_invalidated": False, "writes": []}
+
+        class Connection:
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def fetchrow(self, query, *args):
+                if "ingestion_storage_usage" in query:
+                    return {"used_bytes": 0}
+                if "SELECT * FROM gods_mlops_jobs" in query:
+                    return prior_job
+                if "FROM gods_mlops_resource_profiles" in query and "checkpoint_reservation_bytes" in query:
+                    return {"checkpoint_reservation_bytes": 1024, "result_reservation_bytes": 1024}
+                if "FROM gods_mlops_resource_profiles" in query:
+                    return probe_profile if "phase='probe'" in query else training_profile
+                if "FROM gods_mlops_profile_measurements" in query:
+                    return {**measurement, "result_state": "failed"} if changes["origin_invalidated"] else measurement
+                if "checkpoint_committed" in query:
+                    return {"details": commit}
+                if "FROM gods_mlops_artifact_reservations" in query:
+                    return reservation
+                return None
+
+            async def fetch(self, _query, *_args):
+                return []
+
+            async def execute(self, query, *_args):
+                changes["writes"].append(query)
+
+        connection = Connection()
+
+        class Pool:
+            def acquire(self):
+                return connection
+
+        class Repository(PostgresJobQueueRepository):
+            async def ensure_schema(self):
+                return None
+
+            async def _get_pool(self):
+                return Pool()
+
+            async def _lock_job_then_lease(self, _connection, **_kwargs):
+                return job, lease
+
+        repository = Repository(database_url="postgresql://unused")
+        prepared = SimpleNamespace(
+            identity=identity,
+            uri=f"s3://gods-task8-test/jobs/{job['job_id']}/results/probe.artifact",
+            object_key=f"jobs/{job['job_id']}/results/probe.artifact",
+            sha256="1" * 64,
+            size_bytes=32,
+            metadata_size_bytes=0,
+            kind="drafts",
+            previous_uri=None,
+            previous_sha256=None,
+            previous_size_bytes=None,
+            previous_metadata_size_bytes=None,
+        )
+        store = SimpleNamespace(_bucket="gods-task8-test", _prefix="jobs", commit=lambda _item: self.fail("stale result reached S3 commit"))
+
+        with patch(
+            "gods_mlops.jobs.queue._evaluation_probe_checkpoint_source_error",
+            new=AsyncMock(side_effect=[None, "evaluation_probe_checkpoint_source_invalid"]),
+        ):
+            operation_id = asyncio.run(
+                repository.begin_artifact_write(
+                    job_id=job["job_id"],
+                    lease_token=job["lease_token"],
+                    identity=identity,
+                    prepared=prepared,
+                    store=store,
+                    operation="result",
+                    runtime_measurements={"optimizer_steps": 0},
+                )
+            )
+            self.assertTrue(operation_id)
+            self.assertTrue(any("artifact_write_pending" in write for write in changes["writes"]))
+            changes["origin_invalidated"] = True
+            with self.assertRaisesRegex(CheckpointIdentityError, "source changed before result commit"):
+                asyncio.run(
+                    repository.commit_result_artifact(
+                        job_id=job["job_id"],
+                        lease_token=job["lease_token"],
+                        identity=identity,
+                        prepared=prepared,
+                        store=store,
+                        source_registry=object(),
+                        operation_id=operation_id,
+                        precharged=True,
+                        runtime_measurements={"optimizer_steps": 0},
+                    )
+                )
+
+        class StaleRepository(Repository):
+            async def _lock_job_then_lease(self, _connection, **_kwargs):
+                return job, None
+
+        with self.assertRaisesRegex(StaleCheckpointOwnerError, "no longer owns"):
+            asyncio.run(
+                StaleRepository(database_url="postgresql://unused").commit_result_artifact(
+                    job_id=job["job_id"],
+                    lease_token=job["lease_token"],
+                    identity=identity,
+                    prepared=prepared,
+                    store=store,
+                    source_registry=object(),
+                    operation_id=operation_id,
+                    precharged=True,
+                    runtime_measurements={"optimizer_steps": 0},
+                )
+            )
+
     def test_evaluation_profile_probe_and_clip_fixture_can_name_evaluation_phase(self) -> None:
         profile = ExecutionProfile(
             model_kind="clip",
@@ -174,6 +929,7 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
             manifest_object_key="probe-inputs/fixture/manifest.json",
             input_sha256="e" * 64,
             object_size_bytes=512,
+            evaluation_checkpoint_source=_evaluation_probe_checkpoint_source(model_kind="clip"),
         )
 
         self.assertEqual(profile.target_phase, "evaluation")
@@ -206,6 +962,8 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
                         "clip",
                         "--target-phase",
                         "evaluation",
+                        "--training-probe-job-id",
+                        "a0320b59-663c-4cdc-b893-086bb970ea60",
                         "--worker-image",
                         "gods-mlops-training:task9",
                         "--worker-image-id",
@@ -218,6 +976,23 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         run_probe.assert_awaited_once()
         self.assertEqual(run_probe.await_args.kwargs["target_phase"], "evaluation")
+        self.assertEqual(
+            run_probe.await_args.kwargs["training_probe_job_id"],
+            "a0320b59-663c-4cdc-b893-086bb970ea60",
+        )
+
+    def test_evaluation_profile_probe_rejects_missing_training_probe_source_before_runtime_setup(self) -> None:
+        from gods_mlops.training.docker_probe import run_docker_model_probe
+
+        with self.assertRaisesRegex(ValueError, "training-probe job ID"):
+            asyncio.run(
+                run_docker_model_probe(
+                    model_kind="detr",
+                    target_phase="evaluation",
+                    worker_image="sha256:" + "f" * 64,
+                    expected_image_id="sha256:" + "f" * 64,
+                )
+            )
 
     def test_evaluation_job_requires_current_evaluation_eligibility_and_measured_profile(self) -> None:
         job_queue_type = _require("gods_mlops.jobs.queue", "JobQueue")

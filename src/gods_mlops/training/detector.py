@@ -123,6 +123,15 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             model_kind="detr",
             model_revision=model_lock.revision,
         )
+    elif phase == "probe" and target_phase == "evaluation":
+        from .worker import apply_verified_evaluation_probe_checkpoint_weights
+
+        apply_verified_evaluation_probe_checkpoint_weights(
+            model,
+            config,
+            model_kind="detr",
+            model_revision=model_lock.revision,
+        )
 
     if target_phase in {"preparation", "evaluation"}:
         return _draft_detections(
@@ -365,15 +374,27 @@ def _draft_detections(
     if not 0 <= threshold <= 1:
         raise ValueError("detector score threshold must be between zero and one")
     model.eval()
-    evaluation = config.get("phase") == "evaluation" and config.get("target_phase") == "evaluation"
+    evaluation = (
+        config.get("target_phase") == "evaluation"
+        and (
+            config.get("phase") == "evaluation"
+            or (
+                config.get("phase") == "probe"
+                and isinstance(config.get("_evaluation_probe_checkpoint_source"), dict)
+            )
+        )
+    )
     drafts: list[dict[str, Any]] = []
     next_index = 0
     if evaluation:
-        from gods_mlops.evaluation.report import decode_evaluation_cursor
+        if config.get("phase") == "probe":
+            from gods_mlops.evaluation.report import decode_evaluation_probe_cursor as decode_cursor
+        else:
+            from gods_mlops.evaluation.report import decode_evaluation_cursor as decode_cursor
 
         resume_payload = config.get("_evaluation_resume_payload")
         if isinstance(resume_payload, bytes):
-            cursor = decode_evaluation_cursor(
+            cursor = decode_cursor(
                 resume_payload,
                 expected_identity=config["_evaluation_job_identity"],
                 expected_candidate_checkpoint_sha256=str(config["_evaluation_checkpoint_sha256"]),
@@ -458,6 +479,13 @@ def _draft_detections(
             "coco_category_id": 1,
             "coco_category_name": "person",
         }
+    if config.get("phase") == "probe" and evaluation:
+        checkpoint_source = config["_evaluation_probe_checkpoint_source"]
+        output["evaluation_probe_checkpoint"] = {
+            "training_probe_job_id": checkpoint_source["training_probe_job_id"],
+            "checkpoint_sha256": checkpoint_source["checkpoint_sha256"],
+            "model_revision": checkpoint_source["model_revision"],
+        }
     encoded = write_json(output_path / "draft-detections.json", output)
     digest = sha256(encoded).hexdigest()
     measurements = _draft_resource_measurements(
@@ -466,7 +494,12 @@ def _draft_detections(
     )
     result_uri = None
     commit_result = config.get("_commit_result_artifact")
-    if callable(commit_result):
+    source_bound_evaluation_probe = (
+        config.get("phase") == "probe"
+        and evaluation
+        and isinstance(config.get("_evaluation_probe_checkpoint_source"), dict)
+    )
+    if callable(commit_result) and not source_bound_evaluation_probe:
         result_uri = commit_result("drafts", encoded, measurements).uri
         encoded = b""
     return {
@@ -486,9 +519,12 @@ def _yield_detr_evaluation_cursor(
     drafts: list[dict[str, Any]],
     next_index: int,
 ) -> dict[str, Any]:
-    from gods_mlops.evaluation.report import encode_evaluation_cursor
+    if config.get("phase") == "probe":
+        from gods_mlops.evaluation.report import encode_evaluation_probe_cursor as encode_cursor
+    else:
+        from gods_mlops.evaluation.report import encode_evaluation_cursor as encode_cursor
 
-    payload = encode_evaluation_cursor(
+    payload = encode_cursor(
         identity=config["_evaluation_job_identity"],
         candidate_checkpoint_sha256=str(config["_evaluation_checkpoint_sha256"]),
         manifest_sha256=str(config["input_sha256"]),

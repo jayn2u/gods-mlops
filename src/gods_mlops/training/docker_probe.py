@@ -11,7 +11,6 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from hashlib import sha256
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -24,9 +23,10 @@ from gods_mlops.jobs.queue import JobQueue, PostgresJobQueueRepository
 from gods_mlops.jobs.sources import DatasetSourceRegistry
 
 from .claims import WorkerClaim
+from .contracts import locked_model
 from .data import dataset_object_store_from_environment
 from .placement import validate_worker_placement
-from .probe_setup import candidate_profile, create_probe_input
+from .probe_setup import candidate_profile, create_probe_input, load_evaluation_probe_checkpoint_source
 from .worker_adapter import resolve_owned_docker_process
 
 _IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -78,9 +78,10 @@ class DockerProbeEvidence:
     measurement: dict
     result_artifact: dict
     output: dict
+    evaluation_checkpoint_source: dict | None = None
 
     def as_dict(self) -> dict:
-        return {
+        result = {
             "event": "task8_real_model_probe_complete",
             "job_id": self.job_id,
             "model_kind": self.model_kind,
@@ -100,6 +101,9 @@ class DockerProbeEvidence:
             "result_artifact": self.result_artifact,
             "output": self.output,
         }
+        if self.evaluation_checkpoint_source is not None:
+            result["evaluation_checkpoint_source"] = self.evaluation_checkpoint_source
+        return result
 
 
 class DockerProbeError(RuntimeError):
@@ -116,6 +120,7 @@ async def run_docker_model_probe(
     worker_image: str,
     expected_image_id: str,
     target_phase: str | None = None,
+    training_probe_job_id: str | None = None,
     model_cache_root: str = "/data/jayn2u/gods-mlops-model-preparation",
     timeout_seconds: int = 3600,
     evidence_directory: str | Path = "output/task8-real-model-probes",
@@ -124,6 +129,10 @@ async def run_docker_model_probe(
     if model_kind not in {"detr", "clip", "qwen"}:
         raise ValueError("real-model probe model_kind must be detr, clip, or qwen")
     profile = candidate_profile(model_kind, target_phase=target_phase)
+    if profile.target_phase == "evaluation" and training_probe_job_id is None:
+        raise ValueError("evaluation profile probes require a successful training-probe job ID")
+    if profile.target_phase != "evaluation" and training_probe_job_id is not None:
+        raise ValueError("training-probe checkpoint source is only valid for evaluation profile calibration")
     if not _IMAGE_REF.fullmatch(worker_image) or not _IMAGE_ID.fullmatch(expected_image_id):
         raise ValueError("probe requires the source-matched image reference and exact Docker image ID")
     if not model_cache_root.startswith("/") or any(char in model_cache_root for char in ":,\n\r"):
@@ -197,8 +206,20 @@ async def run_docker_model_probe(
         if profile.config_version is None:
             raise RuntimeError("candidate profile lost its immutable config version")
         objects = dataset_object_store_from_environment()
+        evaluation_checkpoint_source = None
+        if profile.target_phase == "evaluation":
+            evaluation_checkpoint_source = await load_evaluation_probe_checkpoint_source(
+                repository=repository,
+                objects=objects,
+                bucket=_required("GODS_MLOPS_S3_BUCKET"),
+                training_probe_job_id=training_probe_job_id,
+                model_kind=model_kind,
+            )
         probe_input = create_probe_input(
-            objects=objects, model_kind=model_kind, target_phase=profile.target_phase
+            objects=objects,
+            model_kind=model_kind,
+            target_phase=profile.target_phase,
+            evaluation_checkpoint_source=evaluation_checkpoint_source,
         )
         docker_image_id = await _remote_ssh(
             ssh_target,
@@ -224,7 +245,7 @@ async def run_docker_model_probe(
         )
         if image_source_commit != source_commit:
             raise DockerProbeError("cached Docker image label differs from the committed Task 8 source")
-        model = __import__("gods_mlops.training.contracts", fromlist=["locked_model"]).locked_model(model_kind)
+        model = locked_model(model_kind)
         await _verify_model_cache(
             ssh_target=ssh_target,
             ssh_port=ssh_port,
@@ -377,6 +398,11 @@ async def run_docker_model_probe(
             measurement=measurement,
             result_artifact=artifact[0],
             output=artifact[1],
+            evaluation_checkpoint_source=(
+                evaluation_checkpoint_source.as_dict()
+                if evaluation_checkpoint_source is not None
+                else None
+            ),
         )
         evidence_path = Path(evidence_directory) / f"{model_kind}-{job_id}.json"
         evidence_path.parent.mkdir(parents=True, exist_ok=True)

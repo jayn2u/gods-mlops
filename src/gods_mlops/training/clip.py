@@ -226,6 +226,14 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
                 load_rgb_image(item, object_store=object_store) for item in gallery_items
             ]
         else:
+            from .worker import apply_verified_evaluation_probe_checkpoint_weights
+
+            apply_verified_evaluation_probe_checkpoint_weights(
+                model,
+                config,
+                model_kind="clip",
+                model_revision=model_lock.revision,
+            )
             pairs, object_store = _pairs_from_manifest(manifest, config, micro_batch)
             queries = [
                 {"query_id": str(pair["image_id"]), "query_text": str(pair["text"])}
@@ -505,10 +513,21 @@ def _run_clip_evaluation(
     import torch
 
     from gods_mlops.datasets.manifest import canonical_json
-    from gods_mlops.evaluation.report import decode_evaluation_cursor, encode_evaluation_cursor
+    from gods_mlops.evaluation.report import (
+        decode_evaluation_cursor,
+        decode_evaluation_probe_cursor,
+        encode_evaluation_cursor,
+        encode_evaluation_probe_cursor,
+    )
     from .runner_support import resource_measurements
 
     phase = str(config.get("phase"))
+    evaluation_probe = (
+        phase == "probe"
+        and config.get("target_phase") == "evaluation"
+        and isinstance(config.get("_evaluation_probe_checkpoint_source"), dict)
+    )
+    evaluation_execution = phase == "evaluation" or evaluation_probe
     if len(gallery_items) != len(gallery_images):
         raise ValueError("CLIP gallery item and image counts do not match")
     if not queries or not gallery_items:
@@ -528,8 +547,9 @@ def _run_clip_evaluation(
     }
     start_index = 0
     resume_payload = config.get("_evaluation_resume_payload")
-    if phase == "evaluation" and isinstance(resume_payload, bytes):
-        cursor = decode_evaluation_cursor(
+    if evaluation_execution and isinstance(resume_payload, bytes):
+        decode_cursor = decode_evaluation_probe_cursor if evaluation_probe else decode_evaluation_cursor
+        cursor = decode_cursor(
             resume_payload,
             expected_identity=config["_evaluation_job_identity"],
             expected_candidate_checkpoint_sha256=str(config["_evaluation_checkpoint_sha256"]),
@@ -541,7 +561,18 @@ def _run_clip_evaluation(
         if state.get("stage") not in {"queries", "gallery"}:
             raise ValueError("CLIP evaluation cursor stage is invalid")
 
-    inference_steps = 0
+    completed_query_batches = 0
+    completed_gallery_batches = 0
+    if evaluation_execution and isinstance(resume_payload, bytes):
+        completed_queries = (
+            len(queries)
+            if state.get("stage") == "gallery"
+            else start_index
+        )
+        completed_galleries = start_index if state.get("stage") == "gallery" else 0
+        completed_query_batches = (completed_queries + batch_size - 1) // batch_size
+        completed_gallery_batches = (completed_galleries + batch_size - 1) // batch_size
+    inference_steps = completed_query_batches + completed_gallery_batches
     stage_order = {"queries": 0, "gallery": 1, "complete": 2}
     for stage in ("queries", "gallery"):
         if stage_order[stage] < stage_order.get(state["stage"], -1):
@@ -550,9 +581,10 @@ def _run_clip_evaluation(
         size = len(queries) if stage == "queries" else len(gallery_items)
         while position < size:
             if not _worker_should_continue(config):
-                if phase != "evaluation":
+                if not evaluation_execution:
                     return {"status": "yielded", "resource_measurements": {"optimizer_steps": 0}}
-                cursor_payload = encode_evaluation_cursor(
+                encode_cursor = encode_evaluation_probe_cursor if evaluation_probe else encode_evaluation_cursor
+                cursor_payload = encode_cursor(
                     identity=config["_evaluation_job_identity"],
                     candidate_checkpoint_sha256=str(config["_evaluation_checkpoint_sha256"]),
                     manifest_sha256=str(config["input_sha256"]),
@@ -595,9 +627,10 @@ def _run_clip_evaluation(
         start_index = 0
 
     if not _worker_should_continue(config):
-        if phase != "evaluation":
+        if not evaluation_execution:
             return {"status": "yielded", "resource_measurements": {"optimizer_steps": 0}}
-        cursor_payload = encode_evaluation_cursor(
+        encode_cursor = encode_evaluation_probe_cursor if evaluation_probe else encode_evaluation_cursor
+        cursor_payload = encode_cursor(
             identity=config["_evaluation_job_identity"],
             candidate_checkpoint_sha256=str(config["_evaluation_checkpoint_sha256"]),
             manifest_sha256=str(config["input_sha256"]),
@@ -628,6 +661,13 @@ def _run_clip_evaluation(
             "source_fixture": True,
             "human_relevance_truth_used": False,
         }
+        if evaluation_probe:
+            source = config["_evaluation_probe_checkpoint_source"]
+            document["evaluation_probe_checkpoint"] = {
+                "training_probe_job_id": source["training_probe_job_id"],
+                "checkpoint_sha256": source["checkpoint_sha256"],
+                "model_revision": source["model_revision"],
+            }
         payload = canonical_json(document)
         result_kind = "evaluation_probe"
     else:

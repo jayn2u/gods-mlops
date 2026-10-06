@@ -30,6 +30,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     probe.add_argument("--model-kind", choices=("detr", "clip", "qwen"), required=True)
     probe.add_argument("--target-phase", choices=("training", "preparation", "evaluation"))
+    probe.add_argument(
+        "--training-probe-job-id",
+        help="successful measured training-target probe checkpoint required for evaluation profile calibration",
+    )
     probe.add_argument("--worker-image", required=True, help="source-matched image already loaded on Ubuntu")
     probe.add_argument("--worker-image-id", required=True, help="exact immutable Docker image ID from Ubuntu")
     probe.add_argument(
@@ -138,6 +142,7 @@ async def _run_probe(args: argparse.Namespace) -> int:
         target_phase=args.target_phase,
         worker_image=args.worker_image,
         expected_image_id=args.worker_image_id,
+        training_probe_job_id=args.training_probe_job_id,
         model_cache_root=args.model_cache_root,
         timeout_seconds=args.timeout_seconds,
         evidence_directory=args.evidence_directory,

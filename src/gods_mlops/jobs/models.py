@@ -115,6 +115,241 @@ class DatasetTrainingSource:
 
 
 @dataclass(frozen=True, slots=True)
+class EvaluationProbeCheckpointSource:
+    """Verified weights source used only to calibrate a probe's evaluation phase."""
+
+    training_probe_job_id: str
+    model_kind: str
+    model_id: str
+    model_revision: str
+    checkpoint_uri: str
+    checkpoint_sha256: str
+    checkpoint_size_bytes: int
+    checkpoint_identity: dict[str, Any]
+    worker_image_id: str
+    source_commit: str
+    runtime_evidence_sha256: str
+
+    def __post_init__(self) -> None:
+        import re
+
+        from gods_mlops.jobs.checkpoints import CheckpointIdentity
+
+        try:
+            canonical_job_id = str(UUID(self.training_probe_job_id))
+        except (TypeError, ValueError) as error:
+            raise ValueError("evaluation probe training job ID must be a UUID") from error
+        if canonical_job_id != self.training_probe_job_id.lower():
+            raise ValueError("evaluation probe training job ID must be lowercase canonical UUID text")
+        if self.model_kind not in {"detr", "clip"}:
+            raise ValueError("evaluation probe checkpoint model kind must be DETR or CLIP")
+        if not self.model_id.strip() or not self.model_revision.strip():
+            raise ValueError("evaluation probe checkpoint model identity is missing")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.checkpoint_sha256):
+            raise ValueError("evaluation probe checkpoint SHA-256 is invalid")
+        if type(self.checkpoint_size_bytes) is not int or self.checkpoint_size_bytes <= 0:
+            raise ValueError("evaluation probe checkpoint size must be a positive integer")
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", self.worker_image_id):
+            raise ValueError("evaluation probe source image ID must be an immutable SHA-256 ID")
+        if not re.fullmatch(r"[0-9a-f]{40,64}", self.source_commit):
+            raise ValueError("evaluation probe source commit is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", self.runtime_evidence_sha256):
+            raise ValueError("evaluation probe runtime evidence SHA-256 is invalid")
+        if not isinstance(self.checkpoint_identity, dict):
+            raise ValueError("evaluation probe checkpoint identity is missing")
+        identity = CheckpointIdentity.from_dict(self.checkpoint_identity).as_dict()
+        if identity != self.checkpoint_identity:
+            raise ValueError("evaluation probe checkpoint identity is not canonical")
+        if (
+            identity["job_id"] != canonical_job_id
+            or identity["input_kind"] != "probe_input"
+            or identity["phase"] != "probe"
+            or identity["dataset_version"] is not None
+            or identity["model_kind"] != self.model_kind
+        ):
+            raise ValueError("evaluation probe checkpoint identity is not a null-dataset model probe")
+
+        parsed = urlsplit(self.checkpoint_uri)
+        key = parsed.path.lstrip("/")
+        parts = key.split("/")
+        if (
+            parsed.scheme != "s3"
+            or not parsed.netloc
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or ".." in parts
+            or "\\" in key
+            or len(parts) != 5
+            or parts[0] != "jobs"
+            or parts[1] != canonical_job_id
+            or parts[2] != "checkpoints"
+            or not re.fullmatch(r"[0-9a-f]{64}", parts[3])
+            or parts[4] != f"{self.checkpoint_sha256}.checkpoint"
+        ):
+            raise ValueError("evaluation probe checkpoint URI does not match its job and content hash")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "schema": "gods-mlops-evaluation-probe-checkpoint-v1",
+            "training_probe_job_id": self.training_probe_job_id,
+            "model_kind": self.model_kind,
+            "model_id": self.model_id,
+            "model_revision": self.model_revision,
+            "checkpoint_uri": self.checkpoint_uri,
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "checkpoint_size_bytes": self.checkpoint_size_bytes,
+            "checkpoint_identity": dict(self.checkpoint_identity),
+            "worker_image_id": self.worker_image_id,
+            "source_commit": self.source_commit,
+            "runtime_evidence_sha256": self.runtime_evidence_sha256,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "EvaluationProbeCheckpointSource":
+        expected_keys = {
+            "schema",
+            "training_probe_job_id",
+            "model_kind",
+            "model_id",
+            "model_revision",
+            "checkpoint_uri",
+            "checkpoint_sha256",
+            "checkpoint_size_bytes",
+            "checkpoint_identity",
+            "worker_image_id",
+            "source_commit",
+            "runtime_evidence_sha256",
+        }
+        if not isinstance(value, dict) or set(value) != expected_keys:
+            raise ValueError("evaluation probe checkpoint source schema is unsupported")
+        if value["schema"] != "gods-mlops-evaluation-probe-checkpoint-v1":
+            raise ValueError("evaluation probe checkpoint source schema is unsupported")
+        return cls(
+            training_probe_job_id=str(value["training_probe_job_id"]),
+            model_kind=str(value["model_kind"]),
+            model_id=str(value["model_id"]),
+            model_revision=str(value["model_revision"]),
+            checkpoint_uri=str(value["checkpoint_uri"]),
+            checkpoint_sha256=str(value["checkpoint_sha256"]),
+            checkpoint_size_bytes=value["checkpoint_size_bytes"],
+            checkpoint_identity=value["checkpoint_identity"],
+            worker_image_id=str(value["worker_image_id"]),
+            source_commit=str(value["source_commit"]),
+            runtime_evidence_sha256=str(value["runtime_evidence_sha256"]),
+        )
+
+    def validate_training_probe_origin(
+        self,
+        training_probe_job: dict[str, Any],
+        probe_profile: dict[str, Any],
+        training_profile: dict[str, Any],
+        measurement: dict[str, Any],
+        checkpoint_commit: dict[str, Any],
+        runtime_evidence: dict[str, Any] | None = None,
+        runtime_evidence_sha256: str | None = None,
+    ) -> None:
+        """Require successful, measured training-target probe provenance and commit bytes."""
+
+        def mapping(value: Any, name: str) -> dict[str, Any]:
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError as error:
+                    raise ValueError(f"evaluation probe {name} is invalid JSON") from error
+            if not isinstance(value, dict):
+                raise ValueError(f"evaluation probe {name} is missing")
+            return value
+
+        identity = self.checkpoint_identity
+        stored_identity = mapping(training_probe_job.get("checkpoint_identity"), "training probe identity")
+        if (
+            training_probe_job.get("state") != "completed"
+            or training_probe_job.get("phase") != "probe"
+            or training_probe_job.get("target_phase") != "training"
+            or training_probe_job.get("input_kind") != "probe_input"
+            or training_probe_job.get("dataset_version") is not None
+            or training_probe_job.get("profile_state_snapshot") != "candidate"
+            or training_probe_job.get("job_id") != self.training_probe_job_id
+            or training_probe_job.get("input_id") != identity["input_id"]
+            or str(training_probe_job.get("input_sha256", "")).strip() != identity["input_sha256"]
+            or training_probe_job.get("model_kind") != self.model_kind
+            or training_probe_job.get("config_version") != identity["config_version"]
+            or str(training_probe_job.get("config_sha256", "")).strip() != identity["config_sha256"]
+            or training_probe_job.get("checkpoint_uri") != self.checkpoint_uri
+            or str(training_probe_job.get("checkpoint_sha256", "")).strip() != self.checkpoint_sha256
+            or stored_identity != identity
+        ):
+            raise ValueError("evaluation probe source is not a successful training-target probe origin")
+
+        for profile, expected_phase, expected_state in (
+            (probe_profile, "probe", "candidate"),
+            (training_profile, "training", "measured"),
+        ):
+            profile_config = mapping(profile.get("config_json"), "profile config")
+            if (
+                profile.get("phase") != expected_phase
+                or profile.get("model_kind") != self.model_kind
+                or profile.get("config_version") != identity["config_version"]
+                or str(profile.get("config_sha256", "")).strip() != identity["config_sha256"]
+                or profile.get("profile_state") != expected_state
+                or profile_config.get("model_id") != self.model_id
+                or profile_config.get("model_revision") != self.model_revision
+            ):
+                raise ValueError("evaluation probe source profile differs from its checkpoint identity")
+        if probe_profile.get("target_phase") != "training":
+            raise ValueError("evaluation probe source profile is not training-target")
+
+        verification = mapping(measurement.get("verification_details"), "training measurement verification")
+        if (
+            measurement.get("result_state") != "succeeded"
+            or measurement.get("target_phase") != "training"
+            or measurement.get("model_kind") != self.model_kind
+            or str(measurement.get("input_sha256", "")).strip() != identity["input_sha256"]
+            or str(measurement.get("config_sha256", "")).strip() != identity["config_sha256"]
+            or type(measurement.get("optimizer_steps")) is not int
+            or measurement["optimizer_steps"] < 3
+            or measurement.get("checkpoint_resumed") is not True
+            or str(measurement.get("checkpoint_sha256", "")).strip() != self.checkpoint_sha256
+            or measurement.get("exit_code") != 0
+            or verification.get("passed") is not True
+            or verification.get("learning_signal_verified") is not True
+            or verification.get("checkpoint_resume_verified") is not True
+        ):
+            raise ValueError("evaluation probe source training measurement did not verify model updates")
+
+        commit_identity = mapping(checkpoint_commit.get("identity"), "checkpoint commit identity")
+        commit_uri = checkpoint_commit.get("uri", checkpoint_commit.get("checkpoint_uri"))
+        if (
+            commit_uri != self.checkpoint_uri
+            or str(checkpoint_commit.get("sha256", "")).strip() != self.checkpoint_sha256
+            or checkpoint_commit.get("size_bytes") != self.checkpoint_size_bytes
+            or commit_identity != identity
+        ):
+            raise ValueError("evaluation probe checkpoint commit marker differs from its typed source")
+
+        evidence_identity = {
+            "job_id": self.training_probe_job_id,
+            "model_kind": self.model_kind,
+            "target_phase": "training",
+            "config_version": identity["config_version"],
+            "input_sha256": identity["input_sha256"],
+            "docker_image_id": self.worker_image_id,
+            "image_source_commit": self.source_commit,
+            "source_commit": self.source_commit,
+        }
+        if runtime_evidence is not None:
+            if (
+                runtime_evidence_sha256 != self.runtime_evidence_sha256
+                or runtime_evidence.get("event") != "task8_real_model_probe_complete"
+                or any(runtime_evidence.get(key) != value for key, value in evidence_identity.items())
+                or self.source_commit != runtime_evidence.get("image_source_commit")
+            ):
+                raise ValueError("evaluation probe source runtime image/source evidence differs from its origin")
+
+
+@dataclass(frozen=True, slots=True)
 class ProbeInput:
     """Immutable S3 manifest for a model-readiness fixture, separate from a dataset."""
 
@@ -126,6 +361,7 @@ class ProbeInput:
     input_sha256: str
     object_size_bytes: int
     fixture: bool = True
+    evaluation_checkpoint_source: EvaluationProbeCheckpointSource | None = None
 
     def __post_init__(self) -> None:
         import re
@@ -155,13 +391,22 @@ class ProbeInput:
             raise ValueError("probe manifest object size must be positive")
         if self.fixture is not True:
             raise ValueError("model readiness probe input must be explicitly marked as a fixture")
+        if self.target_phase == "evaluation" and self.evaluation_checkpoint_source is None:
+            raise ValueError("evaluation profile probes require a verified training-probe checkpoint")
+        if self.target_phase != "evaluation" and self.evaluation_checkpoint_source is not None:
+            raise ValueError("training-probe checkpoint references are only valid for evaluation profile probes")
+        if (
+            self.evaluation_checkpoint_source is not None
+            and self.evaluation_checkpoint_source.model_kind != self.model_kind
+        ):
+            raise ValueError("evaluation probe checkpoint model kind differs from its probe input")
 
     @property
     def input_kind(self) -> str:
         return "probe_input"
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema": "gods-mlops-probe-input-v1",
             "probe_input_id": self.probe_input_id,
             "input_kind": self.input_kind,
@@ -174,6 +419,9 @@ class ProbeInput:
             "fixture": self.fixture,
             "dataset_version": None,
         }
+        if self.evaluation_checkpoint_source is not None:
+            result["evaluation_checkpoint_source"] = self.evaluation_checkpoint_source.as_dict()
+        return result
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ProbeInput":
@@ -181,6 +429,7 @@ class ProbeInput:
             raise ValueError("probe input reference schema is unsupported")
         if value.get("dataset_version") is not None:
             raise ValueError("probe input cannot claim a published dataset version")
+        checkpoint_source = value.get("evaluation_checkpoint_source")
         return cls(
             probe_input_id=str(value["probe_input_id"]),
             model_kind=str(value["model_kind"]),
@@ -190,6 +439,11 @@ class ProbeInput:
             input_sha256=str(value["input_sha256"]),
             object_size_bytes=int(value["object_size_bytes"]),
             fixture=value.get("fixture") is True,
+            evaluation_checkpoint_source=(
+                EvaluationProbeCheckpointSource.from_dict(checkpoint_source)
+                if checkpoint_source is not None
+                else None
+            ),
         )
 
     def verify(self, object_store: Any) -> dict[str, Any]:

@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import io
+import asyncio
+import json
 from hashlib import sha256
+from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw
 
 from gods_mlops.datasets.manifest import canonical_json, content_sha256
-from gods_mlops.jobs.models import ExecutionProfile, ProbeInput
+from gods_mlops.jobs.models import EvaluationProbeCheckpointSource, ExecutionProfile, ProbeInput
 
 from .contracts import locked_model
 
@@ -116,15 +119,35 @@ def candidate_profile(model_kind: str, *, target_phase: str | None = None) -> Ex
 
 
 def create_probe_input(
-    *, objects: Any, model_kind: str, target_phase: str | None = None
+    *,
+    objects: Any,
+    model_kind: str,
+    target_phase: str | None = None,
+    evaluation_checkpoint_source: EvaluationProbeCheckpointSource | None = None,
 ) -> ProbeInput:
     """Store tiny deterministic synthetic media and a typed immutable S3 manifest."""
     profile = candidate_profile(model_kind, target_phase=target_phase)
-    probe_input_id = (
-        "task8-detr-preparation-synthetic-probe-v1"
-        if model_kind == "detr" and profile.target_phase == "preparation"
-        else f"task8-{model_kind}-synthetic-probe-v1"
-    )
+    if profile.target_phase == "evaluation":
+        if evaluation_checkpoint_source is None:
+            raise ValueError("evaluation profile probes require a verified training-probe checkpoint")
+        if (
+            evaluation_checkpoint_source.model_kind != model_kind
+            or evaluation_checkpoint_source.model_id != profile.config["model_id"]
+            or evaluation_checkpoint_source.model_revision != profile.config["model_revision"]
+        ):
+            raise ValueError("evaluation probe checkpoint does not match the locked model profile")
+        probe_input_id = (
+            f"task9-{model_kind}-evaluation-probe-"
+            f"{evaluation_checkpoint_source.checkpoint_sha256}"
+        )
+    else:
+        if evaluation_checkpoint_source is not None:
+            raise ValueError("training-probe checkpoints are only valid for evaluation profile probes")
+        probe_input_id = (
+            "task8-detr-preparation-synthetic-probe-v1"
+            if model_kind == "detr" and profile.target_phase == "preparation"
+            else f"task8-{model_kind}-synthetic-probe-v1"
+        )
     media = _probe_media(model_kind)
     item_objects = []
     for label, image_bytes in media.items():
@@ -247,7 +270,92 @@ def create_probe_input(
         input_sha256=manifest_sha256,
         object_size_bytes=len(manifest_bytes),
         fixture=True,
+        evaluation_checkpoint_source=evaluation_checkpoint_source,
     )
+
+
+async def load_evaluation_probe_checkpoint_source(
+    *,
+    repository: Any,
+    objects: Any,
+    bucket: str,
+    training_probe_job_id: str | None,
+    model_kind: str,
+) -> EvaluationProbeCheckpointSource:
+    """Build the probe-only source from a completed Task 8 probe and its recorded evidence."""
+    from .checkpoints import S3CheckpointStore
+
+    if not training_probe_job_id:
+        raise ValueError("evaluation profile probes require a training-target probe checkpoint source")
+    try:
+        job = await repository.get_job(training_probe_job_id)
+        identity = await repository.checkpoint_identity(training_probe_job_id)
+        checkpoint_commit = await repository.checkpoint_metadata_for(training_probe_job_id)
+        probe_profile = await repository.get_profile(
+            phase="probe",
+            model_kind=model_kind,
+            config_version=str(job.get("config_version", "")),
+        )
+        training_profile = await repository.get_profile(
+            phase="training",
+            model_kind=model_kind,
+            config_version=str(job.get("config_version", "")),
+        )
+        measurement = await repository.profile_measurement_for_job(training_probe_job_id)
+        runtime_evidence, evidence_sha256 = _recorded_training_probe_evidence(
+            training_probe_job_id, model_kind
+        )
+        model = locked_model(model_kind)
+        if checkpoint_commit is None:
+            raise ValueError("training-target probe has no current DB checkpoint commit marker")
+        source = EvaluationProbeCheckpointSource(
+            training_probe_job_id=training_probe_job_id,
+            model_kind=model_kind,
+            model_id=model.model_id,
+            model_revision=model.revision,
+            checkpoint_uri=str(checkpoint_commit["uri"]),
+            checkpoint_sha256=str(checkpoint_commit["sha256"]).strip(),
+            checkpoint_size_bytes=int(checkpoint_commit["size_bytes"]),
+            checkpoint_identity=identity.as_dict(),
+            worker_image_id=str(runtime_evidence["docker_image_id"]),
+            source_commit=str(runtime_evidence["image_source_commit"]),
+            runtime_evidence_sha256=evidence_sha256,
+        )
+        source.validate_training_probe_origin(
+            job,
+            probe_profile,
+            training_profile,
+            measurement,
+            checkpoint_commit,
+            runtime_evidence,
+            evidence_sha256,
+        )
+        checkpoint_store = S3CheckpointStore(objects=objects, bucket=bucket)
+        verified = await asyncio.to_thread(
+            checkpoint_store.load_uri,
+            source.checkpoint_uri,
+            expected_identity=identity,
+            expected_sha256=source.checkpoint_sha256,
+            expected_size_bytes=source.checkpoint_size_bytes,
+        )
+        if verified.identity.as_dict() != source.checkpoint_identity:
+            raise ValueError("S3 checkpoint payload identity differs from the training-probe source")
+        return source
+    except Exception as error:  # noqa: BLE001 - fail closed without leaking local DB/S3 details
+        raise ValueError("training-target probe checkpoint provenance could not be verified") from error
+
+
+def _recorded_training_probe_evidence(job_id: str, model_kind: str) -> tuple[dict[str, Any], str]:
+    root = Path(__file__).resolve().parents[3]
+    output_root = root / "output"
+    matches = sorted(output_root.rglob(f"{model_kind}-{job_id}.json")) if output_root.is_dir() else []
+    if len(matches) != 1:
+        raise ValueError("training-probe runtime evidence is missing or ambiguous")
+    payload = matches[0].read_bytes()
+    value = json.loads(payload)
+    if not isinstance(value, dict):
+        raise ValueError("training-probe runtime evidence is not an object")
+    return value, sha256(payload).hexdigest()
 
 
 def _probe_media(model_kind: str) -> dict[str, bytes]:
