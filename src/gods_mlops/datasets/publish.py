@@ -183,7 +183,7 @@ class DatasetPublisher:
                        crop.caption_revision_id, crop.state, crop.caption_state, crop.sha256
                 FROM annotation_crops AS crop
                 JOIN ingestion_samples AS sample USING (sample_id)
-                WHERE crop.state = 'ready' AND sample.state = 'received'
+                WHERE crop.state = 'ready' AND sample.state IN ('received', 'purge_pending', 'expired')
                 ORDER BY crop.updated_at DESC, crop.crop_id ASC
                 LIMIT $1
                 """,

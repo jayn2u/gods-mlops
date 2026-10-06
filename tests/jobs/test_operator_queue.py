@@ -356,6 +356,76 @@ def test_operator_dedupe_key_requires_a_canonical_parent_and_high_entropy_intent
         )
 
 
+def test_cancel_cleanup_readback_failure_stays_explicitly_unknown() -> None:
+    class UnknownReservationRepository(_CancelRepository):
+        async def artifact_reservation_for(self, job_id):
+            raise OSError("reservation readback unavailable")
+
+    async def exercise() -> None:
+        repository = UnknownReservationRepository()
+        queue = JobQueue(repository=repository, sources=object())
+
+        result = await queue.cancel_queued(str(uuid4()), operator_id="operator")
+
+        assert result["reservation_cleanup"] == "unknown"
+        assert result["cleanup_pending"] is True
+        assert result["settlement_error_type"] == "OSError"
+
+    asyncio.run(exercise())
+
+
+def test_job_detail_projects_reservation_cleanup_as_unknown_when_readback_fails() -> None:
+    class DetailRepository:
+        async def get_job(self, job_id):
+            return {"job_id": job_id, "state": "cancelled", "phase": "training"}
+
+        async def artifact_reservation_for(self, job_id):
+            raise OSError("reservation readback unavailable")
+
+        async def checkpoint_metadata_for(self, job_id):
+            return None
+
+        async def result_artifacts_for(self, job_id):
+            return []
+
+        async def profile_measurement_for_job(self, job_id):
+            return None
+
+        async def review_handoffs_for(self, job_id):
+            return []
+
+    async def exercise() -> None:
+        queue = JobQueue(repository=DetailRepository(), sources=object())
+        detail = await queue.get_job_detail(str(uuid4()))
+
+        assert detail["reservation_cleanup"] == "unknown"
+
+    asyncio.run(exercise())
+
+
+def test_job_list_reads_artifact_reservation_cleanup_in_same_projection() -> None:
+    class ListingConnection:
+        query = ""
+
+        async def fetch(self, query, *args):
+            self.query = query
+            return [{"job_id": uuid4(), "state": "cancelled", "reservation_cleanup": "pending"}]
+
+    async def exercise() -> None:
+        connection = ListingConnection()
+        repository = PostgresJobQueueRepository(database_url="postgresql://unused")
+        repository._schema_ready = True
+        repository._pool = _Pool(connection)
+
+        jobs = await repository.list_jobs(limit=10)
+
+        assert jobs[0]["reservation_cleanup"] == "pending"
+        assert "LEFT JOIN gods_mlops_artifact_reservations AS reservation USING (job_id)" in connection.query
+        assert "AS reservation_cleanup" in connection.query
+
+    asyncio.run(exercise())
+
+
 def test_retry_job_reuses_current_training_gates_and_binds_the_parent_intent() -> None:
     async def exercise() -> None:
         parent = _training_parent()

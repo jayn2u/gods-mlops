@@ -12,27 +12,41 @@ function bindCsrfForms() {
     form.dataset.csrfBound = "true";
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      const response = await fetch(form.action, {
-        method: form.method.toUpperCase(),
-        body: new FormData(form),
-        credentials: "same-origin",
-        headers: { "X-CSRF-Token": csrfToken() },
+      if (form.dataset.submitting === "true") return;
+      form.dataset.submitting = "true";
+      const submitButtons = form.querySelectorAll('button[type="submit"], input[type="submit"]');
+      submitButtons.forEach((button) => {
+        button.disabled = true;
       });
-      if (response.redirected) {
-        window.location.assign(response.url);
-        return;
-      }
-      if (response.status === 202) {
+      try {
+        const response = await fetch(form.action, {
+          method: form.method.toUpperCase(),
+          body: new FormData(form),
+          credentials: "same-origin",
+          headers: { "X-CSRF-Token": csrfToken() },
+        });
+        if (response.redirected) {
+          window.location.assign(response.url);
+          return;
+        }
+        if (response.status === 202) {
+          document.documentElement.innerHTML = await response.text();
+          bindCsrfForms();
+          return;
+        }
+        if (response.ok) {
+          window.location.reload();
+          return;
+        }
         document.documentElement.innerHTML = await response.text();
         bindCsrfForms();
-        return;
+      } catch (error) {
+        form.dataset.submitting = "false";
+        submitButtons.forEach((button) => {
+          button.disabled = false;
+        });
+        throw error;
       }
-      if (response.ok) {
-        window.location.reload();
-        return;
-      }
-      document.documentElement.innerHTML = await response.text();
-      bindCsrfForms();
     });
   });
 }

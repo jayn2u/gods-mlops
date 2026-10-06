@@ -453,9 +453,16 @@ class PostgresJobQueueRepository:
                     FROM gods_mlops_jobs
                     WHERE state = ANY($2::text[])
                 )
-                SELECT job.*, queue_positions.queue_position
+                SELECT job.*, queue_positions.queue_position,
+                       CASE
+                           WHEN reservation.job_id IS NULL THEN 'not_reserved'
+                           WHEN reservation.state IN ('settled', 'released') THEN reservation.state
+                           WHEN reservation.state = 'reserved' THEN 'pending'
+                           ELSE 'unknown'
+                       END AS reservation_cleanup
                 FROM gods_mlops_jobs AS job
                 LEFT JOIN queue_positions USING (job_id)
+                LEFT JOIN gods_mlops_artifact_reservations AS reservation USING (job_id)
                 ORDER BY
                     CASE WHEN queue_positions.queue_position IS NULL THEN 1 ELSE 0 END,
                     queue_positions.queue_position ASC NULLS LAST,
@@ -4356,8 +4363,13 @@ class JobQueue:
 
     async def get_job_detail(self, job_id: str) -> dict[str, Any]:
         job = await self.get(job_id)
+        try:
+            reservation = await self._repository.artifact_reservation_for(job_id)
+        except Exception:  # noqa: BLE001 - unknown cleanup state remains visible after a failed readback
+            reservation = {"state": "unknown"}
         return {
             **job,
+            "reservation_cleanup": _reservation_cleanup_state(reservation),
             "checkpoint": await self._repository.checkpoint_metadata_for(job_id),
             "result_artifacts": await self._repository.result_artifacts_for(job_id),
             "profile_measurement": await self._repository.profile_measurement_for_job(job_id),
@@ -4377,18 +4389,11 @@ class JobQueue:
         except Exception as error:  # noqa: BLE001 - failed readback cannot prove settlement
             reservation = {"state": "unknown"}
             settlement_error_type = settlement_error_type or type(error).__name__
-        reservation_state = reservation.get("state") if reservation is not None else None
-        cleanup_status = (
-            "not_reserved"
-            if reservation is None
-            else "settled"
-            if reservation_state == "settled"
-            else "pending"
-        )
+        cleanup_status = _reservation_cleanup_state(reservation)
         return {
             "job": await self.get(job_id),
             "reservation_cleanup": cleanup_status,
-            "cleanup_pending": cleanup_status == "pending",
+            "cleanup_pending": cleanup_status in {"pending", "unknown"},
             "settlement_error_type": settlement_error_type,
         }
 
@@ -4793,6 +4798,17 @@ def _operator_actor_sha256(operator_id: str) -> str:
     if not isinstance(operator_id, str) or not operator_id.strip() or len(operator_id) > 255:
         raise ValueError("operator identity must contain 1 to 255 characters")
     return sha256(operator_id.encode("utf-8")).hexdigest()
+
+
+def _reservation_cleanup_state(reservation: dict[str, Any] | None) -> str:
+    if reservation is None:
+        return "not_reserved"
+    state = reservation.get("state")
+    if state in {"settled", "released"}:
+        return str(state)
+    if state == "reserved":
+        return "pending"
+    return "unknown"
 
 
 def _queue_order_sort_key(job: dict[str, Any]) -> tuple[bool, int, str, str]:

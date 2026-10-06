@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import time
 from urllib.parse import urlsplit
 import uuid
 
@@ -50,6 +51,11 @@ def _loopback_url(value: str, expected_port: int) -> str:
     if not loopback or parsed.port != expected_port:
         pytest.fail("browser fixture must use its explicitly owned loopback port")
     return value.rstrip("/")
+
+
+def _delay_request(route) -> None:
+    time.sleep(0.75)
+    route.continue_()
 
 
 def test_operator_flow_in_root_acknowledged_browser_fixture() -> None:
@@ -127,7 +133,7 @@ def test_operator_flow_in_root_acknowledged_browser_fixture() -> None:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        pytest.skip("install the optional e2e dependency group to run the real-browser flow")
+        pytest.fail("install the optional browser dependencies with `uv sync --group e2e`", pytrace=False)
 
     artifact_root = (Path(__file__).resolve().parents[2] / "output").resolve()
     screenshot_dir = Path(str(config["artifact_output_dir"])).expanduser().resolve()
@@ -173,9 +179,17 @@ def test_operator_flow_in_root_acknowledged_browser_fixture() -> None:
             page.locator(f'input[name="sample_ids"][value="{sample_id}"]').check()
         for crop_id in config["publication_crop_ids"]:
             page.locator(f'input[name="crop_ids"][value="{crop_id}"]').check()
+        page.route("**/datasets/publish", _delay_request)
         page.get_by_role("button", name="Publish selected dataset").click()
         page.wait_for_url(f"{base_url}/datasets")
-        page.locator("section").first.wait_for()
+        page.wait_for_function(
+            """before => Array.from(document.querySelectorAll('section:first-of-type tbody code'))
+                .map(element => element.textContent.trim())
+                .some(version => version && !before.includes(version))""",
+            list(versions_before),
+            timeout=60_000,
+        )
+        page.unroute("**/datasets/publish", _delay_request)
         page.screenshot(path=str(screenshot_dir / "datasets.png"), full_page=True)
         versions_after = set(page.locator("section").first.locator("tbody code").all_text_contents())
         new_versions = sorted(versions_after - versions_before)
@@ -192,18 +206,40 @@ def test_operator_flow_in_root_acknowledged_browser_fixture() -> None:
 
         retry_parent_id = str(config["retry_parent_job_id"])
         page.goto(f"{base_url}/jobs/{retry_parent_id}", wait_until="domcontentloaded")
-        page.get_by_role("button", name="Rerun job").click()
-        page.wait_for_url(re.compile(rf"{re.escape(base_url)}/jobs/[0-9a-f-]+$"))
+        retry_posts = []
+
+        def count_retry_post(request):
+            if request.method == "POST" and request.url.endswith(f"/jobs/{retry_parent_id}/retry"):
+                retry_posts.append(request.url)
+
+        page.on("request", count_retry_post)
+        page.route(f"**/jobs/{retry_parent_id}/retry", _delay_request)
+        page.get_by_role("button", name="Rerun job").dblclick()
+        page.wait_for_function(
+            """parentId => {
+                const match = window.location.pathname.match(/\\/jobs\\/([0-9a-f-]+)$/);
+                const visible = Array.from(document.querySelectorAll('p'))
+                    .find(element => element.textContent.startsWith('Job ID:'))
+                    ?.querySelector('code')?.textContent.trim();
+                return match && match[1] !== parentId && visible === match[1];
+            }""",
+            retry_parent_id,
+            timeout=60_000,
+        )
+        page.unroute(f"**/jobs/{retry_parent_id}/retry", _delay_request)
         retry_job_id = page.url.rsplit("/", 1)[-1]
         assert retry_job_id != retry_parent_id
+        assert len(retry_posts) == 1
+        assert page.get_by_text(f"Job ID: {retry_job_id}").is_visible()
         page.screenshot(path=str(screenshot_dir / "rerun-job.png"), full_page=True)
 
         evaluation_job_id = str(config["evaluation_job_id"])
         page.goto(f"{base_url}/jobs/{evaluation_job_id}", wait_until="domcontentloaded")
         page.get_by_text("Committed evaluation report").wait_for()
         page.get_by_text("Deployment blocked").wait_for()
-        kubeflow_link = page.get_by_role("link", name="Open Kubeflow run details, logs, and artifacts")
-        assert kubeflow_link.get_attribute("href").startswith(kubeflow_url)
+        page.get_by_text("Run details are not available for this job").wait_for()
+        kubeflow_link = page.get_by_role("link", name="Open Kubeflow Pipelines")
+        assert kubeflow_link.get_attribute("href") == f"{kubeflow_url}/pipeline/#/runs"
         report_text = page.locator("main").inner_text()
         for reason in config["expected_deployment_block_reasons"]:
             assert reason in report_text
@@ -211,3 +247,68 @@ def test_operator_flow_in_root_acknowledged_browser_fixture() -> None:
 
         context.close()
         browser.close()
+
+
+def test_acknowledged_browser_gate_fails_instead_of_skipping_when_playwright_is_missing(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import builtins
+
+    fixture_id = str(uuid.uuid4())
+    credentials_path = tmp_path / "credentials.json"
+    credentials_path.write_text(json.dumps({"username": "operator", "password": "secret"}), encoding="utf-8")
+    credentials_path.chmod(0o600)
+    config_path = tmp_path / "config.json"
+    sample_ids = [f"sample-{index}" for index in range(20)]
+    config = {
+        "fixture_id": fixture_id,
+        "base_url": "http://127.0.0.1:18000",
+        "loopback_port": 18000,
+        "database_name": f"gods_mlops_task10_{fixture_id.replace('-', '')}",
+        "s3_bucket": f"gods-mlops-task10-{fixture_id}",
+        "s3_key_prefixes": {"samples": "samples/", "datasets": "datasets/", "jobs": "jobs/"},
+        "label_studio_url": "http://127.0.0.1:18001",
+        "label_studio_port": 18001,
+        "label_media_cleanup_url": "http://127.0.0.1:18002",
+        "label_media_cleanup_port": 18002,
+        "label_studio_project_id": 7,
+        "kubeflow_url": "http://127.0.0.1:18003",
+        "kubeflow_port": 18003,
+        "credentials_file": str(credentials_path),
+        "preserve_task8_task9_evidence": True,
+        "cleanup_plan": "no runtime actions in this dependency-gate test",
+        "review_sample_id": "review-sample",
+        "publication_sample_ids": sample_ids,
+        "publication_crop_ids": [],
+        "dataset_target": "detr",
+        "dataset_config_version": "dataset-v1",
+        "model_kind": "detr",
+        "training_config_version": "train-v1",
+        "retry_parent_job_id": str(uuid.uuid4()),
+        "evaluation_job_id": str(uuid.uuid4()),
+        "expected_deployment_block_reasons": [],
+        "artifact_output_dir": str(tmp_path / "output" / fixture_id),
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    config_path.chmod(0o600)
+    monkeypatch.setenv("GODS_MLOPS_OPERATOR_E2E_CONFIG", str(config_path))
+    monkeypatch.setenv("GODS_MLOPS_OPERATOR_E2E_ROOT_ACK", fixture_id)
+    real_import = builtins.__import__
+
+    def import_without_playwright(name, *args, **kwargs):
+        if name.startswith("playwright"):
+            raise ImportError("Playwright intentionally absent in dependency-gate test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", import_without_playwright)
+
+    try:
+        test_operator_flow_in_root_acknowledged_browser_fixture()
+    except pytest.skip.Exception as skipped:
+        pytest.fail(f"an acknowledged browser flow skipped instead of failing: {skipped}")
+    except pytest.fail.Exception as failure:
+        assert "install" in str(failure).lower()
+        assert "e2e" in str(failure).lower()
+    else:
+        pytest.fail("an acknowledged browser flow proceeded without Playwright")

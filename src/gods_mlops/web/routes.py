@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from html import escape
 import json
 from pathlib import Path
@@ -34,7 +35,10 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
         operator_id: str = Depends(auth.require_operator),
     ) -> HTMLResponse:
         try:
-            items = await request.app.state.operator_services.ingestion.list_samples(limit=100, state=state)
+            items = await request.app.state.operator_services.ingestion.list_samples(
+                limit=100,
+                state=state or None,
+            )
         except Exception as error:  # noqa: BLE001 - page renders a bounded service error
             return _error_page(request, "Samples", error, status_code=503)
         integrations = request.app.state.operator_integrations
@@ -97,7 +101,12 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
         services = request.app.state.operator_services
         project_id = request.app.state.operator_integrations.label_studio_bbox_project_id
         if services.review_workflow is None or project_id is None:
-            return _error_page(request, "Reviews", RuntimeError("Label Studio review setup is not configured"), 409)
+            return _error_page(
+                request,
+                "Reviews",
+                RuntimeError("Label Studio review setup is not configured"),
+                status_code=409,
+            )
         try:
             await services.annotations.start_bbox_review(
                 sample_id,
@@ -138,12 +147,19 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
                     f"/reviews/{_e(item['sample_id'])}/{_e(item['revision'])}/finalize",
                     '<button type="submit">Finalize submitted annotation</button>',
                 )
+            provision = ""
+            workflow = request.app.state.operator_services.review_workflow
+            if item.get("state") == "provisioning" and workflow is not None and project_id is not None:
+                provision = _form(
+                    f"/reviews/{_e(item['sample_id'])}/{_e(item['revision'])}/provision",
+                    '<button type="submit">Retry Label Studio provisioning</button>',
+                )
             rows.append(
                 "<tr>"
                 f"<td><code>{_e(item.get('sample_id'))}</code></td>"
                 f"<td>{_e(item.get('stage'))}</td><td>{_e(item.get('state'))}</td>"
                 f"<td>{_e(task_id if task_id is not None else 'Not provisioned')}</td>"
-                f"<td>{_e(human)}</td><td>{project_link} {finalize}</td></tr>"
+                f"<td>{_e(human)}</td><td>{project_link} {finalize} {provision}</td></tr>"
             )
         label_api_ready = getattr(
             request.app.state.operator_services.annotations,
@@ -178,10 +194,67 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
         _csrf: None = Depends(auth.require_csrf),
     ) -> Response:
         if not getattr(request.app.state.operator_services.annotations, "label_studio_configured", False):
-            return _error_page(request, "Reviews", RuntimeError("Label Studio integration is not configured"), 409)
+            return _error_page(
+                request,
+                "Reviews",
+                RuntimeError("Label Studio integration is not configured"),
+                status_code=409,
+            )
         try:
             await request.app.state.operator_services.annotations.finalize_annotation(sample_id, revision)
         except Exception as error:  # noqa: BLE001 - annotation service owns finalization authority
+            return _error_page(request, "Reviews", error, status_code=409)
+        return _redirect("/reviews")
+
+    @router.post("/reviews/{sample_id}/{revision}/provision", response_class=HTMLResponse)
+    async def retry_review_provisioning(
+        request: Request,
+        sample_id: str,
+        revision: str,
+        operator_id: str = Depends(auth.require_operator),
+        _csrf: None = Depends(auth.require_csrf),
+    ) -> Response:
+        services = request.app.state.operator_services
+        workflow = services.review_workflow
+        if workflow is None:
+            return _error_page(
+                request,
+                "Reviews",
+                RuntimeError("Label Studio review setup is not configured"),
+                status_code=409,
+            )
+        try:
+            assignments = await services.annotations.list_reviews(limit=500)
+            assignment = next(
+                (
+                    item
+                    for item in assignments
+                    if item.get("sample_id") == sample_id and item.get("revision") == revision
+                ),
+                None,
+            )
+            if assignment is None:
+                return _error_page(request, "Reviews", KeyError("review assignment does not exist"), status_code=404)
+            if assignment.get("state") != "provisioning":
+                return _error_page(
+                    request,
+                    "Reviews",
+                    RuntimeError("review assignment is not awaiting Label Studio provisioning"),
+                    status_code=409,
+                )
+            project_id = (
+                assignment.get("project_id")
+                or request.app.state.operator_integrations.label_studio_bbox_project_id
+            )
+            if project_id is None:
+                return _error_page(
+                    request,
+                    "Reviews",
+                    RuntimeError("Label Studio project ID is not configured for this assignment"),
+                    status_code=409,
+                )
+            await workflow.provision_task(revision=revision, project_id=project_id)
+        except Exception as error:  # noqa: BLE001 - workflow retries only the stored assignment
             return _error_page(request, "Reviews", error, status_code=409)
         return _redirect("/reviews")
 
@@ -271,7 +344,7 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
             return _error_page(request, "Jobs", error, status_code=503)
         body = _jobs_table(items)
         response = _page(request, "Jobs", body)
-        _set_retry_intent_cookie(response, auth, secrets.token_urlsafe(32))
+        _set_retry_intents_for_jobs(response, request, auth, items)
         return response
 
     @router.get("/jobs/{job_id}", response_class=HTMLResponse)
@@ -312,7 +385,7 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
                     }
         body = _job_detail_body(job, report_result, request.app.state.operator_integrations)
         response = _page(request, "Job detail", body)
-        _set_retry_intent_cookie(response, auth, secrets.token_urlsafe(32))
+        _set_retry_intents_for_jobs(response, request, auth, [job])
         return response
 
     @router.post("/jobs/queue", response_class=HTMLResponse)
@@ -341,7 +414,7 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
         operator_id: str = Depends(auth.require_operator),
         _csrf: None = Depends(auth.require_csrf),
     ) -> Response:
-        intent_token = request.cookies.get(_RETRY_INTENT_COOKIE)
+        intent_token = request.cookies.get(_retry_intent_cookie_name(job_id))
         if intent_token is None:
             raise HTTPException(status_code=403, detail="Retry intent cookie is required")
         try:
@@ -353,6 +426,30 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
         except Exception as error:  # noqa: BLE001 - queue service revalidates immutable source eligibility
             return _error_page(request, "Jobs", error, status_code=409)
         return _redirect(f"/jobs/{quote(new_job_id, safe='')}")
+
+    @router.post("/jobs/{job_id}/retry/new-intent", response_class=HTMLResponse)
+    async def prepare_new_retry_intent(
+        request: Request,
+        job_id: str,
+        operator_id: str = Depends(auth.require_operator),
+        _csrf: None = Depends(auth.require_csrf),
+    ) -> Response:
+        try:
+            job = await request.app.state.operator_services.queue.get(job_id)
+        except KeyError as error:
+            return _error_page(request, "Jobs", error, status_code=404)
+        except Exception as error:  # noqa: BLE001 - keep queue details out of HTML
+            return _error_page(request, "Jobs", error, status_code=503)
+        if job.get("state") not in _TERMINAL_STATES or job.get("phase") == "probe":
+            return _error_page(
+                request,
+                "Jobs",
+                RuntimeError("a new retry intent is available only for terminal public jobs"),
+                status_code=409,
+            )
+        response = _redirect(f"/jobs/{quote(job_id, safe='')}")
+        _set_retry_intent_cookie(response, auth, job_id, secrets.token_urlsafe(32))
+        return response
 
     @router.post("/jobs/{job_id}/cancel", response_class=HTMLResponse)
     async def cancel_job(
@@ -369,10 +466,16 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
         except Exception as error:  # noqa: BLE001 - service enforces waiting-only cancellation
             return _error_page(request, "Jobs", error, status_code=409)
         if result.get("cleanup_pending"):
+            cleanup_status = result.get("reservation_cleanup")
+            notice = (
+                "cleanup is pending"
+                if cleanup_status == "pending"
+                else "cleanup status could not be verified"
+            )
             return _page(
                 request,
                 "Jobs",
-                f'<p class="waiting">Job {_e(job_id)} is cancelled. Artifact quota cleanup is pending; review this action.</p>',
+                f'<p class="waiting">Job {_e(job_id)} is cancelled. Artifact quota {notice}; retry this action from the job page.</p>',
                 status_code=202,
             )
         return _redirect("/jobs")
@@ -410,8 +513,11 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
             if item.get("state") == "failed"
             or item.get("state") in _WAITING_STATES
             or item.get("reason_code")
+            or item.get("reservation_cleanup") in {"pending", "unknown"}
         ]
-        return _page(request, "Actions", _jobs_table(needing_action, empty="No jobs currently need operator action."))
+        response = _page(request, "Actions", _jobs_table(needing_action, empty="No jobs currently need operator action."))
+        _set_retry_intents_for_jobs(response, request, auth, needing_action)
+        return response
 
     @router.get("/samples/{sample_id}/invalidation-preview", response_class=HTMLResponse)
     async def invalidation_preview(
@@ -473,17 +579,32 @@ def _jobs_table(items: list[dict[str, Any]], *, empty: str = "No jobs recorded."
         checkpoint_sha = item.get("checkpoint_sha256")
         checkpoint_text = f"Checkpoint {_e(checkpoint_sha)}" if checkpoint_sha else "No committed checkpoint"
         failure = _reason_text(item)
+        cleanup = item.get("reservation_cleanup") if state == "cancelled" else None
+        cleanup_text = _e(cleanup) if cleanup else "—"
         actions = [f'<a href="/jobs/{job_id}">Details</a>']
         if state in _WAITING_STATES:
             actions.append(_form(f"/jobs/{job_id}/cancel", '<button type="submit">Cancel</button>'))
+        elif state == "cancelled" and cleanup in {"pending", "unknown"}:
+            actions.append(
+                _form(
+                    f"/jobs/{job_id}/cancel",
+                    '<button type="submit">Retry artifact quota cleanup</button>',
+                )
+            )
         if state in _TERMINAL_STATES and item.get("phase") != "probe":
             actions.append(_form(f"/jobs/{job_id}/retry", '<button type="submit">Rerun</button>'))
+            actions.append(
+                _form(
+                    f"/jobs/{job_id}/retry/new-intent",
+                    '<button type="submit">Prepare another rerun</button>',
+                )
+            )
         rows.append(
             "<tr>"
             f"<td><code>{job_id}</code></td><td>{_e(item.get('phase'))}</td>"
             f"<td>{_e(item.get('queue_position') if item.get('queue_position') is not None else '—')}</td>"
             f'<td class="{css}">{_e(label)}</td><td>{_e(item.get("reason_code") or "—")}</td>'
-            f"<td>{_e(failure)}</td><td>{checkpoint_text}</td><td>{' '.join(actions)}</td></tr>"
+            f"<td>{_e(failure)}</td><td>{checkpoint_text}</td><td>{cleanup_text}</td><td>{' '.join(actions)}</td></tr>"
         )
     reorder_form = ""
     if active:
@@ -500,7 +621,7 @@ def _jobs_table(items: list[dict[str, Any]], *, empty: str = "No jobs recorded."
     return (
         '<section><h2>Execution status</h2>'
         '<p>Resource waiting, data insufficiency, execution failure, pipeline success, human review, and deployment eligibility are separate states.</p>'
-        f"<table><thead><tr><th>Job ID</th><th>Phase</th><th>Queue position</th><th>Status</th><th>Cause code</th><th>Details</th><th>Checkpoint</th><th>Actions</th></tr></thead><tbody>{''.join(rows)}</tbody></table></section>"
+        f"<table><thead><tr><th>Job ID</th><th>Phase</th><th>Queue position</th><th>Status</th><th>Cause code</th><th>Details</th><th>Checkpoint</th><th>Artifact quota cleanup</th><th>Actions</th></tr></thead><tbody>{''.join(rows)}</tbody></table></section>"
         + reorder_form
     )
 
@@ -511,11 +632,21 @@ def _job_detail_body(job: dict[str, Any], report_result: dict[str, Any] | None, 
     checkpoint = job.get("checkpoint")
     checkpoint_sha = checkpoint.get("sha256") if isinstance(checkpoint, dict) else job.get("checkpoint_sha256")
     checkpoint_text = f"Latest committed checkpoint SHA-256: {_e(checkpoint_sha)}" if checkpoint_sha else "No committed checkpoint is available."
-    if integrations.kubeflow_url:
-        kubeflow_url = _e(integrations.kubeflow_url.rstrip("/") + f"/pipeline/#/runs/details/{quote(str(job.get('job_id')), safe='')}")
-        kubeflow_link = f'<a href="{kubeflow_url}" rel="noreferrer">Open Kubeflow run details, logs, and artifacts</a>'
+    kubeflow_run_id = job.get("kubeflow_run_id")
+    if integrations.kubeflow_url and isinstance(kubeflow_run_id, str) and kubeflow_run_id:
+        kubeflow_url = _e(
+            integrations.kubeflow_url.rstrip("/")
+            + f"/pipeline/#/runs/details/{quote(kubeflow_run_id, safe='')}"
+        )
+        kubeflow_link = f'<a href="{kubeflow_url}" rel="noreferrer">Open Kubeflow run details</a>'
+    elif integrations.kubeflow_url:
+        kubeflow_url = _e(integrations.kubeflow_url.rstrip("/") + "/pipeline/#/runs")
+        kubeflow_link = (
+            '<span class="muted">Run details are not available for this job.</span> '
+            f'<a href="{kubeflow_url}" rel="noreferrer">Open Kubeflow Pipelines</a>'
+        )
     else:
-        kubeflow_link = '<span class="muted">Kubeflow run, log, and artifact links are not configured.</span>'
+        kubeflow_link = '<span class="muted">Kubeflow Pipelines navigation is not configured.</span>'
     report_html = ""
     if report_result is not None:
         if report_result.get("availability") != "available":
@@ -542,13 +673,31 @@ def _job_detail_body(job: dict[str, Any], report_result: dict[str, Any] | None, 
     actions = []
     if job.get("state") in _WAITING_STATES:
         actions.append(_form(f"/jobs/{job_id}/cancel", '<button type="submit">Cancel waiting job</button>'))
+    if job.get("state") == "cancelled" and job.get("reservation_cleanup") in {"pending", "unknown"}:
+        actions.append(
+            _form(
+                f"/jobs/{job_id}/cancel",
+                '<button type="submit">Retry artifact quota cleanup</button>',
+            )
+        )
     if job.get("state") in _TERMINAL_STATES and job.get("phase") != "probe":
         actions.append(_form(f"/jobs/{job_id}/retry", '<button type="submit">Rerun job</button>'))
+        actions.append(
+            _form(
+                f"/jobs/{job_id}/retry/new-intent",
+                '<button type="submit">Prepare another rerun</button>',
+            )
+        )
+    cleanup_text = (
+        f"Artifact quota cleanup: {_e(job.get('reservation_cleanup'))}."
+        if job.get("reservation_cleanup")
+        else "Artifact quota cleanup status is unavailable."
+    )
     return (
         '<section><h2>Job state</h2>'
         f"<p>Job ID: <code>{job_id}</code></p><p>Phase: {_e(job.get('phase'))}</p>"
         f"<p>Status: {_e(_status_label(job)[0])}</p><p>Cause code: {_e(job.get('reason_code') or '—')}</p>"
-        f"<p>Cause details: <code>{reason_detail}</code></p><p>{checkpoint_text}</p>"
+        f"<p>Cause details: <code>{reason_detail}</code></p><p>{checkpoint_text}</p><p>{cleanup_text}</p>"
         f"<p>{kubeflow_link}</p><p>{' '.join(actions)}</p></section>{report_html}"
     )
 
@@ -615,12 +764,32 @@ def _redirect(location: str) -> RedirectResponse:
     return RedirectResponse(location, status_code=status.HTTP_303_SEE_OTHER, headers={"Cache-Control": "no-store"})
 
 
-def _set_retry_intent_cookie(response, auth: OperatorAuth, token: str) -> None:
+def _retry_intent_cookie_name(parent_job_id: str) -> str:
+    digest = sha256(parent_job_id.encode("utf-8")).hexdigest()
+    return f"{_RETRY_INTENT_COOKIE}_{digest}"
+
+
+def _set_retry_intents_for_jobs(response, request: Request, auth: OperatorAuth, jobs: list[dict[str, Any]]) -> None:
+    for job in jobs:
+        parent_job_id = job.get("job_id")
+        if job.get("state") not in _TERMINAL_STATES or job.get("phase") == "probe" or not parent_job_id:
+            continue
+        cookie_name = _retry_intent_cookie_name(str(parent_job_id))
+        if request.cookies.get(cookie_name) is None:
+            _set_retry_intent_cookie(response, auth, str(parent_job_id), secrets.token_urlsafe(32))
+
+
+def _set_retry_intent_cookie(
+    response,
+    auth: OperatorAuth,
+    parent_job_id: str,
+    token: str,
+) -> None:
     response.set_cookie(
-        _RETRY_INTENT_COOKIE,
+        _retry_intent_cookie_name(parent_job_id),
         token,
         max_age=auth.settings.session_seconds,
-        path="/jobs",
+        path="/",
         secure=auth.settings.secure_cookie,
         httponly=True,
         samesite="strict",

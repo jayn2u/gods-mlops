@@ -41,10 +41,18 @@ class _ListingConnection:
         self.publications = list(publications)
         self.bbox_revisions = list(bbox_revisions)
         self.captions = list(captions)
+        self.fetch_queries = []
 
     async def fetch(self, query, *args):
+        self.fetch_queries.append(query)
         if "FROM annotation_crops AS crop" in query:
-            return self.captions
+            if "sample.state IN ('received', 'purge_pending', 'expired')" in query:
+                return [
+                    row
+                    for row in self.captions
+                    if row.get("parent_sample_state") in {"received", "purge_pending", "expired"}
+                ]
+            return [row for row in self.captions if row.get("parent_sample_state", "received") == "received"]
         if "FROM ingestion_samples" in query:
             return self.samples
         if "FROM review_assignments" in query:
@@ -214,36 +222,36 @@ def test_dataset_candidate_list_distinguishes_reviewed_samples_and_crops() -> No
         crop_id = uuid4()
         bbox_revision = uuid4()
         caption_revision = uuid4()
+        connection = _ListingConnection(
+            samples=[
+                {
+                    "sample_id": sample_id,
+                    "camera_id": uuid4(),
+                    "captured_at_utc": datetime(2026, 10, 7, tzinfo=UTC),
+                    "reason": "operator",
+                    "state": "received",
+                    "selected": False,
+                    "object_size_bytes": 128,
+                    "latest_bbox_revision": bbox_revision,
+                    "current_bbox_assignment_revision": None,
+                }
+            ],
+            captions=[
+                {
+                    "crop_id": crop_id,
+                    "sample_id": sample_id,
+                    "bbox_revision": bbox_revision,
+                    "caption_revision_id": caption_revision,
+                    "state": "ready",
+                    "caption_state": "reviewed",
+                    "sha256": "a" * 64,
+                    "parent_sample_state": "expired",
+                }
+            ],
+        )
         dataset_publisher = DatasetPublisher(database_url="postgresql://unused", objects=object())
         dataset_publisher._schema_ready = True
-        dataset_publisher._pool = _Pool(
-            _ListingConnection(
-                samples=[
-                    {
-                        "sample_id": sample_id,
-                        "camera_id": uuid4(),
-                        "captured_at_utc": datetime(2026, 10, 7, tzinfo=UTC),
-                        "reason": "operator",
-                        "state": "received",
-                        "selected": False,
-                        "object_size_bytes": 128,
-                        "latest_bbox_revision": bbox_revision,
-                        "current_bbox_assignment_revision": None,
-                    }
-                ],
-                captions=[
-                    {
-                        "crop_id": crop_id,
-                        "sample_id": sample_id,
-                        "bbox_revision": bbox_revision,
-                        "caption_revision_id": caption_revision,
-                        "state": "ready",
-                        "caption_state": "reviewed",
-                        "sha256": "a" * 64,
-                    }
-                ],
-            )
-        )
+        dataset_publisher._pool = _Pool(connection)
 
         candidates = await dataset_publisher.list_publication_candidates(limit=10)
 
@@ -260,6 +268,10 @@ def test_dataset_candidate_list_distinguishes_reviewed_samples_and_crops() -> No
                 "sha256": "a" * 64,
             }
         ]
+        assert any(
+            "sample.state IN ('received', 'purge_pending', 'expired')" in query
+            for query in connection.fetch_queries
+        )
 
     asyncio.run(exercise())
 

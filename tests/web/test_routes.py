@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import http.cookiejar
 import json
 import socket
@@ -10,6 +11,7 @@ from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 from uuid import uuid4
 
+import pytest
 import uvicorn
 
 from gods_mlops.evaluation.report import load_operator_evaluation_report
@@ -106,7 +108,11 @@ class _Browser:
 
 
 class _Ingestion:
+    def __init__(self):
+        self.state_filters = []
+
     async def list_samples(self, *, limit=100, state=None):
+        self.state_filters.append(state)
         return [
             {
                 "sample_id": "10000000-0000-4000-8000-000000000001",
@@ -129,9 +135,7 @@ class _Annotations:
         self.start_calls = []
         self.finalize_calls = []
         self.label_studio_configured = True
-
-    async def list_reviews(self, *, limit=100):
-        return [
+        self.reviews = [
             {
                 "sample_id": "10000000-0000-4000-8000-000000000001",
                 "revision": "30000000-0000-4000-8000-000000000003",
@@ -146,6 +150,9 @@ class _Annotations:
                 "human_review_recorded": False,
             }
         ]
+
+    async def list_reviews(self, *, limit=100):
+        return self.reviews[:limit]
 
     async def start_bbox_review(self, sample_id, *, project_id, workflow):
         self.start_calls.append((sample_id, project_id, workflow))
@@ -269,6 +276,7 @@ class _Queue:
         self.reorder_calls = []
         self.submit_calls = []
         self.cancel_pending = False
+        self.cancel_cleanup_status = None
         self.parent_job_id = parent_job_id
         self.jobs = [
             {"job_id": parent_job_id, "phase": "training", "state": "failed", "reason_code": "probe_execution_failed",
@@ -303,10 +311,11 @@ class _Queue:
 
     async def cancel_queued(self, job_id, *, operator_id):
         self.cancel_calls.append((job_id, operator_id))
+        cleanup = self.cancel_cleanup_status or ("pending" if self.cancel_pending else "settled")
         return {
             "job": {"job_id": job_id, "state": "cancelled"},
-            "reservation_cleanup": "pending" if self.cancel_pending else "settled",
-            "cleanup_pending": self.cancel_pending,
+            "reservation_cleanup": cleanup,
+            "cleanup_pending": cleanup in {"pending", "unknown"},
         }
 
     async def reorder_queued(self, job_id, *, before_job_id, operator_id):
@@ -341,6 +350,19 @@ def _client(services, integrations=None):
     )
     app = create_app(services, auth_settings=settings, integrations=integrations)
     return app, _Browser(app)
+
+
+def _retry_cookie(browser, parent_job_id):
+    return next(
+        (
+            item.value
+            for item in browser.cookies
+            if item.name.startswith(RETRY_COOKIE)
+            and item.path == "/"
+            and item.name == f"{RETRY_COOKIE}_{hashlib.sha256(parent_job_id.encode()).hexdigest()}"
+        ),
+        None,
+    )
 
 
 def test_unauthenticated_mutations_are_rejected_before_service_calls() -> None:
@@ -407,9 +429,9 @@ def test_duplicate_retry_clicks_share_one_httponly_intent_and_one_job() -> None:
         browser.login()
         page = browser.request("/jobs")
         page_html = page.read().decode("utf-8")
-        intent = browser.cookie(RETRY_COOKIE)
         csrf = browser.cookie(CSRF_COOKIE)
         parent = services.queue.parent_job_id
+        intent = _retry_cookie(browser, parent)
         assert intent and csrf
         assert intent not in page_html
         retry_cookie_headers = [value for key, value in page.headers.items() if key.lower() == "set-cookie"]
@@ -433,6 +455,220 @@ def test_duplicate_retry_clicks_share_one_httponly_intent_and_one_job() -> None:
         assert services.queue.retry_calls[0][2] == services.queue.retry_calls[1][2] == intent
         assert len(services.queue.queued_jobs) == 1
         assert intent not in first.headers["Location"]
+    finally:
+        browser.close()
+
+
+def test_retry_intent_survives_child_navigation_and_can_be_rotated_deliberately() -> None:
+    services = _services()
+    app, browser = _client(services)
+    parent = services.queue.parent_job_id
+    try:
+        browser.login()
+        browser.request("/jobs").read()
+        first_intent = _retry_cookie(browser, parent)
+        csrf = browser.cookie(CSRF_COOKIE)
+
+        first = browser.request(f"/jobs/{parent}/retry", method="POST", headers={"X-CSRF-Token": csrf})
+        first_child = first.headers["Location"]
+        browser.request(first_child).read()
+
+        assert first_intent
+        assert _retry_cookie(browser, parent) == first_intent
+        duplicate = browser.request(f"/jobs/{parent}/retry", method="POST", headers={"X-CSRF-Token": csrf})
+        assert duplicate.headers["Location"] == first_child
+        assert len(services.queue.queued_jobs) == 1
+
+        prepared = browser.request(
+            f"/jobs/{parent}/retry/new-intent",
+            method="POST",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert prepared.status_code == 303
+        assert prepared.headers["Location"] == f"/jobs/{parent}"
+        assert _retry_cookie(browser, parent) != first_intent
+
+        deliberate = browser.request(f"/jobs/{parent}/retry", method="POST", headers={"X-CSRF-Token": csrf})
+        assert deliberate.status_code == 303
+        assert deliberate.headers["Location"] != first_child
+        assert len(services.queue.queued_jobs) == 2
+    finally:
+        browser.close()
+
+
+def test_actions_page_issues_retry_intent_before_rendering_rerun_controls() -> None:
+    services = _services()
+    app, browser = _client(services)
+    parent = services.queue.parent_job_id
+    try:
+        browser.login()
+        body = browser.request("/actions").read().decode("utf-8")
+
+        assert "Rerun" in body
+        intent = _retry_cookie(browser, parent)
+        assert intent
+        browser.request("/actions").read()
+        assert _retry_cookie(browser, parent) == intent
+        response = browser.request(
+            f"/jobs/{parent}/retry",
+            method="POST",
+            headers={"X-CSRF-Token": browser.cookie(CSRF_COOKIE)},
+        )
+        assert response.status_code == 303
+    finally:
+        browser.close()
+
+
+def test_empty_samples_filter_means_all_samples() -> None:
+    services = _services()
+    app, browser = _client(services)
+    try:
+        browser.login()
+        response = browser.request("/samples?state=")
+
+        assert response.status_code == 200
+        assert services.ingestion.state_filters == [None]
+    finally:
+        browser.close()
+
+
+def test_missing_review_integrations_return_conflict_after_auth_and_csrf() -> None:
+    services = _services()
+    services.review_workflow = None
+    services.annotations.label_studio_configured = False
+    app, browser = _client(services)
+    sample_id = "10000000-0000-4000-8000-000000000001"
+    revision = "30000000-0000-4000-8000-000000000003"
+    try:
+        browser.login()
+        headers = {"X-CSRF-Token": browser.cookie(CSRF_COOKIE)}
+        start = browser.request(
+            "/reviews/start",
+            method="POST",
+            data={"sample_id": sample_id},
+            headers=headers,
+        )
+        finalize = browser.request(
+            f"/reviews/{sample_id}/{revision}/finalize",
+            method="POST",
+            headers=headers,
+        )
+
+        assert start.status_code == 409
+        assert finalize.status_code == 409
+    finally:
+        browser.close()
+
+
+def test_provisioning_review_can_retry_the_exact_existing_assignment() -> None:
+    services = _services()
+    sample_id = "10000000-0000-4000-8000-000000000001"
+    revision = "30000000-0000-4000-8000-000000000003"
+    services.annotations.reviews[0].update(
+        state="provisioning",
+        label_studio_task_id=None,
+        project_id=7,
+    )
+
+    class _RecoverableWorkflow:
+        def __init__(self):
+            self.provision_calls = []
+
+        async def provision_task(self, *, revision, project_id):
+            self.provision_calls.append((revision, project_id))
+            if len(self.provision_calls) == 1:
+                raise RuntimeError("temporary Label Studio provisioning failure")
+            return {"revision": revision, "project_id": project_id, "state": "active"}
+
+    workflow = _RecoverableWorkflow()
+    services.review_workflow = workflow
+    app, browser = _client(
+        services,
+        integrations=OperatorUIIntegrations(label_studio_bbox_project_id=7),
+    )
+    try:
+        browser.login()
+        reviews = browser.request("/reviews").read().decode("utf-8")
+        assert "Retry Label Studio provisioning" in reviews
+
+        headers = {"X-CSRF-Token": browser.cookie(CSRF_COOKIE)}
+        first = browser.request(
+            f"/reviews/{sample_id}/{revision}/provision",
+            method="POST",
+            headers=headers,
+        )
+        second = browser.request(
+            f"/reviews/{sample_id}/{revision}/provision",
+            method="POST",
+            headers=headers,
+        )
+
+        assert first.status_code == 409
+        assert second.status_code == 303
+        assert second.headers["Location"] == "/reviews"
+        assert workflow.provision_calls == [(revision, 7), (revision, 7)]
+        assert services.annotations.start_calls == []
+    finally:
+        browser.close()
+
+
+@pytest.mark.parametrize(
+    ("cleanup_state", "expected_notice"),
+    [
+        ("pending", "Artifact quota cleanup is pending"),
+        ("unknown", "cleanup status could not be verified"),
+    ],
+)
+def test_cancelled_cleanup_state_survives_reload_and_offers_idempotent_retry(cleanup_state, expected_notice) -> None:
+    services = _services()
+    parent = services.queue.parent_job_id
+    services.queue.jobs[0].update(
+        state="cancelled",
+        reason_code=None,
+        reservation_cleanup=cleanup_state,
+    )
+    services.queue.cancel_pending = cleanup_state == "pending"
+    services.queue.cancel_cleanup_status = cleanup_state
+    app, browser = _client(services)
+    try:
+        browser.login()
+        for path in ("/jobs", "/actions", f"/jobs/{parent}"):
+            body = browser.request(path).read().decode("utf-8")
+            assert cleanup_state in body
+            assert "Retry artifact quota cleanup" in body
+
+        headers = {"X-CSRF-Token": browser.cookie(CSRF_COOKIE)}
+        pending = browser.request(f"/jobs/{parent}/cancel", method="POST", headers=headers)
+        assert pending.status_code == 202
+        assert expected_notice in pending.read().decode("utf-8")
+
+        services.queue.cancel_cleanup_status = "settled"
+        settled = browser.request(f"/jobs/{parent}/cancel", method="POST", headers=headers)
+        assert settled.status_code == 303
+        assert services.queue.cancel_calls == [(parent, "operator"), (parent, "operator")]
+    finally:
+        browser.close()
+
+
+def test_kubeflow_navigation_uses_stored_run_identity_and_never_guesses_job_uuid() -> None:
+    services = _services()
+    job_id = services.queue.parent_job_id
+    kfp_run_id = str(uuid4())
+    app, browser = _client(
+        services,
+        integrations=OperatorUIIntegrations(kubeflow_url="http://127.0.0.1:18080"),
+    )
+    try:
+        browser.login()
+        missing = browser.request(f"/jobs/{job_id}").read().decode("utf-8")
+        assert "Run details are not available for this job" in missing
+        assert f"/runs/details/{job_id}" not in missing
+        assert "Open Kubeflow Pipelines" in missing
+
+        services.queue.jobs[0]["kubeflow_run_id"] = kfp_run_id
+        mapped = browser.request(f"/jobs/{job_id}").read().decode("utf-8")
+        assert f"/runs/details/{kfp_run_id}" in mapped
+        assert f"/runs/details/{job_id}" not in mapped
     finally:
         browser.close()
 
@@ -540,7 +776,7 @@ def test_all_five_operator_pages_render_and_keep_optional_integrations_explicit(
         assert "Label Studio review setup is not configured" in browser.request("/samples").read().decode("utf-8")
         assert "Label Studio integration is not configured" in browser.request("/reviews").read().decode("utf-8")
         detail = browser.request(f"/jobs/{services.queue.parent_job_id}").read().decode("utf-8")
-        assert "Kubeflow run, log, and artifact links are not configured" in detail
+        assert "Kubeflow Pipelines navigation is not configured" in detail
     finally:
         browser.close()
 
@@ -558,7 +794,9 @@ def test_configured_external_links_contain_no_embedded_credentials() -> None:
         review_body = browser.request("/reviews").read().decode("utf-8")
         job_body = browser.request(f"/jobs/{services.queue.parent_job_id}").read().decode("utf-8")
         assert "http://label-studio.local/projects/7/data" in review_body
-        assert "http://127.0.0.1:18080/pipeline/#/runs/details/" in job_body
+        assert "Open Kubeflow Pipelines" in job_body
+        assert "Run details are not available for this job" in job_body
+        assert f"/runs/details/{services.queue.parent_job_id}" not in job_body
         for body in (review_body, job_body):
             assert PASSWORD not in body
             assert SECRET not in body
