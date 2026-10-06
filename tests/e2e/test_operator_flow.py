@@ -6,7 +6,9 @@ GPU job, or Label Studio project. Root must prepare and acknowledge the fixture 
 
 from __future__ import annotations
 
+import ast
 import ipaddress
+import inspect
 import json
 import os
 from pathlib import Path
@@ -56,6 +58,29 @@ def _loopback_url(value: str, expected_port: int) -> str:
 def _delay_request(route) -> None:
     time.sleep(0.75)
     route.continue_()
+
+
+def test_browser_wait_calls_match_playwright_keyword_only_api() -> None:
+    try:
+        from playwright.sync_api import Page
+    except ImportError:
+        pytest.skip("install the optional e2e dependency group to check Playwright's Python signature")
+
+    signature = inspect.signature(Page.wait_for_function)
+    assert signature.parameters["arg"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["timeout"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "wait_for_function"
+    ]
+    assert len(calls) == 2
+    assert all(len(call.args) == 1 for call in calls)
+    assert all({keyword.arg for keyword in call.keywords} >= {"arg", "timeout"} for call in calls)
 
 
 def test_operator_flow_in_root_acknowledged_browser_fixture() -> None:
@@ -186,7 +211,7 @@ def test_operator_flow_in_root_acknowledged_browser_fixture() -> None:
             """before => Array.from(document.querySelectorAll('section:first-of-type tbody code'))
                 .map(element => element.textContent.trim())
                 .some(version => version && !before.includes(version))""",
-            list(versions_before),
+            arg=list(versions_before),
             timeout=60_000,
         )
         page.unroute("**/datasets/publish", _delay_request)
@@ -223,7 +248,7 @@ def test_operator_flow_in_root_acknowledged_browser_fixture() -> None:
                     ?.querySelector('code')?.textContent.trim();
                 return match && match[1] !== parentId && visible === match[1];
             }""",
-            retry_parent_id,
+            arg=retry_parent_id,
             timeout=60_000,
         )
         page.unroute(f"**/jobs/{retry_parent_id}/retry", _delay_request)

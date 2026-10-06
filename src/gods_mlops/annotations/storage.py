@@ -41,6 +41,7 @@ _MIGRATIONS = (
     (12, "0012_dataset_authority_and_invalidations.sql"),
     (13, "0013_gpu_job_queue.sql"),
     (14, "0014_operator_queue_order.sql"),
+    (15, "0015_operator_retry_intent_generations.sql"),
 )
 _MIGRATION_RESOURCES = files("gods_mlops.migrations")
 

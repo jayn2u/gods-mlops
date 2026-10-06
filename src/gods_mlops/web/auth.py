@@ -151,6 +151,21 @@ class OperatorAuth:
         except (ValueError, TypeError, json.JSONDecodeError):
             return None
 
+    def session_identity(self, token: str) -> tuple[str, int] | None:
+        """Return the verified nonce and expiry from an existing operator session."""
+        expiry = self._session_expiry(token)
+        if expiry is None:
+            return None
+        try:
+            payload_part, _signature_part = token.split(".", maxsplit=1)
+            decoded: Any = json.loads(_unbase64url(payload_part))
+        except (ValueError, TypeError, json.JSONDecodeError):
+            return None
+        nonce = decoded.get("nonce") if isinstance(decoded, dict) else None
+        if not isinstance(nonce, str) or not nonce:
+            return None
+        return nonce, expiry
+
     def _set_session_cookie(self, response: Response, token: str) -> None:
         response.set_cookie(
             AUTH_COOKIE,

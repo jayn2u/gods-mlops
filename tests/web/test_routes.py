@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import http.cookiejar
 import json
 import socket
@@ -16,9 +16,10 @@ import uvicorn
 
 from gods_mlops.evaluation.report import load_operator_evaluation_report
 from gods_mlops.jobs.queue import _operator_retry_dedupe_key
-from gods_mlops.web.auth import AUTH_COOKIE, CSRF_COOKIE
+from gods_mlops.web.auth import AUTH_COOKIE, CSRF_COOKIE, OperatorAuth
 from gods_mlops.web.app import OperatorServices, OperatorUIIntegrations, create_app
 from gods_mlops.web.auth import OperatorAuthSettings
+from gods_mlops.web.routes import _retry_intent_scope, _retry_intent_token
 
 
 PASSWORD = "test-only-operator-password-42"
@@ -275,6 +276,8 @@ class _Queue:
         self.cancel_calls = []
         self.reorder_calls = []
         self.submit_calls = []
+        self.retry_intent_generations = {}
+        self.retry_intent_generation_calls = []
         self.cancel_pending = False
         self.cancel_cleanup_status = None
         self.parent_job_id = parent_job_id
@@ -308,6 +311,16 @@ class _Queue:
         if key not in self.queued_jobs:
             self.queued_jobs[key] = str(uuid4())
         return self.queued_jobs[key]
+
+    async def retry_intent_generation(self, scope_hash, *, session_expires_at):
+        self.retry_intent_generation_calls.append(("read", scope_hash, session_expires_at))
+        return self.retry_intent_generations.get(scope_hash, 0)
+
+    async def advance_retry_intent_generation(self, scope_hash, *, session_expires_at):
+        self.retry_intent_generation_calls.append(("advance", scope_hash, session_expires_at))
+        generation = self.retry_intent_generations.get(scope_hash, 0) + 1
+        self.retry_intent_generations[scope_hash] = generation
+        return generation
 
     async def cancel_queued(self, job_id, *, operator_id):
         self.cancel_calls.append((job_id, operator_id))
@@ -352,17 +365,70 @@ def _client(services, integrations=None):
     return app, _Browser(app)
 
 
-def _retry_cookie(browser, parent_job_id):
-    return next(
-        (
-            item.value
-            for item in browser.cookies
-            if item.name.startswith(RETRY_COOKIE)
-            and item.path == "/"
-            and item.name == f"{RETRY_COOKIE}_{hashlib.sha256(parent_job_id.encode()).hexdigest()}"
-        ),
-        None,
+def test_retry_intent_hmac_is_canonical_and_scoped_to_verified_session_operator_and_parent() -> None:
+    auth = OperatorAuth(
+        OperatorAuthSettings(
+            username="operator",
+            password=PASSWORD,
+            session_secret=SECRET,
+            secure_cookie=False,
+        )
     )
+    session_nonce, _expires_at = auth.session_identity(auth._issue_session())
+    parent = str(uuid4())
+    canonical, scope = _retry_intent_scope(
+        auth,
+        session_nonce=session_nonce,
+        operator_id="operator",
+        parent_job_id=parent.upper(),
+    )
+    default_token = _retry_intent_token(
+        auth,
+        session_nonce=session_nonce,
+        operator_id="operator",
+        parent_job_id=canonical,
+        generation=0,
+    )
+
+    assert canonical == parent
+    assert scope == _retry_intent_scope(
+        auth,
+        session_nonce=session_nonce,
+        operator_id="operator",
+        parent_job_id=parent,
+    )[1]
+    assert default_token == _retry_intent_token(
+        auth,
+        session_nonce=session_nonce,
+        operator_id="operator",
+        parent_job_id=parent,
+        generation=0,
+    )
+    assert default_token != _retry_intent_token(
+        auth,
+        session_nonce=session_nonce,
+        operator_id="operator",
+        parent_job_id=parent,
+        generation=1,
+    )
+    assert scope != _retry_intent_scope(
+        auth,
+        session_nonce="a-different-session-nonce",
+        operator_id="operator",
+        parent_job_id=parent,
+    )[1]
+    assert scope != _retry_intent_scope(
+        auth,
+        session_nonce=session_nonce,
+        operator_id="different-operator",
+        parent_job_id=parent,
+    )[1]
+    assert scope != _retry_intent_scope(
+        auth,
+        session_nonce=session_nonce,
+        operator_id="operator",
+        parent_job_id=str(uuid4()),
+    )[1]
 
 
 def test_unauthenticated_mutations_are_rejected_before_service_calls() -> None:
@@ -422,7 +488,7 @@ def test_authenticated_mutation_requires_csrf_before_publication_side_effects() 
         browser.close()
 
 
-def test_duplicate_retry_clicks_share_one_httponly_intent_and_one_job() -> None:
+def test_duplicate_retry_posts_share_session_derived_intent_without_retry_cookies() -> None:
     services = _services()
     app, browser = _client(services)
     try:
@@ -431,11 +497,10 @@ def test_duplicate_retry_clicks_share_one_httponly_intent_and_one_job() -> None:
         page_html = page.read().decode("utf-8")
         csrf = browser.cookie(CSRF_COOKIE)
         parent = services.queue.parent_job_id
-        intent = _retry_cookie(browser, parent)
-        assert intent and csrf
-        assert intent not in page_html
+        assert csrf
+        assert "Rerun" in page_html
         retry_cookie_headers = [value for key, value in page.headers.items() if key.lower() == "set-cookie"]
-        assert not retry_cookie_headers or "HttpOnly" in " ".join(retry_cookie_headers)
+        assert not any(RETRY_COOKIE in value for value in retry_cookie_headers)
 
         first = browser.request(
             f"/jobs/{parent}/retry",
@@ -452,9 +517,9 @@ def test_duplicate_retry_clicks_share_one_httponly_intent_and_one_job() -> None:
         assert second.status_code == 303
         assert first.headers["Location"] == second.headers["Location"]
         assert len(services.queue.retry_calls) == 2
-        assert services.queue.retry_calls[0][2] == services.queue.retry_calls[1][2] == intent
+        assert services.queue.retry_calls[0][2] == services.queue.retry_calls[1][2]
         assert len(services.queue.queued_jobs) == 1
-        assert intent not in first.headers["Location"]
+        assert {cookie.name for cookie in browser.cookies} == {AUTH_COOKIE, CSRF_COOKIE}
     finally:
         browser.close()
 
@@ -466,18 +531,17 @@ def test_retry_intent_survives_child_navigation_and_can_be_rotated_deliberately(
     try:
         browser.login()
         browser.request("/jobs").read()
-        first_intent = _retry_cookie(browser, parent)
         csrf = browser.cookie(CSRF_COOKIE)
 
         first = browser.request(f"/jobs/{parent}/retry", method="POST", headers={"X-CSRF-Token": csrf})
         first_child = first.headers["Location"]
         browser.request(first_child).read()
 
-        assert first_intent
-        assert _retry_cookie(browser, parent) == first_intent
         duplicate = browser.request(f"/jobs/{parent}/retry", method="POST", headers={"X-CSRF-Token": csrf})
         assert duplicate.headers["Location"] == first_child
         assert len(services.queue.queued_jobs) == 1
+        first_intent = services.queue.retry_calls[0][2]
+        assert services.queue.retry_calls[1][2] == first_intent
 
         prepared = browser.request(
             f"/jobs/{parent}/retry/new-intent",
@@ -486,35 +550,173 @@ def test_retry_intent_survives_child_navigation_and_can_be_rotated_deliberately(
         )
         assert prepared.status_code == 303
         assert prepared.headers["Location"] == f"/jobs/{parent}"
-        assert _retry_cookie(browser, parent) != first_intent
 
         deliberate = browser.request(f"/jobs/{parent}/retry", method="POST", headers={"X-CSRF-Token": csrf})
         assert deliberate.status_code == 303
         assert deliberate.headers["Location"] != first_child
         assert len(services.queue.queued_jobs) == 2
+        assert services.queue.retry_calls[2][2] != first_intent
+        assert services.queue.retry_intent_generation_calls[-1][0] == "read"
     finally:
         browser.close()
 
 
-def test_actions_page_issues_retry_intent_before_rendering_rerun_controls() -> None:
+def test_explicit_retry_generation_survives_new_auth_app_instance() -> None:
+    services = _services()
+    parent = services.queue.parent_job_id
+    app, browser = _client(services)
+    restarted_browser = None
+    try:
+        browser.login()
+        csrf = browser.cookie(CSRF_COOKIE)
+        session = browser.cookie(AUTH_COOKIE)
+        first = browser.request(f"/jobs/{parent}/retry", method="POST", headers={"X-CSRF-Token": csrf})
+        first_child = first.headers["Location"]
+        first_intent = services.queue.retry_calls[-1][2]
+
+        prepared = browser.request(
+            f"/jobs/{parent}/retry/new-intent",
+            method="POST",
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert prepared.status_code == 303
+        deliberate = browser.request(f"/jobs/{parent}/retry", method="POST", headers={"X-CSRF-Token": csrf})
+        second_child = deliberate.headers["Location"]
+        second_intent = services.queue.retry_calls[-1][2]
+        assert second_child != first_child
+        assert second_intent != first_intent
+
+        restarted_services = _services()
+        restarted_services.queue.parent_job_id = parent
+        restarted_services.queue.jobs = services.queue.jobs
+        restarted_services.queue.retry_intent_generations = services.queue.retry_intent_generations
+        restarted_services.queue.queued_jobs = services.queue.queued_jobs
+        _restarted_app, restarted_browser = _client(restarted_services)
+        headers = {
+            "Cookie": f"{AUTH_COOKIE}={session}; {CSRF_COOKIE}={csrf}",
+            "X-CSRF-Token": csrf,
+        }
+        request = urllib_request.Request(
+            f"http://127.0.0.1:{restarted_browser.port}/jobs/{parent}/retry",
+            data=b"",
+            headers=headers,
+            method="POST",
+        )
+        try:
+            response = urllib_request.build_opener(_NoRedirect()).open(request, timeout=10)
+        except urllib_error.HTTPError as error:
+            response = error
+
+        assert response.status == 303
+        assert response.headers["Location"] == second_child
+        assert restarted_services.queue.retry_calls[0][2] == second_intent
+    finally:
+        if restarted_browser is not None:
+            restarted_browser.close()
+        browser.close()
+
+
+def test_actions_page_renders_rerun_without_issuing_per_job_cookies() -> None:
     services = _services()
     app, browser = _client(services)
     parent = services.queue.parent_job_id
     try:
         browser.login()
-        body = browser.request("/actions").read().decode("utf-8")
+        actions = browser.request("/actions")
+        body = actions.read().decode("utf-8")
 
         assert "Rerun" in body
-        intent = _retry_cookie(browser, parent)
-        assert intent
+        assert not any(
+            RETRY_COOKIE in value
+            for key, value in actions.headers.items()
+            if key.lower() == "set-cookie"
+        )
         browser.request("/actions").read()
-        assert _retry_cookie(browser, parent) == intent
+        assert {cookie.name for cookie in browser.cookies} == {AUTH_COOKIE, CSRF_COOKIE}
         response = browser.request(
             f"/jobs/{parent}/retry",
             method="POST",
             headers={"X-CSRF-Token": browser.cookie(CSRF_COOKIE)},
         )
         assert response.status_code == 303
+    finally:
+        browser.close()
+
+
+def test_many_jobs_and_concurrent_first_gets_do_not_grow_retry_cookies_or_split_intent() -> None:
+    services = _services()
+    parent = services.queue.parent_job_id
+    services.queue.jobs = [
+        {
+            "job_id": parent if index == 0 else str(uuid4()),
+            "phase": "training",
+            "state": "failed",
+            "reason_code": "probe_execution_failed",
+            "reason_detail": {},
+            "checkpoint_sha256": None,
+        }
+        for index in range(300)
+    ]
+    app, browser = _client(services)
+
+    def raw_request(path, *, method="GET"):
+        csrf = browser.cookie(CSRF_COOKIE)
+        headers = {
+            "Cookie": f"{AUTH_COOKIE}={browser.cookie(AUTH_COOKIE)}; {CSRF_COOKIE}={csrf}",
+        }
+        payload = None
+        if method == "POST":
+            headers["X-CSRF-Token"] = csrf
+            payload = b""
+        request = urllib_request.Request(
+            f"http://127.0.0.1:{browser.port}{path}",
+            data=payload,
+            headers=headers,
+            method=method,
+        )
+        try:
+            response = urllib_request.build_opener(_NoRedirect()).open(request, timeout=10)
+        except urllib_error.HTTPError as error:
+            response = error
+        return response.status, response.headers.get("Location"), response.headers.get_all("Set-Cookie", [])
+
+    try:
+        browser.login()
+        assert len(list(browser.cookies)) == 2
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            page_results = list(executor.map(lambda path: raw_request(path), ["/jobs", "/actions"] * 2))
+
+        assert all(status == 200 for status, _, _ in page_results)
+        assert all(not any(RETRY_COOKIE in value for value in headers) for _, _, headers in page_results)
+        assert {cookie.name for cookie in browser.cookies} == {AUTH_COOKIE, CSRF_COOKIE}
+
+        historical_jobs = services.queue.jobs
+        for start in range(0, len(historical_jobs), 100):
+            services.queue.jobs = historical_jobs[start : start + 100]
+            page = browser.request("/jobs")
+            page.read()
+            assert not any(
+                RETRY_COOKIE in value
+                for key, value in page.headers.items()
+                if key.lower() == "set-cookie"
+            )
+            assert {cookie.name for cookie in browser.cookies} == {AUTH_COOKIE, CSRF_COOKIE}
+        services.queue.jobs = historical_jobs[:100]
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            retry_results = list(
+                executor.map(
+                    lambda _: raw_request(f"/jobs/{parent}/retry", method="POST"),
+                    range(4),
+                )
+            )
+
+        assert all(status == 303 for status, _, _ in retry_results)
+        assert len({location for _, location, _ in retry_results}) == 1
+        assert len({call[2] for call in services.queue.retry_calls}) == 1
+        assert len(services.queue.queued_jobs) == 1
+        assert len(list(browser.cookies)) == 2
     finally:
         browser.close()
 
@@ -567,7 +769,7 @@ def test_provisioning_review_can_retry_the_exact_existing_assignment() -> None:
     services.annotations.reviews[0].update(
         state="provisioning",
         label_studio_task_id=None,
-        project_id=7,
+        project_id=None,
     )
 
     class _RecoverableWorkflow:
@@ -608,6 +810,96 @@ def test_provisioning_review_can_retry_the_exact_existing_assignment() -> None:
         assert second.headers["Location"] == "/reviews"
         assert workflow.provision_calls == [(revision, 7), (revision, 7)]
         assert services.annotations.start_calls == []
+    finally:
+        browser.close()
+
+
+def test_provisioning_caption_recovery_prefers_its_recorded_project() -> None:
+    services = _services()
+    sample_id = "10000000-0000-4000-8000-000000000001"
+    revision = "30000000-0000-4000-8000-000000000003"
+    services.annotations.reviews[0].update(
+        stage="caption",
+        state="provisioning",
+        label_studio_task_id=None,
+        project_id=9,
+    )
+
+    class _Workflow:
+        def __init__(self):
+            self.provision_calls = []
+
+        async def provision_task(self, *, revision, project_id):
+            self.provision_calls.append((revision, project_id))
+            return {"revision": revision, "project_id": project_id, "state": "active"}
+
+    workflow = _Workflow()
+    services.review_workflow = workflow
+    app, browser = _client(
+        services,
+        integrations=OperatorUIIntegrations(
+            label_studio_url="http://label-studio.local",
+            label_studio_bbox_project_id=7,
+        ),
+    )
+    try:
+        browser.login()
+        body = browser.request("/reviews").read().decode("utf-8")
+        assert "http://label-studio.local/projects/9/data" in body
+        assert "Retry Label Studio provisioning" in body
+
+        response = browser.request(
+            f"/reviews/{sample_id}/{revision}/provision",
+            method="POST",
+            headers={"X-CSRF-Token": browser.cookie(CSRF_COOKIE)},
+        )
+
+        assert response.status_code == 303
+        assert workflow.provision_calls == [(revision, 9)]
+    finally:
+        browser.close()
+
+
+@pytest.mark.parametrize("stage", ["caption", "relevance"])
+def test_provisioning_without_stage_project_does_not_fall_back_to_bbox(stage) -> None:
+    services = _services()
+    sample_id = "10000000-0000-4000-8000-000000000001"
+    revision = "30000000-0000-4000-8000-000000000003"
+    services.annotations.reviews[0].update(
+        stage=stage,
+        state="provisioning",
+        label_studio_task_id=None,
+        project_id=None,
+    )
+
+    class _Workflow:
+        def __init__(self):
+            self.provision_calls = []
+
+        async def provision_task(self, *, revision, project_id):
+            self.provision_calls.append((revision, project_id))
+            return {"revision": revision, "project_id": project_id, "state": "active"}
+
+    workflow = _Workflow()
+    services.review_workflow = workflow
+    app, browser = _client(
+        services,
+        integrations=OperatorUIIntegrations(label_studio_bbox_project_id=7),
+    )
+    try:
+        browser.login()
+        body = browser.request("/reviews").read().decode("utf-8")
+        assert "Retry Label Studio provisioning" not in body
+        assert "stage-matched Label Studio project is not configured" in body
+
+        response = browser.request(
+            f"/reviews/{sample_id}/{revision}/provision",
+            method="POST",
+            headers={"X-CSRF-Token": browser.cookie(CSRF_COOKIE)},
+        )
+
+        assert response.status_code == 409
+        assert workflow.provision_calls == []
     finally:
         browser.close()
 

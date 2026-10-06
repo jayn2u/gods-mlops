@@ -2,25 +2,27 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from hashlib import sha256
+import hmac
 from html import escape
 import json
 from pathlib import Path
-import secrets
 from string import Template
 from typing import Annotated, Any
 from urllib.parse import quote
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from gods_mlops.datasets.deletion import invalidate_sample, preview_invalidate_sample
 from gods_mlops.evaluation.report import load_operator_evaluation_report
+from gods_mlops.jobs.queue import OperatorRetryIntentCapacityError
 
-from .auth import OperatorAuth
+from .auth import AUTH_COOKIE, OperatorAuth
 
 _BASE_TEMPLATE = Path(__file__).with_name("templates") / "base.html"
-_RETRY_INTENT_COOKIE = "gods_mlops_operator_retry_intent"
 _WAITING_STATES = {"queued", "waiting_profile", "waiting_gpu", "waiting_storage", "waiting_capacity"}
 _TERMINAL_STATES = {"completed", "failed", "cancelled"}
 
@@ -127,13 +129,18 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
         except Exception as error:  # noqa: BLE001 - keep database details out of HTML
             return _error_page(request, "Reviews", error, status_code=503)
         base_url = request.app.state.operator_integrations.label_studio_url
+        integrations = request.app.state.operator_integrations
         rows = []
         for item in items:
             task_id = item.get("label_studio_task_id")
-            project_id = item.get("project_id") or request.app.state.operator_integrations.label_studio_bbox_project_id
+            project_id = _review_project_id(item, integrations)
             if base_url and project_id:
                 project_url = base_url.rstrip("/") + f"/projects/{project_id}/data"
                 project_link = f'<a href="{_e(project_url)}" rel="noreferrer">Open Label Studio project</a>'
+            elif base_url:
+                project_link = (
+                    '<span class="muted">Label Studio project for this review stage is not configured.</span>'
+                )
             else:
                 project_link = '<span class="muted">Label Studio integration is not configured.</span>'
             human = "Label Studio annotation recorded" if item.get("human_review_recorded") else "No submitted human annotation recorded"
@@ -149,11 +156,19 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
                 )
             provision = ""
             workflow = request.app.state.operator_services.review_workflow
-            if item.get("state") == "provisioning" and workflow is not None and project_id is not None:
-                provision = _form(
-                    f"/reviews/{_e(item['sample_id'])}/{_e(item['revision'])}/provision",
-                    '<button type="submit">Retry Label Studio provisioning</button>',
-                )
+            if item.get("state") == "provisioning":
+                if workflow is not None and project_id is not None:
+                    provision = _form(
+                        f"/reviews/{_e(item['sample_id'])}/{_e(item['revision'])}/provision",
+                        '<button type="submit">Retry Label Studio provisioning</button>',
+                    )
+                elif project_id is None:
+                    provision = (
+                        '<span class="waiting">Provisioning retry unavailable: stage-matched Label Studio '
+                        "project is not configured.</span>"
+                    )
+                else:
+                    provision = '<span class="waiting">Provisioning retry unavailable: Label Studio workflow is not configured.</span>'
             rows.append(
                 "<tr>"
                 f"<td><code>{_e(item.get('sample_id'))}</code></td>"
@@ -242,15 +257,12 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
                     RuntimeError("review assignment is not awaiting Label Studio provisioning"),
                     status_code=409,
                 )
-            project_id = (
-                assignment.get("project_id")
-                or request.app.state.operator_integrations.label_studio_bbox_project_id
-            )
+            project_id = _review_project_id(assignment, request.app.state.operator_integrations)
             if project_id is None:
                 return _error_page(
                     request,
                     "Reviews",
-                    RuntimeError("Label Studio project ID is not configured for this assignment"),
+                    RuntimeError("stage-matched Label Studio project is not configured for this assignment"),
                     status_code=409,
                 )
             await workflow.provision_task(revision=revision, project_id=project_id)
@@ -343,9 +355,7 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
         except Exception as error:  # noqa: BLE001 - bound database error details
             return _error_page(request, "Jobs", error, status_code=503)
         body = _jobs_table(items)
-        response = _page(request, "Jobs", body)
-        _set_retry_intents_for_jobs(response, request, auth, items)
-        return response
+        return _page(request, "Jobs", body)
 
     @router.get("/jobs/{job_id}", response_class=HTMLResponse)
     async def job_detail(
@@ -384,9 +394,7 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
                         "deployment_eligibility": None,
                     }
         body = _job_detail_body(job, report_result, request.app.state.operator_integrations)
-        response = _page(request, "Job detail", body)
-        _set_retry_intents_for_jobs(response, request, auth, [job])
-        return response
+        return _page(request, "Job detail", body)
 
     @router.post("/jobs/queue", response_class=HTMLResponse)
     async def queue_training(
@@ -414,12 +422,34 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
         operator_id: str = Depends(auth.require_operator),
         _csrf: None = Depends(auth.require_csrf),
     ) -> Response:
-        intent_token = request.cookies.get(_retry_intent_cookie_name(job_id))
-        if intent_token is None:
-            raise HTTPException(status_code=403, detail="Retry intent cookie is required")
+        try:
+            session_nonce, session_expiry = _retry_session_identity(request, auth)
+            canonical_parent_id, scope_sha256 = _retry_intent_scope(
+                auth,
+                session_nonce=session_nonce,
+                operator_id=operator_id,
+                parent_job_id=job_id,
+            )
+            generation = await request.app.state.operator_services.queue.retry_intent_generation(
+                scope_sha256,
+                session_expires_at=datetime.fromtimestamp(session_expiry, UTC),
+            )
+        except HTTPException:
+            raise
+        except ValueError as error:
+            return _error_page(request, "Jobs", error, status_code=409)
+        except Exception as error:  # noqa: BLE001 - intent projection remains a bounded service failure
+            return _error_page(request, "Jobs", error, status_code=503)
+        intent_token = _retry_intent_token(
+            auth,
+            session_nonce=session_nonce,
+            operator_id=operator_id,
+            parent_job_id=canonical_parent_id,
+            generation=generation,
+        )
         try:
             new_job_id = await request.app.state.operator_services.queue.retry_job(
-                job_id,
+                canonical_parent_id,
                 operator_id=operator_id,
                 intent_token=intent_token,
             )
@@ -447,9 +477,27 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
                 RuntimeError("a new retry intent is available only for terminal public jobs"),
                 status_code=409,
             )
-        response = _redirect(f"/jobs/{quote(job_id, safe='')}")
-        _set_retry_intent_cookie(response, auth, job_id, secrets.token_urlsafe(32))
-        return response
+        try:
+            session_nonce, session_expiry = _retry_session_identity(request, auth)
+            canonical_parent_id, scope_sha256 = _retry_intent_scope(
+                auth,
+                session_nonce=session_nonce,
+                operator_id=operator_id,
+                parent_job_id=str(job["job_id"]),
+            )
+            await request.app.state.operator_services.queue.advance_retry_intent_generation(
+                scope_sha256,
+                session_expires_at=datetime.fromtimestamp(session_expiry, UTC),
+            )
+        except OperatorRetryIntentCapacityError as error:
+            return _error_page(request, "Jobs", error, status_code=503)
+        except HTTPException:
+            raise
+        except ValueError as error:
+            return _error_page(request, "Jobs", error, status_code=409)
+        except Exception as error:  # noqa: BLE001 - generation advances only the selected session/job scope
+            return _error_page(request, "Jobs", error, status_code=503)
+        return _redirect(f"/jobs/{quote(canonical_parent_id, safe='')}")
 
     @router.post("/jobs/{job_id}/cancel", response_class=HTMLResponse)
     async def cancel_job(
@@ -515,9 +563,7 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
             or item.get("reason_code")
             or item.get("reservation_cleanup") in {"pending", "unknown"}
         ]
-        response = _page(request, "Actions", _jobs_table(needing_action, empty="No jobs currently need operator action."))
-        _set_retry_intents_for_jobs(response, request, auth, needing_action)
-        return response
+        return _page(request, "Actions", _jobs_table(needing_action, empty="No jobs currently need operator action."))
 
     @router.get("/samples/{sample_id}/invalidation-preview", response_class=HTMLResponse)
     async def invalidation_preview(
@@ -764,36 +810,64 @@ def _redirect(location: str) -> RedirectResponse:
     return RedirectResponse(location, status_code=status.HTTP_303_SEE_OTHER, headers={"Cache-Control": "no-store"})
 
 
-def _retry_intent_cookie_name(parent_job_id: str) -> str:
-    digest = sha256(parent_job_id.encode("utf-8")).hexdigest()
-    return f"{_RETRY_INTENT_COOKIE}_{digest}"
+def _review_project_id(assignment: dict[str, Any], integrations) -> int | None:
+    project_id = assignment.get("project_id")
+    if type(project_id) is int and project_id > 0:
+        return project_id
+    if assignment.get("stage") == "bbox":
+        return integrations.label_studio_bbox_project_id
+    return None
 
 
-def _set_retry_intents_for_jobs(response, request: Request, auth: OperatorAuth, jobs: list[dict[str, Any]]) -> None:
-    for job in jobs:
-        parent_job_id = job.get("job_id")
-        if job.get("state") not in _TERMINAL_STATES or job.get("phase") == "probe" or not parent_job_id:
-            continue
-        cookie_name = _retry_intent_cookie_name(str(parent_job_id))
-        if request.cookies.get(cookie_name) is None:
-            _set_retry_intent_cookie(response, auth, str(parent_job_id), secrets.token_urlsafe(32))
+def _retry_session_identity(request: Request, auth: OperatorAuth) -> tuple[str, int]:
+    session_token = request.cookies.get(AUTH_COOKIE)
+    identity = auth.session_identity(session_token) if session_token is not None else None
+    if identity is None:
+        raise HTTPException(status_code=401, detail="operator authentication required")
+    return identity
 
 
-def _set_retry_intent_cookie(
-    response,
+def _retry_intent_scope(
     auth: OperatorAuth,
+    *,
+    session_nonce: str,
+    operator_id: str,
     parent_job_id: str,
-    token: str,
-) -> None:
-    response.set_cookie(
-        _retry_intent_cookie_name(parent_job_id),
-        token,
-        max_age=auth.settings.session_seconds,
-        path="/",
-        secure=auth.settings.secure_cookie,
-        httponly=True,
-        samesite="strict",
+) -> tuple[str, str]:
+    try:
+        canonical_parent_id = str(UUID(parent_job_id))
+    except (ValueError, TypeError) as error:
+        raise ValueError("parent job ID must be a UUID") from error
+    message = b"\0".join(
+        (
+            b"gods-mlops/operator-retry-scope/v1",
+            session_nonce.encode("utf-8"),
+            operator_id.encode("utf-8"),
+            canonical_parent_id.encode("ascii"),
+        )
     )
+    scope_sha256 = hmac.new(auth.settings.session_secret.encode("utf-8"), message, sha256).hexdigest()
+    return canonical_parent_id, scope_sha256
+
+
+def _retry_intent_token(
+    auth: OperatorAuth,
+    *,
+    session_nonce: str,
+    operator_id: str,
+    parent_job_id: str,
+    generation: int,
+) -> str:
+    message = b"\0".join(
+        (
+            b"gods-mlops/operator-retry-token/v1",
+            session_nonce.encode("utf-8"),
+            operator_id.encode("utf-8"),
+            parent_job_id.encode("ascii"),
+            str(generation).encode("ascii"),
+        )
+    )
+    return hmac.new(auth.settings.session_secret.encode("utf-8"), message, sha256).hexdigest()
 
 
 def _e(value: Any) -> str:

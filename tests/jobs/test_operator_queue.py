@@ -426,6 +426,145 @@ def test_job_list_reads_artifact_reservation_cleanup_in_same_projection() -> Non
     asyncio.run(exercise())
 
 
+class _RetryIntentTransaction:
+    def __init__(self, lock):
+        self.lock = lock
+
+    async def __aenter__(self):
+        await self.lock.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        self.lock.release()
+        return False
+
+
+class _RetryIntentConnection:
+    def __init__(self):
+        self.rows = {}
+        self.lock = asyncio.Lock()
+
+    def transaction(self):
+        return _RetryIntentTransaction(self.lock)
+
+    async def execute(self, query, *args):
+        if query.startswith("LOCK TABLE gods_mlops_operator_retry_intent_generations"):
+            return "LOCK TABLE"
+        if query.startswith("DELETE FROM gods_mlops_operator_retry_intent_generations"):
+            now = args[0]
+            for scope_hash in [key for key, row in self.rows.items() if row["expires_at"] <= now]:
+                del self.rows[scope_hash]
+            return "DELETE"
+        if query.startswith("UPDATE gods_mlops_operator_retry_intent_generations"):
+            scope_hash, generation, expires_at, updated_at = args
+            self.rows[scope_hash] = {
+                "generation": generation,
+                "expires_at": expires_at,
+                "updated_at": updated_at,
+            }
+            return "UPDATE 1"
+        if query.startswith("INSERT INTO gods_mlops_operator_retry_intent_generations"):
+            scope_hash, expires_at, updated_at = args
+            self.rows[scope_hash] = {
+                "generation": 1,
+                "expires_at": expires_at,
+                "updated_at": updated_at,
+            }
+            return "INSERT 0 1"
+        raise AssertionError(f"unexpected retry-intent execute query: {query}")
+
+    async def fetchrow(self, query, *args):
+        if query.startswith("SELECT generation FROM gods_mlops_operator_retry_intent_generations"):
+            row = self.rows.get(args[0])
+            if row is None:
+                return None
+            if len(args) > 2 and row["expires_at"] != args[1]:
+                return None
+            if len(args) > 1 and row["expires_at"] <= args[-1]:
+                return None
+            return {"generation": row["generation"]}
+        raise AssertionError(f"unexpected retry-intent fetchrow query: {query}")
+
+    async def fetchval(self, query, *args):
+        if query.startswith("SELECT COUNT(*) FROM gods_mlops_operator_retry_intent_generations"):
+            return len(self.rows)
+        raise AssertionError(f"unexpected retry-intent fetchval query: {query}")
+
+
+def test_retry_intent_generation_advances_atomically_and_survives_repository_restart() -> None:
+    async def exercise() -> None:
+        connection = _RetryIntentConnection()
+        first_repository = PostgresJobQueueRepository(database_url="postgresql://unused")
+        first_repository._schema_ready = True
+        first_repository._pool = _Pool(connection)
+        scope_hash = "a" * 64
+        expires_at = datetime.now(UTC) + timedelta(hours=1)
+
+        generations = await asyncio.gather(
+            *(
+                first_repository.advance_operator_retry_intent_generation(
+                    scope_hash,
+                    expires_at=expires_at,
+                )
+                for _ in range(8)
+            )
+        )
+        assert sorted(generations) == list(range(1, 9))
+
+        restarted_repository = PostgresJobQueueRepository(database_url="postgresql://unused")
+        restarted_repository._schema_ready = True
+        restarted_repository._pool = _Pool(connection)
+        assert await restarted_repository.get_operator_retry_intent_generation(
+            scope_hash,
+            session_expires_at=expires_at,
+        ) == 8
+
+    asyncio.run(exercise())
+
+
+def test_retry_intent_generation_cleanup_and_capacity_are_bounded(monkeypatch) -> None:
+    async def exercise() -> None:
+        monkeypatch.setattr("gods_mlops.jobs.queue._MAX_OPERATOR_RETRY_INTENT_GENERATIONS", 1)
+        connection = _RetryIntentConnection()
+        expired_scope = "a" * 64
+        active_scope = "b" * 64
+        now = datetime.now(UTC)
+        connection.rows[expired_scope] = {
+            "generation": 1,
+            "expires_at": now - timedelta(seconds=1),
+            "updated_at": now - timedelta(hours=1),
+        }
+        repository = PostgresJobQueueRepository(database_url="postgresql://unused")
+        repository._schema_ready = True
+        repository._pool = _Pool(connection)
+
+        assert await repository.advance_operator_retry_intent_generation(
+            active_scope,
+            expires_at=now + timedelta(hours=1),
+            now=now,
+        ) == 1
+        with pytest.raises(ValueError, match="retry intent capacity"):
+            await repository.advance_operator_retry_intent_generation(
+                "c" * 64,
+                expires_at=now + timedelta(hours=1),
+                now=now,
+            )
+        assert set(connection.rows) == {active_scope}
+        expiry = now + timedelta(hours=1)
+        assert await repository.get_operator_retry_intent_generation(
+            active_scope,
+            session_expires_at=expiry,
+            now=now,
+        ) == 1
+        assert await repository.get_operator_retry_intent_generation(
+            active_scope,
+            session_expires_at=expiry,
+            now=now + timedelta(hours=2),
+        ) == 0
+
+    asyncio.run(exercise())
+
+
 def test_retry_job_reuses_current_training_gates_and_binds_the_parent_intent() -> None:
     async def exercise() -> None:
         parent = _training_parent()

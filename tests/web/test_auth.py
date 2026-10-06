@@ -132,6 +132,27 @@ def _login(client: LocalClient) -> None:
     assert response.status_code == 303
 
 
+def test_session_identity_returns_only_the_verified_nonce_and_expiry() -> None:
+    auth = OperatorAuth(
+        OperatorAuthSettings(
+            username="operator",
+            password=OPERATOR_PASSWORD,
+            session_secret=SESSION_SECRET,
+            secure_cookie=False,
+        )
+    )
+    session_token = auth._issue_session()
+
+    identity = auth.session_identity(session_token)
+
+    assert identity is not None
+    nonce, expires_at = identity
+    assert nonce
+    assert expires_at > int(time.time())
+    tampered = ("A" if session_token[0] != "A" else "B") + session_token[1:]
+    assert auth.session_identity(tampered) is None
+
+
 def test_unauthenticated_write_is_rejected_even_with_a_forged_csrf_header() -> None:
     client = _client()
     try:

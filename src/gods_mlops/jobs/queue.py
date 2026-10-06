@@ -43,6 +43,7 @@ _OPERATOR_QUEUE_STATES = (
     "waiting_storage",
     "waiting_capacity",
 )
+_MAX_OPERATOR_RETRY_INTENT_GENERATIONS = 4096
 
 
 class DatasetNotReadyForTrainingError(ValueError):
@@ -75,6 +76,10 @@ class ResultArtifactConflictError(ValueError):
 
 class OperatorRetryIntentConflictError(ValueError):
     """An operator reused one retry intent for a different immutable request."""
+
+
+class OperatorRetryIntentCapacityError(ValueError):
+    """The bounded active server-side retry-intent generation table is full."""
 
 
 class ObservationReplayError(ValueError):
@@ -435,6 +440,84 @@ class PostgresJobQueueRepository:
         if row is None:
             raise KeyError(f"GPU job {job_id} does not exist")
         return _job_dict(row)
+
+    async def get_operator_retry_intent_generation(
+        self,
+        scope_sha256: str,
+        *,
+        session_expires_at: datetime,
+        now: datetime | None = None,
+    ) -> int:
+        """Read the current session-scoped retry generation without creating state."""
+        _validate_digest(scope_sha256, "operator retry intent scope SHA-256")
+        current = now or datetime.now(UTC)
+        if current.tzinfo is None or session_expires_at.tzinfo is None:
+            raise ValueError("retry intent read time and session expiry must be timezone-aware")
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT generation FROM gods_mlops_operator_retry_intent_generations
+                   WHERE scope_sha256=$1 AND expires_at=$2 AND expires_at > $3""",
+                scope_sha256,
+                session_expires_at,
+                current,
+            )
+        return int(row["generation"]) if row is not None else 0
+
+    async def advance_operator_retry_intent_generation(
+        self,
+        scope_sha256: str,
+        *,
+        expires_at: datetime,
+        now: datetime | None = None,
+    ) -> int:
+        """Atomically advance an explicit rerun generation, bounded by live sessions."""
+        _validate_digest(scope_sha256, "operator retry intent scope SHA-256")
+        current = now or datetime.now(UTC)
+        if current.tzinfo is None or expires_at.tzinfo is None or expires_at <= current:
+            raise ValueError("retry intent session expiry must be future and timezone-aware")
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                # Serialize first-insert capacity checks as well as increments across workers.
+                await connection.execute(
+                    "LOCK TABLE gods_mlops_operator_retry_intent_generations IN SHARE ROW EXCLUSIVE MODE"
+                )
+                await connection.execute(
+                    "DELETE FROM gods_mlops_operator_retry_intent_generations WHERE expires_at <= $1",
+                    current,
+                )
+                row = await connection.fetchrow(
+                    """SELECT generation FROM gods_mlops_operator_retry_intent_generations
+                       WHERE scope_sha256=$1 FOR UPDATE""",
+                    scope_sha256,
+                )
+                if row is not None:
+                    generation = int(row["generation"]) + 1
+                    await connection.execute(
+                        """UPDATE gods_mlops_operator_retry_intent_generations
+                           SET generation=$2,expires_at=$3,updated_at=$4 WHERE scope_sha256=$1""",
+                        scope_sha256,
+                        generation,
+                        expires_at,
+                        current,
+                    )
+                    return generation
+                count = await connection.fetchval(
+                    "SELECT COUNT(*) FROM gods_mlops_operator_retry_intent_generations"
+                )
+                if int(count) >= _MAX_OPERATOR_RETRY_INTENT_GENERATIONS:
+                    raise OperatorRetryIntentCapacityError("operator retry intent capacity has been reached")
+                await connection.execute(
+                    """INSERT INTO gods_mlops_operator_retry_intent_generations
+                       (scope_sha256,generation,expires_at,updated_at) VALUES ($1,1,$2,$3)""",
+                    scope_sha256,
+                    expires_at,
+                    current,
+                )
+                return 1
 
     async def list_jobs(self, *, limit: int = 100) -> list[dict[str, Any]]:
         """List recent job state with active queue positions from durable ordering."""
@@ -4360,6 +4443,23 @@ class JobQueue:
 
     async def list_jobs(self, *, limit: int = 100) -> list[dict[str, Any]]:
         return await self._repository.list_jobs(limit=limit)
+
+    async def retry_intent_generation(self, scope_sha256: str, *, session_expires_at: datetime) -> int:
+        return await self._repository.get_operator_retry_intent_generation(
+            scope_sha256,
+            session_expires_at=session_expires_at,
+        )
+
+    async def advance_retry_intent_generation(
+        self,
+        scope_sha256: str,
+        *,
+        session_expires_at: datetime,
+    ) -> int:
+        return await self._repository.advance_operator_retry_intent_generation(
+            scope_sha256,
+            expires_at=session_expires_at,
+        )
 
     async def get_job_detail(self, job_id: str) -> dict[str, Any]:
         job = await self.get(job_id)
