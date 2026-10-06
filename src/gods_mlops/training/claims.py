@@ -5,7 +5,19 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any
+
+from .contracts import (
+    CLIP_FIX5_EXECUTION_CONFIG_VERSION,
+    CLIP_FIX5_INPUT_ID,
+    CLIP_FIX5_INPUT_SHA256,
+    CLIP_FIX5_MANIFEST_CONFIG_VERSION,
+    CLIP_FIX5_MANIFEST_OBJECT_KEY,
+    CLIP_FIX5_MANIFEST_SIZE_BYTES,
+    ProbeManifestVersionPin,
+    locked_model,
+)
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -83,7 +95,7 @@ def validate_worker_claim(
     lease: dict[str, Any],
     profile: dict[str, Any] | None,
     allowed_job_states: frozenset[str] = frozenset({"running"}),
-) -> None:
+) -> ProbeManifestVersionPin | None:
     """Fail closed unless the latest durable job, profile, and fence exactly match."""
     if profile is None:
         raise WorkerAuthorizationError("worker resource profile is unavailable")
@@ -130,6 +142,7 @@ def validate_worker_claim(
     if profile_target != claim.target_phase:
         raise WorkerAuthorizationError("worker profile target phase does not match the job")
     profile_state = profile.get("profile_state")
+    probe_manifest_pin = None
     if claim.phase == "probe":
         if profile_state != "candidate":
             raise WorkerAuthorizationError("probe worker requires a candidate measurement profile")
@@ -151,6 +164,12 @@ def validate_worker_claim(
                 or probe_input.config_version != claim.config_version
             ):
                 raise WorkerAuthorizationError("typed probe source identity differs from the admitted job")
+            probe_manifest_pin = clip_probe_manifest_version_pin(
+                claim,
+                job=job,
+                profile=profile,
+                probe_input=probe_input,
+            )
             if claim.target_phase == "evaluation":
                 checkpoint_source = probe_input.evaluation_checkpoint_source
                 profile_config = profile.get("config_json", {})
@@ -214,6 +233,98 @@ def validate_worker_claim(
         claim.image_id.removeprefix("sha256:")
     ):
         raise WorkerAuthorizationError("worker image identity must be an immutable SHA-256 ID")
+    return probe_manifest_pin
+
+
+def clip_probe_manifest_version_pin(
+    claim: WorkerClaim,
+    *,
+    job: dict[str, Any],
+    profile: dict[str, Any],
+    probe_input: Any,
+) -> ProbeManifestVersionPin | None:
+    """Resolve the one admitted v2 CLIP fixture pin; every other path stays strict."""
+    if (
+        claim.phase != "probe"
+        or claim.target_phase != "training"
+        or claim.model_kind != "clip"
+        or claim.config_version != CLIP_FIX5_EXECUTION_CONFIG_VERSION
+    ):
+        return None
+    if (
+        profile.get("phase") != "probe"
+        or profile.get("model_kind") != "clip"
+        or profile.get("config_version") != CLIP_FIX5_EXECUTION_CONFIG_VERSION
+        or profile.get("target_phase") != "training"
+        or profile.get("profile_state") != "candidate"
+        or job.get("phase") != "probe"
+        or job.get("target_phase") != "training"
+        or job.get("input_kind") != "probe_input"
+        or job.get("model_kind") != "clip"
+        or job.get("config_version") != CLIP_FIX5_EXECUTION_CONFIG_VERSION
+        or claim.input_kind != "probe_input"
+    ):
+        raise WorkerAuthorizationError("CLIP manifest pin requires its registered training-probe candidate")
+    config = profile.get("config_json")
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except json.JSONDecodeError as error:
+            raise WorkerAuthorizationError("CLIP manifest pin profile config is invalid") from error
+    if not isinstance(config, dict):
+        raise WorkerAuthorizationError("CLIP manifest pin profile config is unavailable")
+    try:
+        serialized_config = json.dumps(
+            config,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise WorkerAuthorizationError("CLIP manifest pin profile config is not canonical JSON") from error
+    config_hash = sha256(serialized_config).hexdigest()
+    registered_hash = str(profile.get("config_sha256", "")).strip()
+    if (
+        config_hash != registered_hash
+        or config_hash != claim.config_sha256
+        or config_hash != str(job.get("config_sha256", "")).strip()
+    ):
+        raise WorkerAuthorizationError("CLIP manifest pin profile config hash differs from the admitted job")
+    if (
+        config.get("probe_manifest_config_version") != CLIP_FIX5_MANIFEST_CONFIG_VERSION
+        or config.get("forward_precision") != "float16-autocast"
+        or config.get("training_loss_policy_version") != "task9-clip-symmetric-ce-fp64-v1"
+        or config.get("training_loss_objective") != "symmetric_identity_cross_entropy"
+        or config.get("training_loss_reduction_precision") != "float64"
+    ):
+        raise WorkerAuthorizationError("CLIP manifest pin profile does not select the approved loss policy")
+    model = locked_model("clip")
+    if config.get("model_id") != model.model_id or config.get("model_revision") != model.revision:
+        raise WorkerAuthorizationError("CLIP manifest pin model differs from its immutable model lock")
+    if (
+        claim.input_id != CLIP_FIX5_INPUT_ID
+        or claim.input_sha256 != CLIP_FIX5_INPUT_SHA256
+        or str(job.get("input_id", "")) != CLIP_FIX5_INPUT_ID
+        or str(job.get("input_sha256", "")).strip() != CLIP_FIX5_INPUT_SHA256
+        or probe_input.probe_input_id != CLIP_FIX5_INPUT_ID
+        or probe_input.input_sha256 != CLIP_FIX5_INPUT_SHA256
+        or probe_input.config_version != CLIP_FIX5_EXECUTION_CONFIG_VERSION
+        or probe_input.model_kind != "clip"
+        or probe_input.target_phase != "training"
+        or probe_input.manifest_object_key != CLIP_FIX5_MANIFEST_OBJECT_KEY
+        or probe_input.object_size_bytes != CLIP_FIX5_MANIFEST_SIZE_BYTES
+        or probe_input.fixture is not True
+    ):
+        raise WorkerAuthorizationError("CLIP manifest pin is restricted to the exact frozen probe input")
+    return ProbeManifestVersionPin(
+        manifest_config_version=CLIP_FIX5_MANIFEST_CONFIG_VERSION,
+        execution_config_version=CLIP_FIX5_EXECUTION_CONFIG_VERSION,
+        execution_config_sha256=config_hash,
+        input_id=CLIP_FIX5_INPUT_ID,
+        input_sha256=CLIP_FIX5_INPUT_SHA256,
+        model_id=model.model_id,
+        model_revision=model.revision,
+    )
 
 
 class WorkerYieldRequested(RuntimeError):
@@ -236,7 +347,7 @@ async def validate_current_worker_claim(
         model_kind=claim.model_kind,
         config_version=claim.config_version,
     )
-    validate_worker_claim(claim, job=job, lease=lease, profile=profile)
+    probe_manifest_pin = validate_worker_claim(claim, job=job, lease=lease, profile=profile)
     if not await queue.repository.lease_is_current(claim.job_id, claim.lease_token):
         raise WorkerAuthorizationError("worker fence is no longer current")
     if claim.phase == "training":
@@ -266,7 +377,14 @@ async def validate_current_worker_claim(
                 raise WorkerAuthorizationError("typed probe manifest object store is unavailable")
             try:
                 probe_input = ProbeInput.from_dict(source_refs)
-                probe_input.verify(object_store)
+                probe_input.verify(
+                    object_store,
+                    expected_manifest_config_version=(
+                        probe_manifest_pin.manifest_config_version
+                        if probe_manifest_pin is not None
+                        else None
+                    ),
+                )
             except Exception as error:
                 raise WorkerAuthorizationError("immutable probe manifest bytes changed") from error
             if claim.target_phase == "evaluation":

@@ -14,11 +14,19 @@ from PIL import Image, ImageDraw
 from gods_mlops.datasets.manifest import canonical_json, content_sha256
 from gods_mlops.jobs.models import EvaluationProbeCheckpointSource, ExecutionProfile, ProbeInput
 
-from .contracts import locked_model
+from .contracts import (
+    CLIP_FIX5_EXECUTION_CONFIG_VERSION,
+    CLIP_FIX5_INPUT_ID,
+    CLIP_FIX5_INPUT_SHA256,
+    CLIP_FIX5_MANIFEST_CONFIG_VERSION,
+    CLIP_FIX5_MANIFEST_OBJECT_KEY,
+    CLIP_FIX5_MANIFEST_SIZE_BYTES,
+    locked_model,
+)
 
 _PROFILE_VERSIONS = {
     "detr": "task8-detr-640-microbatch1-probe-v1",
-    "clip": "task8-clip-224-microbatch2-explicit-negative-probe-v1",
+    "clip": CLIP_FIX5_EXECUTION_CONFIG_VERSION,
     "qwen": "task8-qwen-bounded-crop-caption-probe-v1",
 }
 _DETR_PREPARATION_PROFILE_VERSION = "task8-detr-640-frame-drafts-preparation-probe-v1"
@@ -79,6 +87,11 @@ def candidate_profile(model_kind: str, *, target_phase: str | None = None) -> Ex
                 "optimizer_steps": 3,
                 "learning_rate": 1e-5,
                 "weight_decay": 1e-4,
+                "probe_manifest_config_version": CLIP_FIX5_MANIFEST_CONFIG_VERSION,
+                "forward_precision": "float16-autocast",
+                "training_loss_policy_version": "task9-clip-symmetric-ce-fp64-v1",
+                "training_loss_objective": "symmetric_identity_cross_entropy",
+                "training_loss_reduction_precision": "float64",
             }
             version = _PROFILE_VERSIONS[model_kind]
         elif requested_target == "evaluation":
@@ -163,6 +176,14 @@ def create_probe_input(
             {"key": key, "sha256": digest, "size_bytes": len(image_bytes)}
         )
 
+    manifest_config_version = profile.config_version
+    if model_kind == "clip" and profile.target_phase == "training" and (
+        profile.config_version == CLIP_FIX5_EXECUTION_CONFIG_VERSION
+    ):
+        manifest_config_version = str(profile.config.get("probe_manifest_config_version", ""))
+        if manifest_config_version != CLIP_FIX5_MANIFEST_CONFIG_VERSION:
+            raise ValueError("CLIP fix5 probe manifest version must match its immutable profile pin")
+
     common = {
         "schema_version": 1,
         "fixture": True,
@@ -170,7 +191,7 @@ def create_probe_input(
         "model_kind": model_kind,
         "input_kind": "probe_input",
         "input_id": probe_input_id,
-        "config_version": profile.config_version,
+        "config_version": manifest_config_version,
         "model_id": profile.config["model_id"],
         "model_revision": profile.config["model_revision"],
     }
@@ -254,14 +275,18 @@ def create_probe_input(
 
     manifest_bytes = canonical_json(manifest)
     manifest_sha256 = content_sha256(manifest_bytes)
-    manifest_key = f"probe-inputs/{probe_input_id}/manifest.json"
+    manifest_key = (
+        CLIP_FIX5_MANIFEST_OBJECT_KEY
+        if model_kind == "clip" and profile.target_phase == "training"
+        else f"probe-inputs/{probe_input_id}/manifest.json"
+    )
     objects.write_immutable(
         object_key=manifest_key,
         content=manifest_bytes,
         sha256_digest=manifest_sha256,
         content_type="application/json",
     )
-    return ProbeInput(
+    probe_input = ProbeInput(
         probe_input_id=probe_input_id,
         model_kind=model_kind,
         target_phase=profile.target_phase or "training",
@@ -272,6 +297,28 @@ def create_probe_input(
         fixture=True,
         evaluation_checkpoint_source=evaluation_checkpoint_source,
     )
+    if manifest_config_version != profile.config_version:
+        if (
+            manifest_key != CLIP_FIX5_MANIFEST_OBJECT_KEY
+            or probe_input.probe_input_id != CLIP_FIX5_INPUT_ID
+        ):
+            raise ValueError("CLIP fix5 manifest pin is only valid for its frozen synthetic training fixture")
+        if probe_input.input_sha256 != CLIP_FIX5_INPUT_SHA256:
+            raise ValueError("CLIP fix5 profile changed the frozen synthetic training input")
+        if probe_input.object_size_bytes != CLIP_FIX5_MANIFEST_SIZE_BYTES:
+            raise ValueError("CLIP fix5 profile changed the frozen synthetic manifest size")
+        payload = objects.read_source(
+            object_key=manifest_key,
+            sha256_digest=probe_input.input_sha256,
+            size_bytes=probe_input.object_size_bytes,
+        )
+        if payload != manifest_bytes:
+            raise ValueError("CLIP fix5 immutable probe manifest readback differs from its canonical bytes")
+        probe_input.verify(
+            objects,
+            expected_manifest_config_version=manifest_config_version,
+        )
+    return probe_input
 
 
 async def load_evaluation_probe_checkpoint_source(

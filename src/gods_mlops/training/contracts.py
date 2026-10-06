@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,26 @@ _MODEL_IDS = {
     "clip": "openai/clip-vit-base-patch16",
     "qwen": "Qwen/Qwen2.5-VL-7B-Instruct",
 }
+
+CLIP_FIX5_EXECUTION_CONFIG_VERSION = "task9-clip-224-microbatch2-symmetric-ce-fp64-probe-v1"
+CLIP_FIX5_MANIFEST_CONFIG_VERSION = "task8-clip-224-microbatch2-explicit-negative-probe-v1"
+CLIP_FIX5_INPUT_ID = "task8-clip-synthetic-probe-v1"
+CLIP_FIX5_INPUT_SHA256 = "b9f04dcf067c0dc4d53fa4b39bd88a991b9f956ca91590ba6d95a2293416731e"
+CLIP_FIX5_MANIFEST_OBJECT_KEY = f"probe-inputs/{CLIP_FIX5_INPUT_ID}/manifest.json"
+CLIP_FIX5_MANIFEST_SIZE_BYTES = 1268
+
+
+@dataclass(frozen=True, slots=True)
+class ProbeManifestVersionPin:
+    """Worker-validated bridge from one CLIP execution profile to its frozen probe manifest."""
+
+    manifest_config_version: str
+    execution_config_version: str
+    execution_config_sha256: str
+    input_id: str
+    input_sha256: str
+    model_id: str
+    model_revision: str
 
 
 def model_lock_path() -> Path:
@@ -41,7 +62,12 @@ def validate_model_revision(config: dict[str, Any], *, lock_path: Path | None = 
     return {"model_id": model.model_id, "model_revision": model.revision}
 
 
-def validate_manifest_identity(config: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+def validate_manifest_identity(
+    config: dict[str, Any],
+    manifest: dict[str, Any],
+    *,
+    probe_manifest_pin: ProbeManifestVersionPin | None = None,
+) -> dict[str, Any]:
     """Reject a manifest whose immutable input, model, phase, or config differs from its job."""
     if not isinstance(config, dict) or not isinstance(manifest, dict):
         raise ValueError("runner config and manifest must be JSON objects")
@@ -52,6 +78,7 @@ def validate_manifest_identity(config: dict[str, Any], manifest: dict[str, Any])
         raise ValueError("runner model_kind must be detr, clip, or qwen")
     if not config.get("config_version"):
         raise ValueError("runner config version is missing")
+    expected_manifest_config_version = _expected_manifest_config_version(config, probe_manifest_pin)
     expected_sha = str(config.get("input_sha256", ""))
     if len(expected_sha) != 64 or any(char not in "0123456789abcdef" for char in expected_sha):
         raise ValueError("runner input hash must be a lowercase SHA-256 digest")
@@ -108,7 +135,7 @@ def validate_manifest_identity(config: dict[str, Any], manifest: dict[str, Any])
             or manifest.get("model_kind") != model_kind
             or manifest.get("input_kind") != input_kind
             or manifest.get("input_id") != input_id
-            or manifest.get("config_version") != config.get("config_version")
+            or manifest.get("config_version") != expected_manifest_config_version
         ):
             raise ValueError("probe manifest must explicitly identify its synthetic fixture")
         if sha256(canonical_json(manifest)).hexdigest() != expected_sha:
@@ -122,9 +149,14 @@ def validate_manifest_identity(config: dict[str, Any], manifest: dict[str, Any])
     if (
         phase != "evaluation"
         and manifest_config_version is not None
-        and manifest_config_version != config.get("config_version")
+        and manifest_config_version != expected_manifest_config_version
     ):
         raise ValueError("manifest config version does not match the immutable job")
+    if probe_manifest_pin is not None and (
+        manifest.get("model_id") != probe_manifest_pin.model_id
+        or manifest.get("model_revision") != probe_manifest_pin.model_revision
+    ):
+        raise ValueError("pinned CLIP probe manifest model identity differs from its admitted profile")
     return {
         "phase": phase,
         "model_kind": model_kind,
@@ -136,6 +168,44 @@ def validate_manifest_identity(config: dict[str, Any], manifest: dict[str, Any])
         "model_id": str(config["model_id"]),
         "model_revision": str(config["model_revision"]),
     }
+
+
+def _expected_manifest_config_version(
+    config: dict[str, Any],
+    pin: ProbeManifestVersionPin | None,
+) -> str:
+    execution_version = str(config.get("config_version", ""))
+    if pin is None:
+        return execution_version
+    if not isinstance(pin, ProbeManifestVersionPin):
+        raise ValueError("CLIP probe manifest pin must come from the validated execution profile")
+    if (
+        config.get("phase") != "probe"
+        or config.get("target_phase") != "training"
+        or config.get("model_kind") != "clip"
+        or config.get("input_kind") != "probe_input"
+        or config.get("dataset_version") is not None
+        or execution_version != CLIP_FIX5_EXECUTION_CONFIG_VERSION
+        or config.get("config_sha256") != pin.execution_config_sha256
+        or pin.execution_config_version != execution_version
+        or pin.manifest_config_version != CLIP_FIX5_MANIFEST_CONFIG_VERSION
+        or config.get("probe_manifest_config_version") != pin.manifest_config_version
+        or config.get("training_loss_policy_version") != "task9-clip-symmetric-ce-fp64-v1"
+        or config.get("training_loss_objective") != "symmetric_identity_cross_entropy"
+        or config.get("training_loss_reduction_precision") != "float64"
+        or config.get("forward_precision") != "float16-autocast"
+        or config.get("input_id") != CLIP_FIX5_INPUT_ID
+        or config.get("input_sha256") != CLIP_FIX5_INPUT_SHA256
+        or pin.input_id != CLIP_FIX5_INPUT_ID
+        or pin.input_sha256 != CLIP_FIX5_INPUT_SHA256
+        or config.get("model_id") != pin.model_id
+        or config.get("model_revision") != pin.model_revision
+    ):
+        raise ValueError("CLIP probe manifest version pin is not bound to the admitted execution profile")
+    model = locked_model("clip")
+    if config.get("model_id") != model.model_id or config.get("model_revision") != model.revision:
+        raise ValueError("pinned CLIP probe manifest model identity differs from the immutable model lock")
+    return pin.manifest_config_version
 
 
 def load_manifest(manifest_uri: str, *, config: dict[str, Any] | None = None) -> dict[str, Any]:

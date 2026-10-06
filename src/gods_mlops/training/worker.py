@@ -24,6 +24,7 @@ from .claims import (
     WorkerAuthorizationError,
     WorkerClaim,
     WorkerYieldRequested,
+    clip_probe_manifest_version_pin,
     validate_current_worker_claim,
 )
 from .data import dataset_object_store_from_environment
@@ -218,6 +219,7 @@ async def run_worker() -> int:
             model=model,
             contracts=contracts,
             config=config,
+            profile=profile,
         )
         if recovered_exit is not None:
             return recovered_exit
@@ -230,7 +232,12 @@ async def run_worker() -> int:
             result = None
             try:
                 manifest_uri, extra = await _worker_manifest(
-                    job, queue, objects, root=manifest_root
+                    job,
+                    queue,
+                    objects,
+                    root=manifest_root,
+                    claim=claim,
+                    profile=profile,
                 )
                 config.update(extra)
                 result = await _run_after_owner_binding(
@@ -450,7 +457,13 @@ def _build_owned_evaluation_report(
 
 
 async def _worker_manifest(
-    job: dict[str, Any], queue: JobQueue, objects: Any, *, root: Path
+    job: dict[str, Any],
+    queue: JobQueue,
+    objects: Any,
+    *,
+    root: Path,
+    claim: WorkerClaim | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     phase = str(job["phase"])
     refs = job.get("source_refs")
@@ -489,10 +502,32 @@ async def _worker_manifest(
         if refs.get("schema") != "gods-mlops-probe-input-v1":
             raise WorkerAuthorizationError("real model probes require typed immutable probe input refs")
         probe_input = ProbeInput.from_dict(refs)
-        manifest = probe_input.verify(objects)
+        probe_manifest_pin = (
+            clip_probe_manifest_version_pin(
+                claim,
+                job=job,
+                profile=profile,
+                probe_input=probe_input,
+            )
+            if claim is not None and profile is not None
+            else None
+        )
+        manifest = probe_input.verify(
+            objects,
+            expected_manifest_config_version=(
+                probe_manifest_pin.manifest_config_version
+                if probe_manifest_pin is not None
+                else None
+            ),
+        )
         path = root / "probe-manifest.json"
         path.write_bytes(canonical_json(manifest))
-        return str(path), {}
+        extra = (
+            {"_probe_manifest_pin": probe_manifest_pin}
+            if probe_manifest_pin is not None
+            else {}
+        )
+        return str(path), extra
     if phase == "preparation":
         items = refs.get("items")
         if not isinstance(items, list) or not items:
@@ -676,6 +711,7 @@ async def _recover_committed_result(
     model,
     contracts,
     config: dict[str, Any],
+    profile: dict[str, Any] | None = None,
 ) -> int | None:
     """Finish a fenced retry from a verified result without importing or invoking a model runner."""
     artifacts = await queue.repository.result_artifacts_for(claim.job_id)
@@ -712,10 +748,29 @@ async def _recover_committed_result(
     with tempfile.TemporaryDirectory(prefix="gods-mlops-recovery-") as stage_directory:
         manifest_root = Path(stage_directory) / "manifest"
         manifest_root.mkdir(mode=0o700)
-        manifest_uri, extra = await _worker_manifest(job, queue, objects, root=manifest_root)
+        if profile is None:
+            manifest_uri, extra = await _worker_manifest(
+                job,
+                queue,
+                objects,
+                root=manifest_root,
+            )
+        else:
+            manifest_uri, extra = await _worker_manifest(
+                job,
+                queue,
+                objects,
+                root=manifest_root,
+                claim=claim,
+                profile=profile,
+            )
         config.update(extra)
         manifest = contracts.load_manifest(manifest_uri, config=config)
-        contracts.validate_manifest_identity(config, manifest)
+        contracts.validate_manifest_identity(
+            config,
+            manifest,
+            probe_manifest_pin=config.get("_probe_manifest_pin"),
+        )
     await validate_current_worker_claim(queue, claim, object_store=objects)
 
     if claim.phase == "probe":

@@ -886,7 +886,7 @@ def test_versioned_probe_profiles_and_probe_only_synthetic_media_are_separate_fr
 
     expected_versions = {
         "detr": "task8-detr-640-microbatch1-probe-v1",
-        "clip": "task8-clip-224-microbatch2-explicit-negative-probe-v1",
+        "clip": "task9-clip-224-microbatch2-symmetric-ce-fp64-probe-v1",
         "qwen": "task8-qwen-bounded-crop-caption-probe-v1",
     }
     for model_kind, config_version in expected_versions.items():
@@ -897,12 +897,20 @@ def test_versioned_probe_profiles_and_probe_only_synthetic_media_are_separate_fr
         if model_kind == "clip":
             assert profile.config["micro_batch"] == 2
             assert profile.config["gradient_accumulation_steps"] == 1
+            assert profile.config["training_loss_reduction_precision"] == "float64"
         if model_kind == "qwen":
             assert profile.target_phase == "preparation"
 
         objects = Objects()
         probe_input = module.create_probe_input(objects=objects, model_kind=model_kind)
-        manifest = probe_input.verify(objects)
+        manifest = (
+            probe_input.verify(
+                objects,
+                expected_manifest_config_version=profile.config["probe_manifest_config_version"],
+            )
+            if model_kind == "clip"
+            else probe_input.verify(objects)
+        )
         assert probe_input.fixture is True
         assert probe_input.input_kind == "probe_input"
         assert "dataset_version" not in manifest

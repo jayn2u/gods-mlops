@@ -30,6 +30,8 @@ MAX_AMP_STEP_ATTEMPTS = 32
 class OptimizerStepStats:
     attempts: int = 0
     amp_overflow_skips: int = 0
+    finite_nonzero_gradient_updates: int = 0
+    max_nonzero_trainable_parameters: int = 0
 
 
 def require_cuda(expected_gpu_uuid: str | None = None) -> torch.device:
@@ -113,6 +115,8 @@ def step_optimizer(
     *,
     scaler: Any,
     model_kwargs: dict[str, Any] | None = None,
+    loss_from_output: Callable[[Any], torch.Tensor] | None = None,
+    require_finite_nonzero_gradients: bool = False,
     max_grad_norm: float = 1.0,
     step_stats: OptimizerStepStats | None = None,
     before_attempt: Callable[[], None] | None = None,
@@ -131,7 +135,7 @@ def step_optimizer(
         scale_before = float(scaler.get_scale())
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             output = model(**inputs, **(model_kwargs or {}))
-            loss = output.loss
+        loss = loss_from_output(output) if loss_from_output is not None else output.loss
         if loss is None or not torch.isfinite(loss):
             raise ValueError("model training loss is not finite")
         scalar = float(loss.detach().float().cpu())
@@ -139,6 +143,12 @@ def step_optimizer(
             raise ValueError("model training produced no finite non-zero learning signal")
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer_instance)
+        gradients_finite = True
+        nonzero_trainable_parameters = 0
+        if require_finite_nonzero_gradients:
+            gradients_finite, nonzero_trainable_parameters = _trainable_gradient_summary(model)
+            if gradients_finite and nonzero_trainable_parameters == 0:
+                raise ValueError("training produced no finite nonzero trainable parameter gradients")
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         scaler.step(optimizer_instance)
         scaler.update()
@@ -147,11 +157,40 @@ def step_optimizer(
             optimizer_instance.zero_grad(set_to_none=True)
             _restore_buffers(buffers_before)
             continue
+        if require_finite_nonzero_gradients:
+            if not gradients_finite:
+                raise ValueError("GradScaler accepted non-finite trainable parameter gradients")
+            stats.finite_nonzero_gradient_updates += 1
+            stats.max_nonzero_trainable_parameters = max(
+                stats.max_nonzero_trainable_parameters,
+                nonzero_trainable_parameters,
+            )
         torch.cuda.synchronize()
         return scalar
     raise ValueError(
         f"GradScaler skipped optimizer updates after {MAX_AMP_STEP_ATTEMPTS} attempts"
     )
+
+
+def _trainable_gradient_summary(model: Any) -> tuple[bool, int]:
+    gradients = [
+        parameter.grad
+        for parameter in model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    if not gradients:
+        return True, 0
+    gradients_by_device: dict[torch.device, list[torch.Tensor]] = {}
+    for gradient in gradients:
+        gradients_by_device.setdefault(gradient.device, []).append(gradient)
+    finite = True
+    nonzero_parameters = 0
+    for device_gradients in gradients_by_device.values():
+        finite_flags = [torch.isfinite(gradient).all() for gradient in device_gradients]
+        nonzero_flags = [torch.count_nonzero(gradient) > 0 for gradient in device_gradients]
+        finite = finite and bool(torch.stack(finite_flags).all().item())
+        nonzero_parameters += int(torch.stack(nonzero_flags).sum().item())
+    return finite, nonzero_parameters
 
 
 def _restore_buffers(buffers: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
@@ -184,6 +223,7 @@ def serialize_checkpoint(
     precision: str,
     scaler: Any,
     step_stats: OptimizerStepStats | None = None,
+    execution_policy: dict[str, str] | None = None,
 ) -> bytes:
     stats = step_stats if step_stats is not None else OptimizerStepStats(attempts=optimizer_steps)
     if (
@@ -192,8 +232,18 @@ def serialize_checkpoint(
         or type(stats.attempts) is not int
         or type(stats.amp_overflow_skips) is not int
         or stats.attempts != optimizer_steps + stats.amp_overflow_skips
+        or type(stats.finite_nonzero_gradient_updates) is not int
+        or not 0 <= stats.finite_nonzero_gradient_updates <= optimizer_steps
+        or type(stats.max_nonzero_trainable_parameters) is not int
+        or stats.max_nonzero_trainable_parameters < 0
     ):
         raise ValueError("checkpoint optimizer attempt counters do not match completed updates")
+    if execution_policy is not None and (
+        not isinstance(execution_policy, dict)
+        or stats.finite_nonzero_gradient_updates != optimizer_steps
+        or (optimizer_steps > 0 and stats.max_nonzero_trainable_parameters == 0)
+    ):
+        raise ValueError("checkpoint execution policy requires verified trainable gradients per update")
     payload = io.BytesIO()
     torch.save(
         {
@@ -204,9 +254,12 @@ def serialize_checkpoint(
             "optimizer_steps": optimizer_steps,
             "optimizer_step_attempts": stats.attempts,
             "amp_overflow_skips": stats.amp_overflow_skips,
+            "finite_nonzero_gradient_updates": stats.finite_nonzero_gradient_updates,
+            "max_nonzero_trainable_parameters": stats.max_nonzero_trainable_parameters,
             "model_state_dict": cpu_state(model.state_dict()),
             "optimizer_state_dict": cpu_state(optimizer_instance.state_dict()),
             "scaler_state_dict": cpu_state(scaler.state_dict()),
+            **({"execution_policy": dict(execution_policy)} if execution_policy is not None else {}),
         },
         payload,
     )
@@ -223,6 +276,7 @@ def restore_checkpoint(
     device: torch.device,
     scaler: Any,
     step_stats: OptimizerStepStats | None = None,
+    expected_execution_policy: dict[str, str] | None = None,
 ) -> int:
     checkpoint = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=False)
     if checkpoint.get("format") != "gods-mlops-training-checkpoint-v1":
@@ -231,6 +285,11 @@ def restore_checkpoint(
         raise ValueError("checkpoint job, fence input, phase, model, or config identity changed")
     if checkpoint.get("model_revision") != expected_revision:
         raise ValueError("checkpoint model revision differs from the immutable lock")
+    if (
+        expected_execution_policy is not None
+        and checkpoint.get("execution_policy") != expected_execution_policy
+    ):
+        raise ValueError("checkpoint execution policy differs from the selected training profile")
     step = checkpoint.get("optimizer_steps")
     if not isinstance(step, int) or step < 0:
         raise ValueError("checkpoint optimizer step is invalid")
@@ -244,12 +303,30 @@ def restore_checkpoint(
         or attempts != step + skipped
     ):
         raise ValueError("checkpoint optimizer attempt counters are invalid")
+    finite_nonzero_gradient_updates = checkpoint.get("finite_nonzero_gradient_updates", 0)
+    max_nonzero_trainable_parameters = checkpoint.get("max_nonzero_trainable_parameters", 0)
+    if (
+        type(finite_nonzero_gradient_updates) is not int
+        or not 0 <= finite_nonzero_gradient_updates <= step
+        or type(max_nonzero_trainable_parameters) is not int
+        or max_nonzero_trainable_parameters < 0
+        or (
+            expected_execution_policy is not None
+            and (
+                finite_nonzero_gradient_updates != step
+                or (step > 0 and max_nonzero_trainable_parameters == 0)
+            )
+        )
+    ):
+        raise ValueError("checkpoint trainable gradient counters are invalid")
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     optimizer_instance.load_state_dict(checkpoint["optimizer_state_dict"])
     scaler.load_state_dict(checkpoint["scaler_state_dict"])
     if step_stats is not None:
         step_stats.attempts = attempts
         step_stats.amp_overflow_skips = skipped
+        step_stats.finite_nonzero_gradient_updates = finite_nonzero_gradient_updates
+        step_stats.max_nonzero_trainable_parameters = max_nonzero_trainable_parameters
     model.to(device)
     for state in optimizer_instance.state.values():
         for key, value in state.items():

@@ -478,7 +478,12 @@ class ProbeInput:
             ),
         )
 
-    def verify(self, object_store: Any) -> dict[str, Any]:
+    def verify(
+        self,
+        object_store: Any,
+        *,
+        expected_manifest_config_version: str | None = None,
+    ) -> dict[str, Any]:
         import json
 
         from gods_mlops.datasets.manifest import canonical_json, content_sha256
@@ -494,6 +499,13 @@ class ProbeInput:
             manifest = json.loads(payload)
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("probe manifest object is not valid UTF-8 JSON") from error
+        manifest_config_version = (
+            self.config_version
+            if expected_manifest_config_version is None
+            else expected_manifest_config_version
+        )
+        if not isinstance(manifest_config_version, str) or not manifest_config_version.strip():
+            raise ValueError("probe manifest config version must be explicit")
         expected = {
             "schema_version": 1,
             "fixture": True,
@@ -501,7 +513,7 @@ class ProbeInput:
             "model_kind": self.model_kind,
             "input_kind": self.input_kind,
             "input_id": self.probe_input_id,
-            "config_version": self.config_version,
+            "config_version": manifest_config_version,
         }
         if not isinstance(manifest, dict) or any(manifest.get(key) != value for key, value in expected.items()):
             raise ValueError("probe manifest content differs from its typed immutable reference")

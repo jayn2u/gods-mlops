@@ -56,6 +56,44 @@ def validate_contrastive_pairs(
     return len(pairs)
 
 
+def _symmetric_clip_loss_from_output(output: Any):
+    """Recompute CLIP's symmetric identity loss from attached logits in FP64."""
+    import torch
+    import torch.nn.functional as functional
+
+    logits = getattr(output, "logits_per_image", None)
+    if not isinstance(logits, torch.Tensor) or logits.ndim != 2 or logits.shape[0] != logits.shape[1]:
+        raise ValueError("CLIP training output must include square attached similarity logits")
+    if logits.shape[0] < 2:
+        raise ValueError("CLIP symmetric identity loss requires at least two examples")
+    logits64 = logits.to(dtype=torch.float64)
+    targets = torch.arange(logits64.shape[0], device=logits64.device)
+    return (
+        functional.cross_entropy(logits64, targets)
+        + functional.cross_entropy(logits64.transpose(0, 1), targets)
+    ) / 2
+
+
+def _clip_training_execution_policy(config: dict[str, Any]) -> dict[str, str] | None:
+    keys = (
+        "forward_precision",
+        "training_loss_policy_version",
+        "training_loss_objective",
+        "training_loss_reduction_precision",
+    )
+    if not any(key in config for key in keys):
+        return None
+    expected = {
+        "forward_precision": "float16-autocast",
+        "training_loss_policy_version": "task9-clip-symmetric-ce-fp64-v1",
+        "training_loss_objective": "symmetric_identity_cross_entropy",
+        "training_loss_reduction_precision": "float64",
+    }
+    if any(config.get(key) != value for key, value in expected.items()):
+        raise ValueError("CLIP training profile has an unsupported loss execution policy")
+    return expected
+
+
 def clip_evaluation_sources(
     manifest: dict[str, Any], *, evaluation_split: str
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
@@ -198,7 +236,11 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         raise ValueError("CLIP measurement requires at least three optimizer steps")
 
     manifest = load_manifest(manifest_uri, config=config)
-    identity = validate_manifest_identity(config, manifest)
+    identity = validate_manifest_identity(
+        config,
+        manifest,
+        probe_manifest_pin=config.get("_probe_manifest_pin"),
+    )
     if phase == "evaluation" or (phase == "probe" and target_phase == "evaluation"):
         started = perf_counter()
         model_lock = locked_model("clip")
@@ -253,6 +295,14 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             started=started,
         )
 
+    execution_policy = _clip_training_execution_policy(config)
+    optimizer_step_options = {
+        "model_kwargs": {"return_loss": execution_policy is None},
+        "loss_from_output": (
+            _symmetric_clip_loss_from_output if execution_policy is not None else None
+        ),
+        "require_finite_nonzero_gradients": execution_policy is not None,
+    }
     pairs, object_store = _pairs_from_manifest(manifest, config, micro_batch)
     pair_count = validate_contrastive_pairs(
         {
@@ -286,6 +336,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             device=device,
             scaler=scaler,
             step_stats=step_stats,
+            expected_execution_policy=execution_policy,
         )
     probe_encoded = (
         _encode_contrastive_batch(pairs, processor=processor, device=device)
@@ -326,7 +377,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
                 optimizer_instance,
                 encoded,
                 scaler=scaler,
-                model_kwargs={"return_loss": True},
+                **optimizer_step_options,
                 max_grad_norm=float(config.get("max_grad_norm", 1.0)),
                 step_stats=step_stats,
                 before_attempt=lambda: _require_optimizer_attempt(config),
@@ -367,6 +418,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             precision="float16-autocast",
             scaler=scaler,
             step_stats=step_stats,
+            execution_policy=execution_policy,
         )
         del model, optimizer_instance, scaler
         import gc
@@ -386,6 +438,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             device=device,
             scaler=scaler,
             step_stats=step_stats,
+            expected_execution_policy=execution_policy,
         )
         if resumed_step != total_steps:
             raise ValueError("CLIP checkpoint resumed at the wrong optimizer step")
@@ -405,7 +458,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
                 optimizer_instance,
                 probe_encoded,
                 scaler=scaler,
-                model_kwargs={"return_loss": True},
+                **optimizer_step_options,
                 max_grad_norm=float(config.get("max_grad_norm", 1.0)),
                 step_stats=step_stats,
                 before_attempt=lambda: _require_optimizer_attempt(config),
@@ -444,6 +497,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         precision="float16-autocast",
         scaler=scaler,
         step_stats=step_stats,
+        execution_policy=execution_policy,
     )
     checkpoint_sha = sha256(checkpoint_payload).hexdigest()
     measurements = resource_measurements(started, optimizer_steps=total_steps)
@@ -470,6 +524,14 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             "amp_overflow_skips": step_stats.amp_overflow_skips,
         }
     )
+    if execution_policy is not None:
+        measurements.update(
+            {
+                **execution_policy,
+                "finite_nonzero_gradient_updates": step_stats.finite_nonzero_gradient_updates,
+                "max_nonzero_trainable_parameters": step_stats.max_nonzero_trainable_parameters,
+            }
+        )
     result_payload, result_sha = model_bundle(
         model,
         output_uri=output_uri,
@@ -810,6 +872,7 @@ def _yield_training_checkpoint(
         precision="float16-autocast",
         scaler=scaler,
         step_stats=step_stats,
+        execution_policy=_clip_training_execution_policy(config),
     )
     commit = config.get("_commit_checkpoint")
     if callable(commit):
