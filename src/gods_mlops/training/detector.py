@@ -73,6 +73,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         checkpoint_identity,
         model_bundle,
         optimizer,
+        OptimizerStepStats,
         require_cuda,
         resource_measurements,
         restore_checkpoint,
@@ -128,6 +129,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
 
     optimizer_instance = optimizer(model, config)
     scaler = torch.amp.GradScaler("cuda", enabled=True)
+    step_stats = OptimizerStepStats()
     weights_before = selected_trainable_weights(model)
     resume_payload = config.get("_resume_payload")
     start_step = 0
@@ -140,6 +142,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             expected_revision=model_lock.revision,
             device=device,
             scaler=scaler,
+            step_stats=step_stats,
         )
     count = int(config.get("optimizer_steps", 3))
     if count < 3:
@@ -155,13 +158,19 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             yielded = True
             break
         inputs = _move_inputs(input_batches[(start_step + step) % len(input_batches)], device)
-        step_optimizer(
-            model,
-            optimizer_instance,
-            inputs,
-            scaler=scaler,
-            max_grad_norm=float(config.get("max_grad_norm", 1.0)),
-        )
+        try:
+            step_optimizer(
+                model,
+                optimizer_instance,
+                inputs,
+                scaler=scaler,
+                max_grad_norm=float(config.get("max_grad_norm", 1.0)),
+                step_stats=step_stats,
+                before_attempt=lambda: _require_optimizer_attempt(config),
+            )
+        except WorkerYieldRequested:
+            yielded = True
+            break
         steps_done += 1
         if not _worker_should_continue(config):
             yielded = True
@@ -175,6 +184,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             model_revision=model_lock.revision,
             precision="float16-autocast",
             scaler=scaler,
+            step_stats=step_stats,
         )
         commit_checkpoint = config.get("_commit_checkpoint")
         if callable(commit_checkpoint):
@@ -189,6 +199,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         model_revision=model_lock.revision,
         precision="float16-autocast",
         scaler=scaler,
+        step_stats=step_stats,
     )
     resume_verified = False
     resumed_steps = 0
@@ -200,7 +211,6 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
                 commit_checkpoint(first_payload)
                 first_payload = b""
             return {"status": "yielded", "checkpoint_payload": first_payload}
-        resumed_steps = 1
         del optimizer_instance, scaler, model
         gc.collect()
         torch.cuda.empty_cache()
@@ -219,11 +229,37 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             expected_revision=model_lock.revision,
             device=device,
             scaler=scaler,
+            step_stats=step_stats,
         )
         if restored_step != steps_done:
             raise ValueError("detector checkpoint resumed at the wrong optimizer step")
         inputs = _move_inputs(input_batches[restored_step % len(input_batches)], device)
-        step_optimizer(model, optimizer_instance, inputs, scaler=scaler)
+        try:
+            step_optimizer(
+                model,
+                optimizer_instance,
+                inputs,
+                scaler=scaler,
+                step_stats=step_stats,
+                before_attempt=lambda: _require_optimizer_attempt(config),
+            )
+        except WorkerYieldRequested:
+            yielded_checkpoint = serialize_checkpoint(
+                model=model,
+                optimizer_instance=optimizer_instance,
+                optimizer_steps=steps_done,
+                identity=checkpoint_identity(config),
+                model_revision=model_lock.revision,
+                precision="float16-autocast",
+                scaler=scaler,
+                step_stats=step_stats,
+            )
+            commit_checkpoint = config.get("_commit_checkpoint")
+            if callable(commit_checkpoint):
+                commit_checkpoint(yielded_checkpoint)
+                yielded_checkpoint = b""
+            return {"status": "yielded", "checkpoint_payload": yielded_checkpoint}
+        resumed_steps = 1
         resume_verified = True
         if not _worker_should_continue(config):
             yielded_checkpoint = serialize_checkpoint(
@@ -234,6 +270,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
                 model_revision=model_lock.revision,
                 precision="float16-autocast",
                 scaler=scaler,
+                step_stats=step_stats,
             )
             commit_checkpoint = config.get("_commit_checkpoint")
             if callable(commit_checkpoint):
@@ -250,6 +287,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         model_revision=model_lock.revision,
         precision="float16-autocast",
         scaler=scaler,
+        step_stats=step_stats,
     )
     checkpoint_sha = sha256(checkpoint_payload).hexdigest()
     measurements = resource_measurements(started, optimizer_steps=optimizer_steps)
@@ -264,6 +302,8 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             "final_weight_sha256": final_weight_sha,
             "model_id": model_lock.model_id,
             "model_revision": model_lock.revision,
+            "optimizer_step_attempts": step_stats.attempts,
+            "amp_overflow_skips": step_stats.amp_overflow_skips,
         }
     )
     metrics = {"status": "succeeded", "resource_measurements": measurements}
@@ -471,3 +511,8 @@ def _output_path(output_uri: str) -> Path:
 def _worker_should_continue(config: dict[str, Any]) -> bool:
     check = config.get("_assert_current")
     return bool(check()) if callable(check) else True
+
+
+def _require_optimizer_attempt(config: dict[str, Any]) -> None:
+    if not _worker_should_continue(config):
+        raise WorkerYieldRequested("Task 7 requested a cooperative detector training stop")

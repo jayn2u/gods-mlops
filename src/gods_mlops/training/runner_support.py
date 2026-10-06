@@ -10,9 +10,10 @@ import subprocess
 import tarfile
 import tempfile
 import time
+from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import torch
@@ -21,6 +22,14 @@ from gods_mlops.jobs.checkpoints import CheckpointIdentity
 from gods_mlops.model_locks import model_cache_path, validate_model_cache
 from .contracts import locked_model, model_lock_path
 from .placement import validate_worker_placement
+
+MAX_AMP_STEP_ATTEMPTS = 32
+
+
+@dataclass(slots=True)
+class OptimizerStepStats:
+    attempts: int = 0
+    amp_overflow_skips: int = 0
 
 
 def require_cuda(expected_gpu_uuid: str | None = None) -> torch.device:
@@ -105,23 +114,52 @@ def step_optimizer(
     scaler: Any,
     model_kwargs: dict[str, Any] | None = None,
     max_grad_norm: float = 1.0,
+    step_stats: OptimizerStepStats | None = None,
+    before_attempt: Callable[[], None] | None = None,
 ) -> float:
-    optimizer_instance.zero_grad(set_to_none=True)
-    with torch.autocast(device_type="cuda", dtype=torch.float16):
-        output = model(**inputs, **(model_kwargs or {}))
-        loss = output.loss
-    if loss is None or not torch.isfinite(loss):
-        raise ValueError("model training loss is not finite")
-    scalar = float(loss.detach().float().cpu())
-    if scalar <= 0:
-        raise ValueError("model training produced no finite non-zero learning signal")
-    scaler.scale(loss).backward()
-    scaler.unscale_(optimizer_instance)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    scaler.step(optimizer_instance)
-    scaler.update()
-    torch.cuda.synchronize()
-    return scalar
+    stats = step_stats if step_stats is not None else OptimizerStepStats()
+    buffers_before: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    for _attempt in range(MAX_AMP_STEP_ATTEMPTS):
+        if before_attempt is not None:
+            before_attempt()
+        if buffers_before is None:
+            buffers_before = [
+                (buffer, buffer.detach().clone()) for buffer in model.buffers()
+            ]
+        stats.attempts += 1
+        optimizer_instance.zero_grad(set_to_none=True)
+        scale_before = float(scaler.get_scale())
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            output = model(**inputs, **(model_kwargs or {}))
+            loss = output.loss
+        if loss is None or not torch.isfinite(loss):
+            raise ValueError("model training loss is not finite")
+        scalar = float(loss.detach().float().cpu())
+        if scalar <= 0:
+            raise ValueError("model training produced no finite non-zero learning signal")
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer_instance)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        scaler.step(optimizer_instance)
+        scaler.update()
+        if float(scaler.get_scale()) < scale_before:
+            stats.amp_overflow_skips += 1
+            optimizer_instance.zero_grad(set_to_none=True)
+            _restore_buffers(buffers_before)
+            continue
+        torch.cuda.synchronize()
+        return scalar
+    raise ValueError(
+        f"GradScaler skipped optimizer updates after {MAX_AMP_STEP_ATTEMPTS} attempts"
+    )
+
+
+def _restore_buffers(buffers: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+    if not buffers:
+        return
+    with torch.no_grad():
+        for buffer, original in buffers:
+            buffer.copy_(original)
 
 
 def cpu_state(value: Any) -> Any:
@@ -145,7 +183,17 @@ def serialize_checkpoint(
     model_revision: str,
     precision: str,
     scaler: Any,
+    step_stats: OptimizerStepStats | None = None,
 ) -> bytes:
+    stats = step_stats if step_stats is not None else OptimizerStepStats(attempts=optimizer_steps)
+    if (
+        type(optimizer_steps) is not int
+        or optimizer_steps < 0
+        or type(stats.attempts) is not int
+        or type(stats.amp_overflow_skips) is not int
+        or stats.attempts != optimizer_steps + stats.amp_overflow_skips
+    ):
+        raise ValueError("checkpoint optimizer attempt counters do not match completed updates")
     payload = io.BytesIO()
     torch.save(
         {
@@ -154,6 +202,8 @@ def serialize_checkpoint(
             "model_revision": model_revision,
             "precision": precision,
             "optimizer_steps": optimizer_steps,
+            "optimizer_step_attempts": stats.attempts,
+            "amp_overflow_skips": stats.amp_overflow_skips,
             "model_state_dict": cpu_state(model.state_dict()),
             "optimizer_state_dict": cpu_state(optimizer_instance.state_dict()),
             "scaler_state_dict": cpu_state(scaler.state_dict()),
@@ -172,6 +222,7 @@ def restore_checkpoint(
     expected_revision: str,
     device: torch.device,
     scaler: Any,
+    step_stats: OptimizerStepStats | None = None,
 ) -> int:
     checkpoint = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=False)
     if checkpoint.get("format") != "gods-mlops-training-checkpoint-v1":
@@ -183,9 +234,22 @@ def restore_checkpoint(
     step = checkpoint.get("optimizer_steps")
     if not isinstance(step, int) or step < 0:
         raise ValueError("checkpoint optimizer step is invalid")
+    attempts = checkpoint.get("optimizer_step_attempts", step)
+    skipped = checkpoint.get("amp_overflow_skips", 0)
+    if (
+        type(attempts) is not int
+        or attempts < 0
+        or type(skipped) is not int
+        or skipped < 0
+        or attempts != step + skipped
+    ):
+        raise ValueError("checkpoint optimizer attempt counters are invalid")
     model.load_state_dict(checkpoint["model_state_dict"], strict=True)
     optimizer_instance.load_state_dict(checkpoint["optimizer_state_dict"])
     scaler.load_state_dict(checkpoint["scaler_state_dict"])
+    if step_stats is not None:
+        step_stats.attempts = attempts
+        step_stats.amp_overflow_skips = skipped
     model.to(device)
     for state in optimizer_instance.state.values():
         for key, value in state.items():

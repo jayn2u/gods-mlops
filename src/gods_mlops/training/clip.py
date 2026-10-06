@@ -6,6 +6,7 @@ from hashlib import sha256
 from time import perf_counter
 from typing import Any
 
+from .claims import WorkerYieldRequested
 from .contracts import load_manifest, locked_model, validate_manifest_identity
 from .data import load_rgb_image
 
@@ -67,6 +68,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         checkpoint_identity,
         model_bundle,
         optimizer,
+        OptimizerStepStats,
         require_cuda,
         resource_measurements,
         restore_checkpoint,
@@ -110,6 +112,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
     model.train()
     optimizer_instance = optimizer(model, config)
     scaler = torch.amp.GradScaler("cuda", enabled=True)
+    step_stats = OptimizerStepStats()
     initial_weights = selected_trainable_weights(model)
     resume_payload = config.get("_resume_payload")
     start_step = 0
@@ -122,6 +125,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             expected_revision=model_lock.revision,
             device=device,
             scaler=scaler,
+            step_stats=step_stats,
         )
     probe_encoded = (
         _encode_contrastive_batch(pairs, processor=processor, device=device)
@@ -139,6 +143,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
                 scaler=scaler,
                 optimizer_steps=steps_done,
                 model_revision=model_lock.revision,
+                step_stats=step_stats,
             )
         if config.get("phase") == "probe":
             encoded = probe_encoded
@@ -155,16 +160,28 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             )
         from .runner_support import step_optimizer
 
-        losses.append(
-            step_optimizer(
+        try:
+            loss = step_optimizer(
                 model,
                 optimizer_instance,
                 encoded,
                 scaler=scaler,
                 model_kwargs={"return_loss": True},
                 max_grad_norm=float(config.get("max_grad_norm", 1.0)),
+                step_stats=step_stats,
+                before_attempt=lambda: _require_optimizer_attempt(config),
             )
-        )
+        except WorkerYieldRequested:
+            return _yield_training_checkpoint(
+                config=config,
+                model=model,
+                optimizer_instance=optimizer_instance,
+                scaler=scaler,
+                optimizer_steps=steps_done,
+                model_revision=model_lock.revision,
+                step_stats=step_stats,
+            )
+        losses.append(loss)
         steps_done += 1
         if not _worker_should_continue(config):
             return _yield_training_checkpoint(
@@ -174,6 +191,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
                 scaler=scaler,
                 optimizer_steps=steps_done,
                 model_revision=model_lock.revision,
+                step_stats=step_stats,
             )
     total_steps = steps_done
     initial_probe_steps = steps
@@ -188,6 +206,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             model_revision=model_lock.revision,
             precision="float16-autocast",
             scaler=scaler,
+            step_stats=step_stats,
         )
         del model, optimizer_instance, scaler
         import gc
@@ -206,6 +225,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             expected_revision=model_lock.revision,
             device=device,
             scaler=scaler,
+            step_stats=step_stats,
         )
         if resumed_step != total_steps:
             raise ValueError("CLIP checkpoint resumed at the wrong optimizer step")
@@ -217,19 +237,32 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
                 scaler=scaler,
                 optimizer_steps=total_steps,
                 model_revision=model_lock.revision,
+                step_stats=step_stats,
             )
-        resumed = True
-        resume_steps = 1
-        losses.append(
-            step_optimizer(
+        try:
+            loss = step_optimizer(
                 model,
                 optimizer_instance,
                 probe_encoded,
                 scaler=scaler,
                 model_kwargs={"return_loss": True},
                 max_grad_norm=float(config.get("max_grad_norm", 1.0)),
+                step_stats=step_stats,
+                before_attempt=lambda: _require_optimizer_attempt(config),
             )
-        )
+        except WorkerYieldRequested:
+            return _yield_training_checkpoint(
+                config=config,
+                model=model,
+                optimizer_instance=optimizer_instance,
+                scaler=scaler,
+                optimizer_steps=total_steps,
+                model_revision=model_lock.revision,
+                step_stats=step_stats,
+            )
+        resumed = True
+        resume_steps = 1
+        losses.append(loss)
         total_steps += 1
         if not _worker_should_continue(config):
             return _yield_training_checkpoint(
@@ -239,6 +272,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
                 scaler=scaler,
                 optimizer_steps=total_steps,
                 model_revision=model_lock.revision,
+                step_stats=step_stats,
             )
     initial_weight_sha, final_weight_sha = assert_weights_changed(initial_weights, model)
     checkpoint_payload = serialize_checkpoint(
@@ -249,6 +283,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         model_revision=model_lock.revision,
         precision="float16-autocast",
         scaler=scaler,
+        step_stats=step_stats,
     )
     checkpoint_sha = sha256(checkpoint_payload).hexdigest()
     measurements = resource_measurements(started, optimizer_steps=total_steps)
@@ -271,6 +306,8 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             "model_revision": model_lock.revision,
             "source_manifest_kind": identity["input_kind"],
             "s3_object_store_verified": object_store is not None,
+            "optimizer_step_attempts": step_stats.attempts,
+            "amp_overflow_skips": step_stats.amp_overflow_skips,
         }
     )
     result_payload, result_sha = model_bundle(
@@ -392,6 +429,11 @@ def _worker_should_continue(config: dict[str, Any]) -> bool:
     return bool(check()) if callable(check) else True
 
 
+def _require_optimizer_attempt(config: dict[str, Any]) -> None:
+    if not _worker_should_continue(config):
+        raise WorkerYieldRequested("Task 7 requested a cooperative CLIP training stop")
+
+
 def _yield_training_checkpoint(
     *,
     config: dict[str, Any],
@@ -400,6 +442,7 @@ def _yield_training_checkpoint(
     scaler: Any,
     optimizer_steps: int,
     model_revision: str,
+    step_stats: Any,
 ) -> dict[str, Any]:
     from .runner_support import checkpoint_identity, serialize_checkpoint
 
@@ -411,6 +454,7 @@ def _yield_training_checkpoint(
         model_revision=model_revision,
         precision="float16-autocast",
         scaler=scaler,
+        step_stats=step_stats,
     )
     commit = config.get("_commit_checkpoint")
     if callable(commit):
