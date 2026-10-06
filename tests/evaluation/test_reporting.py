@@ -389,10 +389,19 @@ class EvaluationReportTests(unittest.TestCase):
         from hashlib import sha256
 
         manifest_sha = sha256(canonical_json(manifest)).hexdigest()
+        class_mapping = {
+            "model_revision": "locked-detr-revision",
+            "model_class_index": 1,
+            "model_class_name": "person",
+            "coco_category_id": 1,
+            "coco_category_name": "person",
+        }
         report = create_report(
             manifest=manifest,
             prediction_payload={
                 "model_kind": "detr",
+                "model_revision": "locked-detr-revision",
+                "person_class_mapping": class_mapping,
                 "input_sha256": manifest_sha,
                 "drafts": [
                     {
@@ -405,7 +414,11 @@ class EvaluationReportTests(unittest.TestCase):
             },
             model_kind="detr",
             evaluation_split="test",
-            candidate={"checkpoint_sha256": "b" * 64, "model_id": "sha256:" + "b" * 64},
+            candidate={
+                "checkpoint_sha256": "b" * 64,
+                "model_id": "sha256:" + "b" * 64,
+                "model_revision": "locked-detr-revision",
+            },
             baseline=None,
             source={
                 "dataset_version": manifest["dataset_version"],
@@ -413,8 +426,18 @@ class EvaluationReportTests(unittest.TestCase):
                 "manifest_sha256": manifest_sha,
                 "target": "detr",
             },
-            evaluation_config={"version": "detr-eval-v1", "sha256": "c" * 64, "score_threshold": 0.5, "max_detections": 100},
+            evaluation_config={
+                "version": "detr-eval-v1",
+                "sha256": "c" * 64,
+                "settings": {"score_threshold": 0.5, "max_detections": 100},
+            },
             current_eligibility={"training_eligible": True, "evaluation_eligible": True, "impacts": []},
+            evaluator_provenance={
+                "evaluator_revision": "sha256:" + "1" * 64,
+                "worker_image_id": "sha256:" + "2" * 64,
+                "model_revision": "locked-detr-revision",
+                "person_class_mapping": class_mapping,
+            },
         )
 
         self.assertEqual(report["execution_status"], "succeeded")
@@ -467,6 +490,7 @@ class EvaluationReportTests(unittest.TestCase):
             manifest=manifest,
             prediction_payload={
                 "model_kind": "clip",
+                "model_revision": "locked-clip-revision",
                 "input_sha256": manifest_sha,
                 "query_embeddings": {"query-1": [1.0, 0.0]},
                 "crop_embeddings": {
@@ -476,7 +500,11 @@ class EvaluationReportTests(unittest.TestCase):
             },
             model_kind="clip",
             evaluation_split="test",
-            candidate={"checkpoint_sha256": "b" * 64, "model_id": "sha256:" + "b" * 64},
+            candidate={
+                "checkpoint_sha256": "b" * 64,
+                "model_id": "sha256:" + "b" * 64,
+                "model_revision": "locked-clip-revision",
+            },
             baseline=None,
             source={
                 "dataset_version": manifest["dataset_version"],
@@ -486,12 +514,146 @@ class EvaluationReportTests(unittest.TestCase):
             },
             evaluation_config={"version": "clip-eval-v1", "sha256": "c" * 64, "split": "test"},
             current_eligibility={"training_eligible": True, "evaluation_eligible": True, "impacts": []},
+            evaluator_provenance={
+                "evaluator_revision": "sha256:" + "1" * 64,
+                "worker_image_id": "sha256:" + "2" * 64,
+                "model_revision": "locked-clip-revision",
+            },
         )
 
         self.assertEqual(report["status"], "complete")
         self.assertEqual(report["metrics"]["hit_rate@1"], 1.0)
         self.assertEqual(report["metrics"]["map"], 1.0)
         self.assertEqual(report["sample_counts"]["gallery_crops"], 20)
+
+    def test_worker_profile_settings_drive_detr_metrics_and_report_protocol(self) -> None:
+        create_report = _require("gods_mlops.evaluation.report", "evaluate_prediction_payload")
+        manifest = {
+            "schema_version": 1,
+            "dataset_version": "dataset-2026-10-01-a1b2c3d4",
+            "target": "detr",
+            "training": {"ready": True, "reason_codes": []},
+            "evaluation": {"eligible": True, "reason_codes": []},
+            "split_counts": {
+                "test": {"groups": 3, "frames": 20, "positive_frames": 10, "negative_frames": 5}
+            },
+            "items": [],
+        }
+        from gods_mlops.datasets.manifest import canonical_json
+        from hashlib import sha256
+
+        manifest_sha = sha256(canonical_json(manifest)).hexdigest()
+        class_mapping = {
+            "model_revision": "locked-detr-revision",
+            "model_class_index": 17,
+            "model_class_name": "person",
+            "coco_category_id": 1,
+            "coco_category_name": "person",
+        }
+        provenance = {
+            "evaluator_revision": "sha256:" + "1" * 64,
+            "worker_image_id": "sha256:" + "2" * 64,
+            "model_revision": "locked-detr-revision",
+            "person_class_mapping": class_mapping,
+        }
+        with patch(
+            "gods_mlops.evaluation.report.evaluate_detections",
+            return_value={
+                "status": "complete",
+                "metrics": {"ap_50_95": 0.5, "ap_50": 0.8, "ar": 0.6},
+                "counts": {"frames": 20, "person_ground_truth": 10},
+                "settings": {"score_threshold": 0.8, "max_detections": 200},
+                "reasons": [],
+            },
+        ) as metric:
+            report = create_report(
+                manifest=manifest,
+                prediction_payload={
+                    "model_kind": "detr",
+                    "model_revision": "locked-detr-revision",
+                    "person_class_mapping": class_mapping,
+                    "input_sha256": manifest_sha,
+                    "drafts": [],
+                },
+                model_kind="detr",
+                evaluation_split="test",
+                candidate={"model_kind": "detr", "model_revision": "locked-detr-revision", "checkpoint_sha256": "b" * 64},
+                baseline=None,
+                source={"dataset_version": manifest["dataset_version"], "manifest_sha256": manifest_sha},
+                evaluation_config={
+                    "version": "detr-eval-v2",
+                    "sha256": "c" * 64,
+                    "split": "test",
+                    "settings": {"score_threshold": 0.8, "max_detections": 200},
+                },
+                current_eligibility={"training_eligible": True, "evaluation_eligible": True, "impacts": []},
+                evaluator_provenance=provenance,
+            )
+
+        self.assertEqual(metric.call_args.kwargs["score_threshold"], 0.8)
+        self.assertEqual(metric.call_args.kwargs["max_detections"], 200)
+        self.assertEqual(report["evaluation_config"]["score_threshold"], 0.8)
+        self.assertEqual(report["evaluation_config"]["max_detections"], 200)
+        self.assertEqual(report["metric_settings"]["score_threshold"], 0.8)
+        self.assertEqual(report["metric_settings"]["max_detections"], 200)
+        self.assertEqual(report["evaluation_provenance"]["person_class_mapping"]["model_class_index"], 17)
+
+    def test_owned_readback_rejects_missing_or_tampered_evaluator_provenance(self) -> None:
+        validate = _require("gods_mlops.evaluation.report", "validate_owned_evaluation_provenance")
+        class_mapping = {
+            "model_revision": "locked-detr-revision",
+            "model_class_index": 17,
+            "model_class_name": "person",
+            "coco_category_id": 1,
+            "coco_category_name": "person",
+        }
+        report = {
+            "model_kind": "detr",
+            "candidate": {"model_revision": "locked-detr-revision"},
+            "predictions": {
+                "model_revision": "locked-detr-revision",
+                "person_class_mapping": class_mapping,
+            },
+            "evaluation_provenance": {
+                "evaluator_revision": "sha256:" + "1" * 64,
+                "worker_image_id": "sha256:" + "2" * 64,
+                "model_revision": "locked-detr-revision",
+                "person_class_mapping": class_mapping,
+            },
+        }
+
+        provenance = validate(
+            report,
+            expected_evaluator_revision="sha256:" + "1" * 64,
+            expected_worker_image_id="sha256:" + "2" * 64,
+            expected_model_revision="locked-detr-revision",
+        )
+
+        self.assertEqual(provenance["person_class_mapping"]["model_class_index"], 17)
+        for bad in (
+            {"model_kind": "detr"},
+            {
+                **report,
+                "evaluation_provenance": {
+                    **report["evaluation_provenance"],
+                    "worker_image_id": "sha256:" + "3" * 64,
+                },
+            },
+            {
+                **report,
+                "evaluation_provenance": {
+                    **report["evaluation_provenance"],
+                    "person_class_mapping": {**class_mapping, "coco_category_id": 2},
+                },
+            },
+        ):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                validate(
+                    bad,
+                    expected_evaluator_revision="sha256:" + "1" * 64,
+                    expected_worker_image_id="sha256:" + "2" * 64,
+                    expected_model_revision="locked-detr-revision",
+                )
 
 
 if __name__ == "__main__":

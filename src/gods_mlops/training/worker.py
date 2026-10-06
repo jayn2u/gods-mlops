@@ -237,8 +237,6 @@ async def run_worker() -> int:
         if claim.phase == "evaluation":
             if evaluation_publisher is None or evaluation_model_id is None:
                 raise WorkerAuthorizationError("evaluation lineage publisher is unavailable")
-            from gods_mlops.evaluation.eligibility import evaluation_readiness
-            from gods_mlops.evaluation.report import evaluate_prediction_payload
 
             prediction_payload = result.get("result_artifact_payload")
             if not isinstance(prediction_payload, bytes) or not prediction_payload:
@@ -253,20 +251,11 @@ async def run_worker() -> int:
                 model_id=evaluation_model_id,
                 dataset_version=str(claim.dataset_version),
             )
-            readiness = evaluation_readiness(
-                manifest,
-                current_lineage,
-                model_kind=claim.model_kind,
-                evaluation_split=str(config["evaluation_split"]),
-            )
-            if not readiness["training_ready"] or not readiness["evaluation_eligible"]:
-                raise WorkerAuthorizationError("evaluation eligibility changed before report publication")
             checkpoint_source = EvaluationCheckpointSource.from_dict(job["source_refs"]["checkpoint"])
-            evaluation_report = evaluate_prediction_payload(
+            evaluation_report = _build_owned_evaluation_report(
                 manifest=manifest,
                 prediction_payload=predictions,
-                model_kind=claim.model_kind,
-                evaluation_split=str(config["evaluation_split"]),
+                claim=claim,
                 candidate=config["_evaluation_candidate"],
                 baseline=config.get("_evaluation_baseline"),
                 source={
@@ -283,7 +272,8 @@ async def run_worker() -> int:
                     "split": config["evaluation_split"],
                     "settings": profile.get("config_json", {}),
                 },
-                current_eligibility=readiness,
+                current_lineage=current_lineage,
+                model_revision=model.revision,
             )
             evaluation_report["evaluation_job"] = {
                 "job_id": claim.job_id,
@@ -375,6 +365,49 @@ async def run_worker() -> int:
             await evaluation_publisher.close()
         await repository.close()
         await sources.close()
+
+
+def _build_owned_evaluation_report(
+    *,
+    manifest: dict[str, Any],
+    prediction_payload: dict[str, Any],
+    claim: Any,
+    candidate: dict[str, Any],
+    baseline: dict[str, Any] | None,
+    source: dict[str, Any],
+    evaluation_config: dict[str, Any],
+    current_lineage: dict[str, Any],
+    model_revision: str,
+) -> dict[str, Any]:
+    """Compose raw current authority with the owned prediction and bound runtime identity."""
+    from gods_mlops.evaluation.provenance import build_owned_evaluation_provenance
+    from gods_mlops.evaluation.report import evaluate_prediction_payload
+
+    if claim.phase != "evaluation" or claim.target_phase != "evaluation":
+        raise WorkerAuthorizationError("owned evaluation report requires an evaluation-phase worker claim")
+    if candidate.get("model_revision") != model_revision:
+        raise WorkerAuthorizationError("candidate checkpoint model revision differs from the loaded model")
+    provenance = build_owned_evaluation_provenance(
+        worker_image_id=claim.image_id,
+        model_revision=model_revision,
+        model_kind=claim.model_kind,
+        prediction_payload=prediction_payload,
+    )
+    report = evaluate_prediction_payload(
+        manifest=manifest,
+        prediction_payload=prediction_payload,
+        model_kind=claim.model_kind,
+        evaluation_split=str(evaluation_config["split"]),
+        candidate=candidate,
+        baseline=baseline,
+        source=source,
+        evaluation_config=evaluation_config,
+        current_eligibility=current_lineage,
+        evaluator_provenance=provenance,
+    )
+    if report.get("training_ready") is not True or report.get("evaluation_eligible") is not True:
+        raise WorkerAuthorizationError("evaluation eligibility changed before report publication")
+    return report
 
 
 async def _worker_manifest(

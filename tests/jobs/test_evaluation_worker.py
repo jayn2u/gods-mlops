@@ -5,6 +5,8 @@ import hashlib
 import importlib
 import unittest
 from uuid import uuid4
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from gods_mlops.jobs.checkpoints import CheckpointIdentity
 from gods_mlops.jobs.models import EvaluationCheckpointSource, ProbeInput
@@ -146,6 +148,89 @@ class EvaluationWorkerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(WorkerAuthorizationError, "late_cross_boundary_link"):
             asyncio.run(validate_current_worker_claim(Queue(), claim))
+
+    def test_worker_to_report_composition_preserves_raw_current_lineage(self) -> None:
+        compose_report = _require("gods_mlops.training.worker", "_build_owned_evaluation_report")
+        dataset_version = "dataset-2026-10-01-a1b2c3d4"
+        manifest = {
+            "schema_version": 1,
+            "dataset_version": dataset_version,
+            "target": "detr",
+            "training": {"ready": True, "reason_codes": []},
+            "evaluation": {"eligible": True, "reason_codes": []},
+            "split_counts": {
+                "test": {"groups": 3, "frames": 20, "positive_frames": 10, "negative_frames": 5}
+            },
+            "items": [],
+        }
+        from gods_mlops.datasets.manifest import canonical_json
+
+        manifest_sha = hashlib.sha256(canonical_json(manifest)).hexdigest()
+        authority = {
+            "dataset_version": dataset_version,
+            "training_eligible": True,
+            "evaluation_eligible": True,
+            "training_reasons": [],
+            "evaluation_reasons": [],
+            "impacts": [],
+        }
+        class_mapping = {
+            "model_revision": "locked-detr-revision",
+            "model_class_index": 17,
+            "model_class_name": "person",
+            "coco_category_id": 1,
+            "coco_category_name": "person",
+        }
+        claim = SimpleNamespace(
+            phase="evaluation",
+            target_phase="evaluation",
+            model_kind="detr",
+            dataset_version=dataset_version,
+            image_id="sha256:" + "2" * 64,
+        )
+        with patch(
+            "gods_mlops.evaluation.report.evaluate_detections",
+            return_value={
+                "status": "complete",
+                "metrics": {"ap_50_95": 0.5, "ap_50": 0.8, "ar": 0.6},
+                "counts": {"frames": 20, "person_ground_truth": 10},
+                "settings": {"score_threshold": 0.8, "max_detections": 200},
+                "reasons": [],
+            },
+        ):
+            report = compose_report(
+                manifest=manifest,
+                prediction_payload={
+                    "model_kind": "detr",
+                    "model_revision": "locked-detr-revision",
+                    "person_class_mapping": class_mapping,
+                    "input_sha256": manifest_sha,
+                    "drafts": [],
+                },
+                claim=claim,
+                candidate={
+                    "model_kind": "detr",
+                    "model_revision": "locked-detr-revision",
+                    "checkpoint_sha256": "b" * 64,
+                    "verified": True,
+                },
+                baseline=None,
+                source={"dataset_version": dataset_version, "manifest_sha256": manifest_sha},
+                evaluation_config={
+                    "version": "detr-eval-v2",
+                    "sha256": "c" * 64,
+                    "split": "test",
+                    "settings": {"score_threshold": 0.8, "max_detections": 200},
+                },
+                current_lineage=authority,
+                model_revision="locked-detr-revision",
+            )
+
+        self.assertEqual(report["status"], "complete")
+        self.assertTrue(report["training_ready"])
+        self.assertEqual(report["training_reasons"], [])
+        self.assertNotIn("dataset_not_training_ready", report["insufficient_reasons"])
+        self.assertEqual(report["evaluation_provenance"]["worker_image_id"], claim.image_id)
 
     def test_evaluation_profile_probe_is_inference_only_and_has_explicit_fixture_identity(self) -> None:
         expected_kind = _require("gods_mlops.training.worker", "_expected_result_kind")

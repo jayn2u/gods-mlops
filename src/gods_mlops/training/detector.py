@@ -111,6 +111,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
     person_class_id = next((key for key, value in id2label.items() if value == "person"), None)
     if person_class_id is None:
         raise ValueError("locked RT-DETRv2 revision has no person class mapping")
+    person_class_name = id2label[person_class_id]
     output_path = _output_path(output_uri)
 
     if phase == "evaluation":
@@ -132,6 +133,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
             items=items,
             images=images,
             person_class_id=person_class_id,
+            person_class_name=person_class_name,
             device=device,
             output_uri=output_uri,
             output_path=output_path,
@@ -351,6 +353,7 @@ def _draft_detections(
     items: list[dict[str, Any]],
     images: list[Image.Image],
     person_class_id: int,
+    person_class_name: str,
     device: Any,
     output_uri: str,
     output_path: Path,
@@ -362,10 +365,44 @@ def _draft_detections(
     if not 0 <= threshold <= 1:
         raise ValueError("detector score threshold must be between zero and one")
     model.eval()
-    drafts = []
+    evaluation = config.get("phase") == "evaluation" and config.get("target_phase") == "evaluation"
+    drafts: list[dict[str, Any]] = []
+    next_index = 0
+    if evaluation:
+        from gods_mlops.evaluation.report import decode_evaluation_cursor
+
+        resume_payload = config.get("_evaluation_resume_payload")
+        if isinstance(resume_payload, bytes):
+            cursor = decode_evaluation_cursor(
+                resume_payload,
+                expected_identity=config["_evaluation_job_identity"],
+                expected_candidate_checkpoint_sha256=str(config["_evaluation_checkpoint_sha256"]),
+                expected_manifest_sha256=str(config["input_sha256"]),
+                expected_config_sha256=str(config["config_sha256"]),
+            )
+            saved = cursor["predictions"]
+            if not isinstance(saved, dict) or saved.get("stage") != "detection_frames":
+                raise ValueError("DETR evaluation cursor stage is invalid")
+            saved_drafts = saved.get("drafts")
+            if not isinstance(saved_drafts, list):
+                raise ValueError("DETR evaluation cursor has no completed frame predictions")
+            next_index = cursor["next_index"]
+            if next_index > len(items) or len(saved_drafts) != next_index:
+                raise ValueError("DETR evaluation cursor frame index differs from its predictions")
+            expected_completed = [str(item.get("item_id", item.get("sample_id"))) for item in items[:next_index]]
+            if [draft.get("item_id") for draft in saved_drafts if isinstance(draft, dict)] != expected_completed:
+                raise ValueError("DETR evaluation cursor completed frame identities changed")
+            drafts.extend(saved_drafts)
     with torch.inference_mode():
-        for item, image in zip(items, images, strict=True):
+        for index in range(next_index, len(items)):
+            item, image = items[index], images[index]
             if not _worker_should_continue(config):
+                if evaluation:
+                    return _yield_detr_evaluation_cursor(
+                        config=config,
+                        drafts=drafts,
+                        next_index=index,
+                    )
                 raise WorkerYieldRequested("Task 7 requested a cooperative detector draft stop")
             inputs = processor(images=image, return_tensors="pt")
             inputs = _move_inputs(inputs, device)
@@ -386,8 +423,6 @@ def _draft_detections(
                         "bbox_xyxy": [float(value) for value in box.cpu().tolist()],
                     }
                 )
-            if not _worker_should_continue(config):
-                raise WorkerYieldRequested("Task 7 requested a cooperative detector draft stop")
             drafts.append(
                 {
                     "item_id": str(item.get("item_id", item.get("sample_id"))),
@@ -396,6 +431,14 @@ def _draft_detections(
                     "detections": detections,
                 }
             )
+            if not _worker_should_continue(config):
+                if evaluation:
+                    return _yield_detr_evaluation_cursor(
+                        config=config,
+                        drafts=drafts,
+                        next_index=index + 1,
+                    )
+                raise WorkerYieldRequested("Task 7 requested a cooperative detector draft stop")
     output = {
         "schema_version": 1,
         "model_kind": "detr",
@@ -407,10 +450,18 @@ def _draft_detections(
         "score_threshold": threshold,
         "drafts": drafts,
     }
+    if evaluation:
+        output["person_class_mapping"] = {
+            "model_revision": identity["model_revision"],
+            "model_class_index": person_class_id,
+            "model_class_name": person_class_name,
+            "coco_category_id": 1,
+            "coco_category_name": "person",
+        }
     encoded = write_json(output_path / "draft-detections.json", output)
     digest = sha256(encoded).hexdigest()
     measurements = _draft_resource_measurements(
-        resource_measurements(started, optimizer_steps=0, inference_steps=len(images)),
+        resource_measurements(started, optimizer_steps=0, inference_steps=len(drafts)),
         identity=identity,
     )
     result_uri = None
@@ -427,6 +478,25 @@ def _draft_detections(
         "result_artifact_payload": encoded,
         "resource_measurements": measurements,
     }
+
+
+def _yield_detr_evaluation_cursor(
+    *,
+    config: dict[str, Any],
+    drafts: list[dict[str, Any]],
+    next_index: int,
+) -> dict[str, Any]:
+    from gods_mlops.evaluation.report import encode_evaluation_cursor
+
+    payload = encode_evaluation_cursor(
+        identity=config["_evaluation_job_identity"],
+        candidate_checkpoint_sha256=str(config["_evaluation_checkpoint_sha256"]),
+        manifest_sha256=str(config["input_sha256"]),
+        config_sha256=str(config["config_sha256"]),
+        next_index=next_index,
+        predictions={"stage": "detection_frames", "drafts": drafts},
+    )
+    return {"status": "yielded", "checkpoint_payload": payload}
 
 
 def _detector_items(manifest: dict[str, Any], config: dict[str, Any]) -> list[dict[str, Any]]:

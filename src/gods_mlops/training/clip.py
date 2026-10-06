@@ -620,6 +620,7 @@ def _run_clip_evaluation(
         document = {
             "schema_version": 1,
             "model_kind": "clip",
+            "model_revision": model_revision,
             "input_id": identity["input_id"],
             "input_sha256": identity["input_sha256"],
             "query_count": len(queries),
@@ -633,6 +634,7 @@ def _run_clip_evaluation(
         document = {
             "schema_version": 1,
             "model_kind": "clip",
+            "model_revision": model_revision,
             "input_id": identity["input_id"],
             "input_sha256": identity["input_sha256"],
             "query_embeddings": state["query_embeddings"],

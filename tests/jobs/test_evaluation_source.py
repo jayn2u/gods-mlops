@@ -52,6 +52,49 @@ def _checkpoint_source():
 
 
 class EvaluationCheckpointSourceTests(unittest.TestCase):
+    def test_training_and_evaluation_transaction_predicates_share_one_locked_source_reader(self) -> None:
+        registry_type = _require("gods_mlops.jobs.sources", "DatasetSourceRegistry")
+        _require("gods_mlops.jobs.sources", "_current_dataset_source_in_transaction")
+        source = DatasetTrainingSource(
+            dataset_version="dataset-2026-10-01-a1b2c3d4",
+            target="both",
+            manifest_sha256="a" * 64,
+            state="published",
+            training_ready=True,
+            training_reasons=(),
+            evaluation_eligible=False,
+            evaluation_reasons=("late_cross_boundary_link",),
+            invalidated_source_count=0,
+            leakage_impact_count=1,
+        )
+        registry = object.__new__(registry_type)
+        connection = object()
+
+        async def read_phase_reasons():
+            training = await registry.training_block_reasons_in_transaction(
+                connection,
+                dataset_version=source.dataset_version,
+                model_kind="detr",
+            )
+            evaluation = await registry.evaluation_block_reasons_in_transaction(
+                connection,
+                dataset_version=source.dataset_version,
+                model_kind="detr",
+            )
+            return training, evaluation
+
+        with patch(
+            "gods_mlops.jobs.sources._current_dataset_source_in_transaction",
+            new_callable=AsyncMock,
+            return_value=source,
+        ) as read_source:
+            training_reasons, evaluation_reasons = asyncio.run(read_phase_reasons())
+
+        self.assertEqual(read_source.await_count, 2)
+        self.assertEqual(training_reasons, ())
+        self.assertIn("late_cross_boundary_link", evaluation_reasons)
+        self.assertIn("dataset_not_evaluation_eligible", evaluation_reasons)
+
     def test_checkpoint_source_round_trips_full_training_identity_and_content_hash(self) -> None:
         source = _checkpoint_source()
         source_type = type(source)
@@ -458,6 +501,310 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
             )
 
         self.assertEqual(events, ["global_ledger_lock", "current_evaluation_source_check"])
+
+    def test_save_checkpoint_facade_rechecks_invalidation_at_commit_after_durable_intent(self) -> None:
+        from gods_mlops.jobs.queue import DatasetNotReadyForEvaluationError, JobQueue, PostgresJobQueueRepository
+
+        checkpoint_source = _checkpoint_source()
+        job_id = "e4d82c26-8f0a-4f45-8b88-5fe84302d948"
+        lease_token = "8ad96890-3434-4f07-85bb-8cde17a2b009"
+        identity = CheckpointIdentity(
+            job_id=job_id,
+            input_kind="dataset_version",
+            input_id=checkpoint_source.dataset_version,
+            input_sha256=checkpoint_source.training_manifest_sha256,
+            phase="evaluation",
+            model_kind=checkpoint_source.model_kind,
+            config_version="clip-evaluation-v1",
+            config_sha256="e" * 64,
+            dataset_version=checkpoint_source.dataset_version,
+        )
+        eval_job = {
+            "job_id": job_id,
+            "state": "running",
+            "lease_token": lease_token,
+            "lease_generation": 3,
+            "phase": "evaluation",
+            "target_phase": "evaluation",
+            "input_kind": "dataset_version",
+            "input_id": checkpoint_source.dataset_version,
+            "input_sha256": checkpoint_source.training_manifest_sha256,
+            "dataset_version": checkpoint_source.dataset_version,
+            "model_kind": checkpoint_source.model_kind,
+            "config_version": identity.config_version,
+            "config_sha256": identity.config_sha256,
+            "checkpoint_uri": None,
+            "checkpoint_sha256": None,
+            "checkpoint_identity": {},
+            "source_refs": {
+                "schema": "gods-mlops-evaluation-source-v1",
+                "dataset_version": checkpoint_source.dataset_version,
+                "manifest_sha256": checkpoint_source.training_manifest_sha256,
+                "target": "both",
+                "evaluation_split": "test",
+                "checkpoint": checkpoint_source.as_dict(),
+            },
+        }
+        training_job = {
+            "job_id": checkpoint_source.training_job_id,
+            "state": "completed",
+            "phase": "training",
+            "target_phase": "training",
+            "profile_state_snapshot": "measured",
+            "input_kind": "dataset_version",
+            "input_id": checkpoint_source.dataset_version,
+            "input_sha256": checkpoint_source.training_manifest_sha256,
+            "dataset_version": checkpoint_source.dataset_version,
+            "model_kind": checkpoint_source.model_kind,
+            "config_version": checkpoint_source.checkpoint_identity["config_version"],
+            "config_sha256": checkpoint_source.checkpoint_identity["config_sha256"],
+            "checkpoint_uri": checkpoint_source.checkpoint_uri,
+            "checkpoint_sha256": checkpoint_source.checkpoint_sha256,
+            "checkpoint_identity": checkpoint_source.checkpoint_identity,
+        }
+        training_profile = {
+            "phase": "training",
+            "model_kind": checkpoint_source.model_kind,
+            "config_version": training_job["config_version"],
+            "config_sha256": training_job["config_sha256"],
+            "profile_state": "measured",
+            "config_json": {"model_revision": checkpoint_source.model_revision},
+        }
+        checkpoint_marker = {
+            "checkpoint_uri": checkpoint_source.checkpoint_uri,
+            "sha256": checkpoint_source.checkpoint_sha256,
+            "size_bytes": checkpoint_source.checkpoint_size_bytes,
+            "identity": checkpoint_source.checkpoint_identity,
+        }
+        eval_profile = {"checkpoint_reservation_bytes": 32_000, "result_reservation_bytes": 32_000}
+        reservation = {"state": "reserved", "reserved_bytes": 100_000, "consumed_bytes": 0}
+
+        class Database:
+            def __init__(self):
+                self.events = []
+                self.source_reads = 0
+                self.stale = False
+
+        database = Database()
+
+        class Connection:
+            async def fetchrow(self, query, *_args):
+                if "ingestion_storage_usage" in query:
+                    database.events.append("global_ledger_lock")
+                    return {"used_bytes": 0}
+                if "SELECT * FROM gods_mlops_jobs" in query and "FOR UPDATE" in query:
+                    database.events.append("job_lock")
+                    return eval_job
+                if "FROM gods_mlops_gpu_leases" in query and "FOR UPDATE" in query:
+                    database.events.append("lease_lock")
+                    return None if database.stale else {
+                        "job_id": job_id,
+                        "lease_token": lease_token,
+                        "fencing_token": 3,
+                    }
+                if "FROM gods_mlops_jobs" in query and "checkpoint_uri" not in query:
+                    return training_job
+                if "WHERE phase = 'training'" in query:
+                    return training_profile
+                if "checkpoint_committed" in query:
+                    return {"details": checkpoint_marker}
+                if "SELECT checkpoint_reservation_bytes,result_reservation_bytes" in query:
+                    return eval_profile
+                if "FROM gods_mlops_artifact_reservations" in query:
+                    return reservation
+                if "event_type='artifact_write_pending'" in query:
+                    return None
+                return None
+
+            async def fetch(self, query, *_args):
+                if "gods_mlops_job_events" in query:
+                    return []
+                return []
+
+            async def fetchval(self, query, *_args):
+                if "result_artifact_committed" in query or "checkpoint_prune_pending" in query:
+                    return False
+                return None
+
+            async def execute(self, *_args):
+                database.events.append("database_write")
+
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Pool:
+            def acquire(self):
+                return Connection()
+
+        class Repository(PostgresJobQueueRepository):
+            async def ensure_schema(self):
+                return None
+
+            async def _get_pool(self):
+                return Pool()
+
+            async def get_job(self, _job_id):
+                return eval_job
+
+            async def lease_is_current(self, _job_id, _lease_token):
+                return not database.stale
+
+            async def get_profile(self, **_kwargs):
+                return eval_profile
+
+            async def checkpoint_metadata_for(self, _job_id):
+                return None
+
+            async def pending_checkpoint_prunes_for(self, _job_id):
+                return []
+
+        class Sources:
+            async def evaluation_block_reasons_in_transaction(self, _connection, **_kwargs):
+                database.source_reads += 1
+                database.events.append("current_evaluation_source_check")
+                if database.source_reads == 2:
+                    return ("late_cross_boundary_link", "dataset_not_evaluation_eligible")
+                return ()
+
+        class Prepared:
+            def __init__(self):
+                self.identity = identity
+                self.sha256 = hashlib.sha256(b"evaluation cursor").hexdigest()
+                self.size_bytes = len(b"evaluation cursor")
+                self.metadata_size_bytes = 0
+                self.object_key = f"jobs/{job_id}/checkpoints/evaluation/{self.sha256}.checkpoint"
+                self.uri = f"s3://gods-mlops/{self.object_key}"
+                self.previous_uri = None
+                self.previous_sha256 = None
+                self.previous_size_bytes = None
+
+        class Store:
+            _bucket = "gods-mlops"
+            _prefix = "jobs"
+
+            def prepare(self, **_kwargs):
+                return Prepared()
+
+            def commit(self, _prepared):
+                database.events.append("object_commit")
+                raise AssertionError("invalidated checkpoint must not reach object commit")
+
+        queue = JobQueue(repository=Repository(database_url="postgresql://unused"), sources=Sources())
+        error_type = DatasetNotReadyForEvaluationError
+        with self.assertRaisesRegex(error_type, "late_cross_boundary_link"):
+            asyncio.run(
+                queue.save_checkpoint(
+                    store=Store(),
+                    job_id=job_id,
+                    lease_token=lease_token,
+                    identity=identity,
+                    payload=b"evaluation cursor",
+                )
+            )
+
+        self.assertEqual(database.source_reads, 2)
+        self.assertEqual(database.events[:7], [
+            "global_ledger_lock",
+            "current_evaluation_source_check",
+            "job_lock",
+            "lease_lock",
+            "database_write",
+            "database_write",
+            "global_ledger_lock",
+        ])
+        self.assertEqual(database.events[7], "current_evaluation_source_check")
+        self.assertNotIn("object_commit", database.events)
+
+    def test_save_checkpoint_facade_rejects_stale_lease_at_final_evaluation_commit(self) -> None:
+        from gods_mlops.jobs.checkpoints import StaleCheckpointOwnerError
+        from gods_mlops.jobs.queue import PostgresJobQueueRepository
+
+        identity = CheckpointIdentity(
+            job_id="e4d82c26-8f0a-4f45-8b88-5fe84302d948",
+            input_kind="dataset_version",
+            input_id="dataset-2026-10-01-a1b2c3d4",
+            input_sha256="a" * 64,
+            phase="evaluation",
+            model_kind="clip",
+            config_version="clip-evaluation-v1",
+            config_sha256="e" * 64,
+            dataset_version="dataset-2026-10-01-a1b2c3d4",
+        )
+        events = []
+
+        class Connection:
+            async def fetchrow(self, query, *_args):
+                if "ingestion_storage_usage" in query:
+                    events.append("global_ledger_lock")
+                    return {"used_bytes": 0}
+                if "SELECT * FROM gods_mlops_jobs" in query and "FOR UPDATE" in query:
+                    events.append("job_lock")
+                    return {"job_id": identity.job_id}
+                if "FROM gods_mlops_gpu_leases" in query and "FOR UPDATE" in query:
+                    events.append("lease_lock")
+                    return None
+                return None
+
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Pool:
+            def acquire(self):
+                return Connection()
+
+        class Repository(PostgresJobQueueRepository):
+            async def ensure_schema(self):
+                return None
+
+            async def _get_pool(self):
+                return Pool()
+
+        class Sources:
+            async def evaluation_block_reasons_in_transaction(self, _connection, **_kwargs):
+                events.append("current_evaluation_source_check")
+                return ()
+
+        prepared = type(
+            "Prepared",
+            (),
+            {
+                "identity": identity,
+                "sha256": "b" * 64,
+                "size_bytes": 64,
+                "metadata_size_bytes": 0,
+                "object_key": "jobs/evaluation/cursor.checkpoint",
+                "uri": "s3://gods-mlops/jobs/evaluation/cursor.checkpoint",
+            },
+        )()
+        repository = Repository(database_url="postgresql://unused")
+        with self.assertRaises(StaleCheckpointOwnerError):
+            asyncio.run(
+                repository.commit_checkpoint(
+                    job_id=identity.job_id,
+                    lease_token="8ad96890-3434-4f07-85bb-8cde17a2b009",
+                    identity=identity,
+                    prepared=prepared,
+                    store=object(),
+                    source_registry=Sources(),
+                    precharged=True,
+                )
+            )
+        self.assertEqual(
+            events,
+            ["global_ledger_lock", "current_evaluation_source_check", "job_lock", "lease_lock"],
+        )
 
     def test_admission_source_reference_is_checked_against_original_job_profile_and_commit_event(self) -> None:
         validate_origin = _require("gods_mlops.jobs.queue", "_evaluation_checkpoint_source_error")

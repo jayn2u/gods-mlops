@@ -1666,6 +1666,7 @@ class PostgresJobQueueRepository:
         identity,
         prepared,
         store,
+        source_registry: DatasetSourceRegistry | None = None,
         operation_id: str | None = None,
         precharged: bool = False,
     ):
@@ -1679,6 +1680,23 @@ class PostgresJobQueueRepository:
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
+                if identity.phase == "evaluation":
+                    usage = await connection.fetchrow(
+                        "SELECT used_bytes FROM ingestion_storage_usage WHERE singleton=TRUE FOR UPDATE"
+                    )
+                    if usage is None:
+                        raise RuntimeError("the shared object-storage ledger is not initialized")
+                    if source_registry is None:
+                        raise ValueError("Task 6 source registry is required before evaluation checkpoint commit")
+                    reasons = await _phase_source_block_reasons_in_transaction(
+                        source_registry,
+                        connection,
+                        phase="evaluation",
+                        dataset_version=identity.dataset_version,
+                        model_kind=identity.model_kind,
+                    )
+                    if reasons:
+                        raise DatasetNotReadyForEvaluationError(reasons)
                 job, lease = await self._lock_job_then_lease(
                     connection, job_id=job_id, lease_token=lease_token
                 )
@@ -1692,6 +1710,10 @@ class PostgresJobQueueRepository:
                 expected = _checkpoint_identity_from_row(job)
                 if identity != expected or prepared.identity != expected:
                     raise CheckpointIdentityError("checkpoint input, phase, model, or config identity changed")
+                if identity.phase == "evaluation":
+                    checkpoint_error = await _evaluation_checkpoint_source_error(connection, job)
+                    if checkpoint_error:
+                        raise CheckpointIdentityError("evaluation checkpoint source changed before checkpoint commit")
                 checkpoint_uri_expected = _prepared_artifact_uri(prepared, store)
                 existing_marker = (
                     str(job["checkpoint_uri"]) == checkpoint_uri_expected
@@ -3555,6 +3577,7 @@ class JobQueue:
                 prepared=prepared,
                 store=store,
                 operation="checkpoint",
+                source_registry=self._sources,
             )
         verified = await self._repository.commit_checkpoint(
             job_id=job_id,
@@ -3562,6 +3585,7 @@ class JobQueue:
             identity=identity,
             prepared=prepared,
             store=store,
+            source_registry=self._sources,
             operation_id=operation_id,
             precharged=precharged,
         )

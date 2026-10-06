@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import os
+import re
 from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
@@ -18,6 +20,7 @@ from .eligibility import (
     evaluation_readiness,
     validate_evaluation_request,
 )
+from .provenance import evaluator_source_revision, worker_image_digest
 from .retrieval import evaluate_retrieval
 
 
@@ -40,6 +43,7 @@ def build_evaluation_report(
     current_eligibility: Mapping[str, Any],
     metrics: Mapping[str, Any],
     predictions: Any,
+    evaluation_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Bind computed metrics and predictions to verified, immutable identities."""
     if not isinstance(candidate, Mapping) or not isinstance(source, Mapping):
@@ -95,6 +99,8 @@ def build_evaluation_report(
         "insufficient_reasons": sorted(reasons),
         "predictions": predictions,
     }
+    if evaluation_provenance is not None:
+        report["evaluation_provenance"] = dict(evaluation_provenance)
     report["deployment_eligibility"] = deployment_eligibility(report)
     return report
 
@@ -384,6 +390,12 @@ async def _evaluate_with_task7_owned_worker(
             or report.get("evaluation_job", {}).get("job_id") != job_id
         ):
             raise ValueError("evaluation artifact provenance differs from the current immutable request")
+        validate_owned_evaluation_provenance(
+            report,
+            expected_evaluator_revision=evaluator_source_revision(),
+            expected_worker_image_id=worker_image_digest(worker_image),
+            expected_model_revision=checkpoint_source.model_revision,
+        )
         current = await publisher.register_model_lineage(
             model_id=candidate["model_id"],
             dataset_version=request["dataset_version"],
@@ -437,6 +449,7 @@ def evaluate_prediction_payload(
     source: Mapping[str, Any],
     evaluation_config: Mapping[str, Any],
     current_eligibility: Mapping[str, Any],
+    evaluator_provenance: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Score worker-produced predictions against the frozen manifest and current overlay."""
     expected_input_sha = source.get("manifest_sha256")
@@ -454,11 +467,25 @@ def evaluate_prediction_payload(
         evaluation_split=evaluation_split,
     )
     if model_kind == "detr":
+        settings = evaluation_config.get("settings")
+        if not isinstance(settings, Mapping):
+            raise ValueError("DETR evaluation profile settings are unavailable")
+        score_threshold = settings.get("score_threshold")
+        max_detections = settings.get("max_detections")
+        if (
+            isinstance(score_threshold, bool)
+            or not isinstance(score_threshold, (int, float))
+            or not math.isfinite(score_threshold)
+            or not 0 <= score_threshold <= 1
+        ):
+            raise ValueError("DETR evaluation profile score_threshold is invalid")
+        if type(max_detections) is not int or max_detections < 10:
+            raise ValueError("DETR evaluation profile max_detections is invalid")
         metrics = evaluate_detections(
             frames=_detection_frames(manifest, prediction_payload, evaluation_split),
             predictions=_detection_predictions(prediction_payload),
-            score_threshold=evaluation_config.get("score_threshold", 0.3),
-            max_detections=evaluation_config.get("max_detections", 100),
+            score_threshold=score_threshold,
+            max_detections=max_detections,
         )
     elif model_kind == "clip":
         evaluation_truth = manifest.get("evaluation")
@@ -485,6 +512,15 @@ def evaluate_prediction_payload(
         "model_kind": model_kind,
         "split": evaluation_split,
     }
+    if model_kind == "detr":
+        enriched_config["score_threshold"] = score_threshold
+        enriched_config["max_detections"] = max_detections
+    validated_provenance = _validate_evaluation_provenance(
+        evaluator_provenance,
+        model_kind=model_kind,
+        candidate=candidate,
+        prediction_payload=prediction_payload,
+    )
     return build_evaluation_report(
         candidate=candidate,
         baseline=baseline,
@@ -493,7 +529,96 @@ def evaluate_prediction_payload(
         current_eligibility=readiness,
         metrics=metrics,
         predictions=dict(prediction_payload),
+        evaluation_provenance=validated_provenance,
     )
+
+
+def validate_owned_evaluation_provenance(
+    report: Mapping[str, Any],
+    *,
+    expected_evaluator_revision: str,
+    expected_worker_image_id: str,
+    expected_model_revision: str,
+) -> dict[str, Any]:
+    """Require the committed report to match its runtime, source and locked model."""
+    if not isinstance(report, Mapping):
+        raise ValueError("owned evaluation provenance report is invalid")
+    candidate = report.get("candidate")
+    predictions = report.get("predictions")
+    if not isinstance(candidate, Mapping) or not isinstance(predictions, Mapping):
+        raise ValueError("owned evaluation provenance inputs are missing")
+    provenance = _validate_evaluation_provenance(
+        report.get("evaluation_provenance"),
+        model_kind=str(report.get("model_kind", "")),
+        candidate=candidate,
+        prediction_payload=predictions,
+    )
+    if provenance["evaluator_revision"] != expected_evaluator_revision:
+        raise ValueError("owned evaluation evaluator revision differs from the current source")
+    if provenance["worker_image_id"] != expected_worker_image_id:
+        raise ValueError("owned evaluation worker image differs from the pinned image")
+    if provenance["model_revision"] != expected_model_revision:
+        raise ValueError("owned evaluation model revision differs from the verified checkpoint")
+    return provenance
+
+
+def _validate_evaluation_provenance(
+    value: Any,
+    *,
+    model_kind: str,
+    candidate: Mapping[str, Any],
+    prediction_payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = {"evaluator_revision", "worker_image_id", "model_revision"}
+    if model_kind == "detr":
+        required.add("person_class_mapping")
+    if not isinstance(value, Mapping) or set(value) != required:
+        raise ValueError("evaluation provenance is missing or has unsupported fields")
+    evaluator_revision = value.get("evaluator_revision")
+    worker_image_id = value.get("worker_image_id")
+    model_revision = value.get("model_revision")
+    if not isinstance(evaluator_revision, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", evaluator_revision):
+        raise ValueError("evaluation provenance evaluator revision is invalid")
+    if not isinstance(worker_image_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", worker_image_id):
+        raise ValueError("evaluation provenance worker image identity is invalid")
+    if (
+        not isinstance(model_revision, str)
+        or not model_revision.strip()
+        or candidate.get("model_revision") != model_revision
+        or prediction_payload.get("model_revision") != model_revision
+    ):
+        raise ValueError("evaluation provenance model revision differs from the verified model")
+    provenance = {
+        "evaluator_revision": evaluator_revision,
+        "worker_image_id": worker_image_id,
+        "model_revision": model_revision,
+    }
+    if model_kind == "detr":
+        mapping = value.get("person_class_mapping")
+        fields = {
+            "model_revision",
+            "model_class_index",
+            "model_class_name",
+            "coco_category_id",
+            "coco_category_name",
+        }
+        if (
+            not isinstance(mapping, Mapping)
+            or set(mapping) != fields
+            or mapping.get("model_revision") != model_revision
+            or type(mapping.get("model_class_index")) is not int
+            or mapping["model_class_index"] < 0
+            or mapping.get("model_class_name") != "person"
+            or type(mapping.get("coco_category_id")) is not int
+            or mapping["coco_category_id"] != 1
+            or mapping.get("coco_category_name") != "person"
+            or prediction_payload.get("person_class_mapping") != dict(mapping)
+        ):
+            raise ValueError("evaluation provenance person class mapping does not bind model person to COCO category 1")
+        provenance["person_class_mapping"] = dict(mapping)
+    elif model_kind != "clip":
+        raise ValueError("evaluation provenance supports only DETR or CLIP")
+    return provenance
 
 
 def encode_evaluation_cursor(

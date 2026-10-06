@@ -18,6 +18,22 @@ class DatasetSourceUnavailableError(ValueError):
     """The requested published dataset cannot be used for the selected GPU phase."""
 
 
+_LOCKED_DATASET_SOURCE_QUERY = """
+    SELECT version.dataset_version, version.target, version.manifest_sha256,
+           version.state, version.training_ready, version.training_reasons,
+           version.evaluation_eligible, version.evaluation_reasons,
+           (SELECT count(DISTINCT item.sample_id)
+            FROM dataset_items AS item
+            JOIN dataset_source_invalidations AS invalidation USING (sample_id)
+            WHERE item.dataset_version = version.dataset_version) AS invalidated_source_count,
+           (SELECT count(*) FROM dataset_version_leakage_impacts AS impact
+            WHERE impact.dataset_version = version.dataset_version) AS leakage_impact_count
+    FROM dataset_versions AS version
+    WHERE version.dataset_version = $1 AND version.published_at IS NOT NULL
+    FOR SHARE OF version
+"""
+
+
 class DatasetSourceRegistry:
     """Read Task 6's durable readiness and impact overlay without private publisher APIs."""
 
@@ -46,18 +62,7 @@ class DatasetSourceRegistry:
             )
         if row is None:
             raise DatasetSourceUnavailableError("dataset version is not a published immutable source")
-        return DatasetTrainingSource(
-            dataset_version=row["dataset_version"],
-            target=row["target"],
-            manifest_sha256=row["manifest_sha256"].strip(),
-            state=row["state"],
-            training_ready=bool(row["training_ready"]),
-            training_reasons=tuple(sorted(_json_list(row["training_reasons"]))),
-            evaluation_eligible=bool(row["evaluation_eligible"]),
-            evaluation_reasons=tuple(sorted(_json_list(row["evaluation_reasons"]))),
-            invalidated_source_count=int(row["invalidated_source_count"]),
-            leakage_impact_count=int(row["leakage_impact_count"]),
-        )
+        return _dataset_training_source_from_row(row)
 
     async def training_manifest_reference(self, dataset_version: str) -> dict[str, str | int]:
         """Return the published immutable manifest S3 reference for a current dataset."""
@@ -88,37 +93,9 @@ class DatasetSourceRegistry:
         model_kind: str,
     ) -> tuple[str, ...]:
         """Recheck mutable training eligibility while the admission transaction locks its version."""
-        row = await connection.fetchrow(
-            """
-            SELECT version.dataset_version, version.target, version.manifest_sha256,
-                   version.state, version.training_ready, version.training_reasons,
-                   version.evaluation_eligible, version.evaluation_reasons,
-                   (SELECT count(DISTINCT item.sample_id)
-                    FROM dataset_items AS item
-                    JOIN dataset_source_invalidations AS invalidation USING (sample_id)
-                    WHERE item.dataset_version = version.dataset_version) AS invalidated_source_count,
-                   (SELECT count(*) FROM dataset_version_leakage_impacts AS impact
-                    WHERE impact.dataset_version = version.dataset_version) AS leakage_impact_count
-            FROM dataset_versions AS version
-            WHERE version.dataset_version = $1 AND version.published_at IS NOT NULL
-            FOR SHARE OF version
-            """,
-            dataset_version,
-        )
-        if row is None:
+        source = await _current_dataset_source_in_transaction(connection, dataset_version)
+        if source is None:
             return ("dataset_source_unavailable",)
-        source = DatasetTrainingSource(
-            dataset_version=row["dataset_version"],
-            target=row["target"],
-            manifest_sha256=row["manifest_sha256"].strip(),
-            state=row["state"],
-            training_ready=bool(row["training_ready"]),
-            training_reasons=tuple(sorted(_json_list(row["training_reasons"]))),
-            evaluation_eligible=bool(row["evaluation_eligible"]),
-            evaluation_reasons=tuple(sorted(_json_list(row["evaluation_reasons"]))),
-            invalidated_source_count=int(row["invalidated_source_count"]),
-            leakage_impact_count=int(row["leakage_impact_count"]),
-        )
         reasons = set(source.training_block_reasons())
         if source.target not in {model_kind, "both"}:
             reasons.add(f"dataset_target_not_{model_kind}")
@@ -132,37 +109,9 @@ class DatasetSourceRegistry:
         model_kind: str,
     ) -> tuple[str, ...]:
         """Recheck current evaluation eligibility under the version SHARE lock."""
-        row = await connection.fetchrow(
-            """
-            SELECT version.dataset_version, version.target, version.manifest_sha256,
-                   version.state, version.training_ready, version.training_reasons,
-                   version.evaluation_eligible, version.evaluation_reasons,
-                   (SELECT count(DISTINCT item.sample_id)
-                    FROM dataset_items AS item
-                    JOIN dataset_source_invalidations AS invalidation USING (sample_id)
-                    WHERE item.dataset_version = version.dataset_version) AS invalidated_source_count,
-                   (SELECT count(*) FROM dataset_version_leakage_impacts AS impact
-                    WHERE impact.dataset_version = version.dataset_version) AS leakage_impact_count
-            FROM dataset_versions AS version
-            WHERE version.dataset_version = $1 AND version.published_at IS NOT NULL
-            FOR SHARE OF version
-            """,
-            dataset_version,
-        )
-        if row is None:
+        source = await _current_dataset_source_in_transaction(connection, dataset_version)
+        if source is None:
             return ("dataset_source_unavailable",)
-        source = DatasetTrainingSource(
-            dataset_version=row["dataset_version"],
-            target=row["target"],
-            manifest_sha256=row["manifest_sha256"].strip(),
-            state=row["state"],
-            training_ready=bool(row["training_ready"]),
-            training_reasons=tuple(sorted(_json_list(row["training_reasons"]))),
-            evaluation_eligible=bool(row["evaluation_eligible"]),
-            evaluation_reasons=tuple(sorted(_json_list(row["evaluation_reasons"]))),
-            invalidated_source_count=int(row["invalidated_source_count"]),
-            leakage_impact_count=int(row["leakage_impact_count"]),
-        )
         reasons = set(source.evaluation_block_reasons())
         if source.target not in {model_kind, "both"}:
             reasons.add(f"dataset_target_not_{model_kind}")
@@ -284,3 +233,27 @@ def _json_list(value: object) -> list[str]:
     if not isinstance(decoded, list):
         return []
     return [str(item) for item in decoded]
+
+
+async def _current_dataset_source_in_transaction(
+    connection: asyncpg.Connection,
+    dataset_version: str,
+) -> DatasetTrainingSource | None:
+    """Read one current source snapshot and hold its version row through the caller's transaction."""
+    row = await connection.fetchrow(_LOCKED_DATASET_SOURCE_QUERY, dataset_version)
+    return _dataset_training_source_from_row(row) if row is not None else None
+
+
+def _dataset_training_source_from_row(row) -> DatasetTrainingSource:
+    return DatasetTrainingSource(
+        dataset_version=row["dataset_version"],
+        target=row["target"],
+        manifest_sha256=row["manifest_sha256"].strip(),
+        state=row["state"],
+        training_ready=bool(row["training_ready"]),
+        training_reasons=tuple(sorted(_json_list(row["training_reasons"]))),
+        evaluation_eligible=bool(row["evaluation_eligible"]),
+        evaluation_reasons=tuple(sorted(_json_list(row["evaluation_reasons"]))),
+        invalidated_source_count=int(row["invalidated_source_count"]),
+        leakage_impact_count=int(row["leakage_impact_count"]),
+    )
