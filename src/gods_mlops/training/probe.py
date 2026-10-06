@@ -19,7 +19,7 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         from .detector import run as run_detector
 
         return run_detector(config, manifest_uri, output_uri)
-    if model_kind == "clip" and target_phase == "training":
+    if model_kind == "clip" and target_phase in {"training", "evaluation"}:
         from .clip import run as run_clip
 
         return run_clip(config, manifest_uri, output_uri)

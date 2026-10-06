@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
         "run-probe", help="measure one locked model on Ubuntu through Task 7 and strict-SSH Docker"
     )
     probe.add_argument("--model-kind", choices=("detr", "clip", "qwen"), required=True)
-    probe.add_argument("--target-phase", choices=("training", "preparation"))
+    probe.add_argument("--target-phase", choices=("training", "preparation", "evaluation"))
     probe.add_argument("--worker-image", required=True, help="source-matched image already loaded on Ubuntu")
     probe.add_argument("--worker-image-id", required=True, help="exact immutable Docker image ID from Ubuntu")
     probe.add_argument(

@@ -19,6 +19,8 @@ _PROFILE_VERSIONS = {
     "qwen": "task8-qwen-bounded-crop-caption-probe-v1",
 }
 _DETR_PREPARATION_PROFILE_VERSION = "task8-detr-640-frame-drafts-preparation-probe-v1"
+_DETR_EVALUATION_PROFILE_VERSION = "task9-detr-person-coco-evaluation-probe-v1"
+_CLIP_EVALUATION_PROFILE_VERSION = "task9-clip-retrieval-evaluation-probe-v1"
 _A6000_CANDIDATE_MEMORY_MIB = 36_000
 _PROBE_ARTIFACT_RESERVATION_BYTES = 8 * 1024**3
 
@@ -49,23 +51,44 @@ def candidate_profile(model_kind: str, *, target_phase: str | None = None) -> Ex
                 "max_draft_frames": 1,
             }
             version = _DETR_PREPARATION_PROFILE_VERSION
+        elif requested_target == "evaluation":
+            config = {
+                "model_id": model.model_id,
+                "model_revision": model.revision,
+                "input_size": 640,
+                "micro_batch": 1,
+                "score_threshold": 0.3,
+                "max_detections": 100,
+                "max_evaluation_frames": 1,
+            }
+            version = _DETR_EVALUATION_PROFILE_VERSION
         else:
-            raise ValueError("DETR readiness target must be training or preparation")
+            raise ValueError("DETR readiness target must be training, preparation, or evaluation")
     elif model_kind == "clip":
-        if requested_target != "training":
-            raise ValueError("CLIP readiness probe target must be training")
-        config = {
-            "model_id": model.model_id,
-            "model_revision": model.revision,
-            "resolution": 224,
-            "micro_batch": 2,
-            "gradient_accumulation_steps": 1,
-            "contrastive_config_version": "task8-explicit-negatives-v1",
-            "optimizer_steps": 3,
-            "learning_rate": 1e-5,
-            "weight_decay": 1e-4,
-        }
-        version = _PROFILE_VERSIONS[model_kind]
+        if requested_target == "training":
+            config = {
+                "model_id": model.model_id,
+                "model_revision": model.revision,
+                "resolution": 224,
+                "micro_batch": 2,
+                "gradient_accumulation_steps": 1,
+                "contrastive_config_version": "task8-explicit-negatives-v1",
+                "optimizer_steps": 3,
+                "learning_rate": 1e-5,
+                "weight_decay": 1e-4,
+            }
+            version = _PROFILE_VERSIONS[model_kind]
+        elif requested_target == "evaluation":
+            config = {
+                "model_id": model.model_id,
+                "model_revision": model.revision,
+                "resolution": 224,
+                "micro_batch": 2,
+                "evaluation_batch_size": 2,
+            }
+            version = _CLIP_EVALUATION_PROFILE_VERSION
+        else:
+            raise ValueError("CLIP readiness target must be training or evaluation")
     elif model_kind == "qwen":
         if requested_target != "preparation":
             raise ValueError("Qwen readiness probe target must be preparation")
@@ -183,7 +206,11 @@ def create_probe_input(
             )
         manifest = {
             **common,
-            "contrastive_config_version": profile.config["contrastive_config_version"],
+            **(
+                {"contrastive_config_version": profile.config["contrastive_config_version"]}
+                if "contrastive_config_version" in profile.config
+                else {}
+            ),
             "pairs": pairs,
         }
     else:

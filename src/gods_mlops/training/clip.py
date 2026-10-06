@@ -56,8 +56,112 @@ def validate_contrastive_pairs(
     return len(pairs)
 
 
+def clip_evaluation_sources(
+    manifest: dict[str, Any], *, evaluation_split: str
+) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Resolve the frozen human query set and exact reviewed test gallery."""
+    if evaluation_split != "test":
+        raise ValueError("CLIP retrieval evaluation is pinned to the frozen test gallery")
+    evaluation = manifest.get("evaluation")
+    items = manifest.get("items")
+    if not isinstance(evaluation, dict) or not isinstance(items, list):
+        raise ValueError("CLIP manifest has no frozen evaluation truth and item list")
+    gallery_ids = evaluation.get("gallery_crop_ids")
+    matrices = evaluation.get("relevance_matrices")
+    if not isinstance(gallery_ids, list) or not gallery_ids or any(
+        not isinstance(item, str) or not item for item in gallery_ids
+    ):
+        raise ValueError("CLIP evaluation gallery IDs are missing")
+    if len(set(gallery_ids)) != len(gallery_ids):
+        raise ValueError("CLIP evaluation gallery has duplicate crop IDs")
+    if not isinstance(matrices, list) or not matrices:
+        raise ValueError("CLIP evaluation human relevance matrices are missing")
+    matrices_by_query: dict[str, dict[str, Any]] = {}
+    for matrix in matrices:
+        if not isinstance(matrix, dict):
+            raise ValueError("CLIP human relevance matrix is invalid")
+        query_id = matrix.get("query_id")
+        query_text = matrix.get("query_text")
+        if not isinstance(query_id, (str, int)) or not str(query_id).strip():
+            raise ValueError("CLIP human relevance query ID is missing")
+        if not isinstance(query_text, str) or not query_text.strip():
+            raise ValueError("CLIP frozen human query text is missing")
+        query_id = str(query_id)
+        if query_id in matrices_by_query:
+            raise ValueError("CLIP human relevance matrices contain a duplicate query")
+        if matrix.get("status") != "complete" or matrix.get("evaluation_eligible") is not True:
+            raise ValueError("CLIP human relevance truth is unresolved")
+        if matrix.get("gallery_matches_selection") is not True:
+            raise ValueError("CLIP human relevance gallery differs from the frozen selection")
+        judgments = matrix.get("judgments")
+        if not isinstance(judgments, list):
+            raise ValueError("CLIP human relevance judgments are missing")
+        judgments_by_crop = {
+            str(row.get("crop_id")): row.get("judgment")
+            for row in judgments
+            if isinstance(row, dict) and row.get("crop_id") is not None
+        }
+        if len(judgments_by_crop) != len(judgments) or set(judgments_by_crop) != set(gallery_ids):
+            raise ValueError("CLIP human relevance matrix does not cover the frozen gallery")
+        values = set(judgments_by_crop.values())
+        if "uncertain" in values or not {"relevant", "not_relevant"} <= values:
+            raise ValueError("CLIP human relevance truth needs resolved positive and negative judgments")
+        matrices_by_query[query_id] = {"query_id": query_id, "query_text": query_text}
+
+    items_by_id = {
+        str(item.get("item_id")): item
+        for item in items
+        if isinstance(item, dict)
+        and (item.get("item_kind") == "crop" or item.get("kind") == "crop")
+        and item.get("split") == "test"
+    }
+    if not set(gallery_ids).issubset(items_by_id):
+        raise ValueError("CLIP frozen gallery references a crop outside the test split")
+    return (
+        [matrices_by_query[query_id] for query_id in sorted(matrices_by_query)],
+        [items_by_id[crop_id] for crop_id in sorted(gallery_ids)],
+    )
+
+
+def encode_evaluation_batch(
+    model: Any,
+    processor: Any,
+    *,
+    texts: list[str],
+    images: list[Any],
+    device: Any,
+) -> tuple[list[list[float]], list[list[float]]]:
+    """Encode frozen text queries and gallery crops in inference-only mode."""
+    import torch
+    import torch.nn.functional as functional
+
+    if not texts and not images:
+        raise ValueError("CLIP evaluation batch must contain queries or gallery images")
+    model.eval()
+    with torch.inference_mode():
+        text_features: list[list[float]] = []
+        if texts:
+            encoded_text = processor(text=texts, return_tensors="pt", padding=True, truncation=True)
+            encoded_text = {
+                key: value.to(device) if isinstance(value, torch.Tensor) else value
+                for key, value in encoded_text.items()
+            }
+            features = model.get_text_features(**encoded_text)
+            text_features = functional.normalize(features.float(), p=2, dim=-1).cpu().tolist()
+        image_features: list[list[float]] = []
+        if images:
+            encoded_images = processor(images=images, return_tensors="pt")
+            encoded_images = {
+                key: value.to(device) if isinstance(value, torch.Tensor) else value
+                for key, value in encoded_images.items()
+            }
+            features = model.get_image_features(**encoded_images)
+            image_features = functional.normalize(features.float(), p=2, dim=-1).cpu().tolist()
+    return text_features, image_features
+
+
 def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str, Any]:
-    """Train the locked CLIP model with explicit in-batch negatives and resumable state."""
+    """Train CLIP or run fenced inference against an immutable evaluation gallery."""
     import torch
     from transformers import CLIPModel, CLIPProcessor
 
@@ -76,8 +180,10 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         serialize_checkpoint,
     )
 
-    if config.get("phase") not in {"probe", "training"}:
-        raise ValueError("CLIP runner supports only probe and published training phases")
+    phase = str(config.get("phase", ""))
+    target_phase = str(config.get("target_phase") or phase)
+    if phase not in {"probe", "training", "evaluation"}:
+        raise ValueError("CLIP runner supports probe, training, and evaluation phases")
     if config.get("target_phase", config.get("phase")) == "preparation":
         raise ValueError("CLIP has no pre-publication caption-draft preparation stage")
     if int(config.get("resolution", 224)) != 224:
@@ -88,11 +194,57 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
     if int(config.get("gradient_accumulation_steps", 1)) != 1:
         raise ValueError("gradient accumulation cannot substitute for explicit CLIP negatives")
     steps = int(config.get("optimizer_steps", 3))
-    if steps < 3:
+    if phase != "evaluation" and target_phase != "evaluation" and steps < 3:
         raise ValueError("CLIP measurement requires at least three optimizer steps")
 
     manifest = load_manifest(manifest_uri, config=config)
     identity = validate_manifest_identity(config, manifest)
+    if phase == "evaluation" or (phase == "probe" and target_phase == "evaluation"):
+        started = perf_counter()
+        model_lock = locked_model("clip")
+        model_path = cache_directory("clip", config)
+        device = require_cuda()
+        torch.cuda.reset_peak_memory_stats(0)
+        processor = CLIPProcessor.from_pretrained(model_path, local_files_only=True)
+        model = CLIPModel.from_pretrained(model_path, local_files_only=True, dtype=torch.float32).to(device)
+        config["_device"] = device
+        if phase == "evaluation":
+            from gods_mlops.evaluation.eligibility import apply_verified_model_weights
+
+            apply_verified_model_weights(
+                model,
+                config,
+                model_kind="clip",
+                model_revision=model_lock.revision,
+            )
+            queries, gallery_items = clip_evaluation_sources(
+                manifest,
+                evaluation_split=str(config.get("evaluation_split", "test")),
+            )
+            object_store = dataset_object_store_from_environment()
+            gallery_images = [
+                load_rgb_image(item, object_store=object_store) for item in gallery_items
+            ]
+        else:
+            pairs, object_store = _pairs_from_manifest(manifest, config, micro_batch)
+            queries = [
+                {"query_id": str(pair["image_id"]), "query_text": str(pair["text"])}
+                for pair in pairs
+            ]
+            gallery_items = [pair.get("media", pair) for pair in pairs]
+            gallery_images = [pair["image"] for pair in pairs]
+        return _run_clip_evaluation(
+            config,
+            model=model,
+            processor=processor,
+            queries=queries,
+            gallery_items=gallery_items,
+            gallery_images=gallery_images,
+            identity=identity,
+            model_revision=model_lock.revision,
+            started=started,
+        )
+
     pairs, object_store = _pairs_from_manifest(manifest, config, micro_batch)
     pair_count = validate_contrastive_pairs(
         {
@@ -334,6 +486,167 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
         "result_artifact_kind": "model",
         "result_artifact_payload": result_payload,
         "checkpoint_payload": checkpoint_payload,
+        "resource_measurements": measurements,
+    }
+
+
+def _run_clip_evaluation(
+    config: dict[str, Any],
+    *,
+    model: Any,
+    processor: Any,
+    queries: list[dict[str, str]],
+    gallery_items: list[dict[str, Any]],
+    gallery_images: list[Any],
+    identity: dict[str, Any],
+    model_revision: str,
+    started: float,
+) -> dict[str, Any]:
+    import torch
+
+    from gods_mlops.datasets.manifest import canonical_json
+    from gods_mlops.evaluation.report import decode_evaluation_cursor, encode_evaluation_cursor
+    from .runner_support import resource_measurements
+
+    phase = str(config.get("phase"))
+    if len(gallery_items) != len(gallery_images):
+        raise ValueError("CLIP gallery item and image counts do not match")
+    if not queries or not gallery_items:
+        raise ValueError("CLIP evaluation requires frozen queries and gallery crops")
+    batch_size = config.get("evaluation_batch_size", config.get("micro_batch", 2))
+    if type(batch_size) is not int or batch_size < 1:
+        raise ValueError("CLIP evaluation batch size must be a positive integer")
+    query_ids = [str(item["query_id"]) for item in queries]
+    gallery_ids = [str(item["item_id"]) for item in gallery_items]
+    if len(set(query_ids)) != len(query_ids) or len(set(gallery_ids)) != len(gallery_ids):
+        raise ValueError("CLIP evaluation query and crop IDs must be unique")
+
+    state: dict[str, Any] = {
+        "stage": "queries",
+        "query_embeddings": {},
+        "crop_embeddings": {},
+    }
+    start_index = 0
+    resume_payload = config.get("_evaluation_resume_payload")
+    if phase == "evaluation" and isinstance(resume_payload, bytes):
+        cursor = decode_evaluation_cursor(
+            resume_payload,
+            expected_identity=config["_evaluation_job_identity"],
+            expected_candidate_checkpoint_sha256=str(config["_evaluation_checkpoint_sha256"]),
+            expected_manifest_sha256=str(config["input_sha256"]),
+            expected_config_sha256=str(config["config_sha256"]),
+        )
+        state = cursor["predictions"]
+        start_index = cursor["next_index"]
+        if state.get("stage") not in {"queries", "gallery"}:
+            raise ValueError("CLIP evaluation cursor stage is invalid")
+
+    inference_steps = 0
+    stage_order = {"queries": 0, "gallery": 1, "complete": 2}
+    for stage in ("queries", "gallery"):
+        if stage_order[stage] < stage_order.get(state["stage"], -1):
+            continue
+        position = start_index if stage == state["stage"] else 0
+        size = len(queries) if stage == "queries" else len(gallery_items)
+        while position < size:
+            if not _worker_should_continue(config):
+                if phase != "evaluation":
+                    return {"status": "yielded", "resource_measurements": {"optimizer_steps": 0}}
+                cursor_payload = encode_evaluation_cursor(
+                    identity=config["_evaluation_job_identity"],
+                    candidate_checkpoint_sha256=str(config["_evaluation_checkpoint_sha256"]),
+                    manifest_sha256=str(config["input_sha256"]),
+                    config_sha256=str(config["config_sha256"]),
+                    next_index=position,
+                    predictions={**state, "stage": stage},
+                )
+                return {"status": "yielded", "checkpoint_payload": cursor_payload}
+            stop = min(position + batch_size, size)
+            if stage == "queries":
+                text_batch = [item["query_text"] for item in queries[position:stop]]
+                image_batch = []
+            else:
+                text_batch = []
+                image_batch = gallery_images[position:stop]
+            text_embeddings, image_embeddings = encode_evaluation_batch(
+                model,
+                processor,
+                texts=text_batch,
+                images=image_batch,
+                device=config.get("_device", "cuda:0"),
+            )
+            if stage == "queries":
+                state["query_embeddings"].update(
+                    {
+                        query_ids[index]: embedding
+                        for index, embedding in zip(range(position, stop), text_embeddings, strict=True)
+                    }
+                )
+            else:
+                state["crop_embeddings"].update(
+                    {
+                        gallery_ids[index]: embedding
+                        for index, embedding in zip(range(position, stop), image_embeddings, strict=True)
+                    }
+                )
+            position = stop
+            inference_steps += 1
+        state["stage"] = "gallery" if stage == "queries" else "complete"
+        start_index = 0
+
+    if not _worker_should_continue(config):
+        if phase != "evaluation":
+            return {"status": "yielded", "resource_measurements": {"optimizer_steps": 0}}
+        cursor_payload = encode_evaluation_cursor(
+            identity=config["_evaluation_job_identity"],
+            candidate_checkpoint_sha256=str(config["_evaluation_checkpoint_sha256"]),
+            manifest_sha256=str(config["input_sha256"]),
+            config_sha256=str(config["config_sha256"]),
+            next_index=len(gallery_items),
+            predictions={**state, "stage": "gallery"},
+        )
+        return {"status": "yielded", "checkpoint_payload": cursor_payload}
+
+    measurements = resource_measurements(started, optimizer_steps=0, inference_steps=inference_steps)
+    measurements.update(
+        {
+            "precision": "float32-inference",
+            "model_id": identity["model_id"],
+            "model_revision": model_revision,
+            "evaluation_batch_size": batch_size,
+        }
+    )
+    if phase == "probe":
+        document = {
+            "schema_version": 1,
+            "model_kind": "clip",
+            "input_id": identity["input_id"],
+            "input_sha256": identity["input_sha256"],
+            "query_count": len(queries),
+            "gallery_count": len(gallery_items),
+            "source_fixture": True,
+            "human_relevance_truth_used": False,
+        }
+        payload = canonical_json(document)
+        result_kind = "evaluation_probe"
+    else:
+        document = {
+            "schema_version": 1,
+            "model_kind": "clip",
+            "input_id": identity["input_id"],
+            "input_sha256": identity["input_sha256"],
+            "query_embeddings": state["query_embeddings"],
+            "crop_embeddings": state["crop_embeddings"],
+        }
+        payload = canonical_json(document)
+        result_kind = "evaluation_predictions"
+    return {
+        "status": "succeeded",
+        "checkpoint_uri": None,
+        "hash": sha256(payload).hexdigest(),
+        "result_uri": None,
+        "result_artifact_kind": result_kind,
+        "result_artifact_payload": payload,
         "resource_measurements": measurements,
     }
 

@@ -211,6 +211,30 @@ async def submit_training(
     return queue, job_id
 
 
+async def submit_evaluation(
+    *,
+    dataset_version: str,
+    model_kind: str,
+    config_version: str,
+    checkpoint_source,
+    evaluation_split: str = "test",
+    baseline_metadata: dict[str, str | None] | None = None,
+    rerun: bool = False,
+) -> tuple[JobQueue, str]:
+    """Submit one prior-checkpoint evaluation through the existing durable queue."""
+    repository, queue = _queue_from_environment()
+    job_id = await queue.submit_evaluation(
+        dataset_version=dataset_version,
+        model_kind=model_kind,
+        config_version=config_version,
+        checkpoint_source=checkpoint_source,
+        evaluation_split=evaluation_split,
+        baseline_metadata=baseline_metadata,
+        rerun=rerun,
+    )
+    return queue, job_id
+
+
 async def submit_preparation(
     *, source_selections: list[dict[str, Any]], model_kind: str, config_version: str
 ) -> tuple[JobQueue, str]:

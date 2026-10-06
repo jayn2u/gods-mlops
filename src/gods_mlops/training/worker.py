@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 import time
@@ -13,7 +14,7 @@ from typing import Any
 
 from gods_mlops.datasets.manifest import canonical_json
 from gods_mlops.datasets.publish import DatasetPublisher
-from gods_mlops.jobs.models import ProbeInput
+from gods_mlops.jobs.models import EvaluationCheckpointSource, ProbeInput
 from gods_mlops.jobs.queue import JobQueue, PostgresJobQueueRepository
 from gods_mlops.jobs.sources import DatasetSourceRegistry
 
@@ -39,6 +40,8 @@ async def run_worker() -> int:
     sources = DatasetSourceRegistry(database_url=database_url)
     queue = JobQueue(repository=repository, sources=sources)
     objects = dataset_object_store_from_environment()
+    evaluation_publisher = None
+    evaluation_model_id = None
     try:
         job = await queue.get(job_id)
         lease = await repository.get_active_lease(gpu_uuid)
@@ -91,6 +94,48 @@ async def run_worker() -> int:
             previous = await queue.load_checkpoint(store=checkpoint_store, job_id=job_id)
             if previous is not None:
                 config["_resume_payload"] = previous.payload
+        elif claim.phase == "evaluation":
+            source_refs = job.get("source_refs")
+            if not isinstance(source_refs, dict):
+                raise WorkerAuthorizationError("evaluation source references are unavailable")
+            checkpoint_source = EvaluationCheckpointSource.from_dict(source_refs.get("checkpoint"))
+            if checkpoint_source.model_revision != model.revision:
+                raise WorkerAuthorizationError("evaluation checkpoint model revision differs from the immutable lock")
+            prior_checkpoint = await _load_verified_evaluation_checkpoint(
+                queue,
+                checkpoint_store,
+                checkpoint_source,
+            )
+            config["_evaluation_checkpoint_payload"] = prior_checkpoint.payload
+            config["_evaluation_checkpoint_identity"] = prior_checkpoint.identity.as_dict()
+            config["_evaluation_checkpoint_sha256"] = prior_checkpoint.sha256
+            config["_evaluation_checkpoint_model_revision"] = checkpoint_source.model_revision
+            evaluation_model_id = "sha256:" + prior_checkpoint.sha256
+            evaluation_publisher = DatasetPublisher.from_environment()
+            current_lineage = await evaluation_publisher.register_model_lineage(
+                model_id=evaluation_model_id,
+                dataset_version=checkpoint_source.dataset_version,
+            )
+            if current_lineage.get("training_eligible") is not True or current_lineage.get(
+                "evaluation_eligible"
+            ) is not True:
+                raise WorkerAuthorizationError("candidate checkpoint is not currently evaluation-eligible")
+            config["_evaluation_candidate"] = {
+                "training_job_id": checkpoint_source.training_job_id,
+                "checkpoint_uri": checkpoint_source.checkpoint_uri,
+                "checkpoint_sha256": checkpoint_source.checkpoint_sha256,
+                "checkpoint_size_bytes": checkpoint_source.checkpoint_size_bytes,
+                "checkpoint_identity": checkpoint_source.checkpoint_identity,
+                "model_revision": checkpoint_source.model_revision,
+                "model_id": evaluation_model_id,
+                "model_kind": checkpoint_source.model_kind,
+                "verified": True,
+            }
+            config["_evaluation_baseline"] = source_refs.get("baseline")
+            evaluation_resume = await queue.load_checkpoint(store=checkpoint_store, job_id=job_id)
+            if evaluation_resume is not None:
+                config["_evaluation_resume_payload"] = evaluation_resume.payload
+            config["_evaluation_job_identity"] = identity.as_dict()
 
         event_loop = asyncio.get_running_loop()
 
@@ -134,7 +179,8 @@ async def run_worker() -> int:
 
         config["_assert_current"] = assert_current
         config["_commit_checkpoint"] = commit_checkpoint
-        config["_commit_result_artifact"] = commit_result
+        if claim.phase != "evaluation":
+            config["_commit_result_artifact"] = commit_result
         if not await still_current():
             raise WorkerAuthorizationError("worker lease was revoked before CUDA startup")
 
@@ -188,6 +234,70 @@ async def run_worker() -> int:
         if result.get("status") != "succeeded":
             raise RuntimeError("model runner did not complete successfully")
 
+        if claim.phase == "evaluation":
+            if evaluation_publisher is None or evaluation_model_id is None:
+                raise WorkerAuthorizationError("evaluation lineage publisher is unavailable")
+            from gods_mlops.evaluation.eligibility import evaluation_readiness
+            from gods_mlops.evaluation.report import evaluate_prediction_payload
+
+            prediction_payload = result.get("result_artifact_payload")
+            if not isinstance(prediction_payload, bytes) or not prediction_payload:
+                raise WorkerAuthorizationError("evaluation runner returned no immutable predictions")
+            try:
+                predictions = json.loads(prediction_payload)
+                manifest = contracts.load_manifest(manifest_uri, config=config)
+                contracts.validate_manifest_identity(config, manifest)
+            except Exception as error:  # noqa: BLE001 - reject changed inputs before report creation
+                raise WorkerAuthorizationError("evaluation prediction or manifest identity is invalid") from error
+            current_lineage = await evaluation_publisher.register_model_lineage(
+                model_id=evaluation_model_id,
+                dataset_version=str(claim.dataset_version),
+            )
+            readiness = evaluation_readiness(
+                manifest,
+                current_lineage,
+                model_kind=claim.model_kind,
+                evaluation_split=str(config["evaluation_split"]),
+            )
+            if not readiness["training_ready"] or not readiness["evaluation_eligible"]:
+                raise WorkerAuthorizationError("evaluation eligibility changed before report publication")
+            checkpoint_source = EvaluationCheckpointSource.from_dict(job["source_refs"]["checkpoint"])
+            evaluation_report = evaluate_prediction_payload(
+                manifest=manifest,
+                prediction_payload=predictions,
+                model_kind=claim.model_kind,
+                evaluation_split=str(config["evaluation_split"]),
+                candidate=config["_evaluation_candidate"],
+                baseline=config.get("_evaluation_baseline"),
+                source={
+                    "dataset_version": str(claim.dataset_version),
+                    "manifest_uri": manifest_uri,
+                    "manifest_sha256": claim.input_sha256,
+                    "training_manifest_sha256": checkpoint_source.training_manifest_sha256,
+                    "target": manifest.get("target"),
+                },
+                evaluation_config={
+                    "version": claim.config_version,
+                    "sha256": claim.config_sha256,
+                    "measurement_id": profile.get("measurement_id"),
+                    "split": config["evaluation_split"],
+                    "settings": profile.get("config_json", {}),
+                },
+                current_eligibility=readiness,
+            )
+            evaluation_report["evaluation_job"] = {
+                "job_id": claim.job_id,
+                "phase": claim.phase,
+                "config_version": claim.config_version,
+                "config_sha256": claim.config_sha256,
+                "profile_measurement_id": profile.get("measurement_id"),
+            }
+            evaluation_report["runtime_measurements"] = result.get("resource_measurements", {})
+            result_payload = canonical_json(evaluation_report)
+            result["hash"] = sha256(result_payload).hexdigest()
+            result["result_artifact_kind"] = "evaluation"
+            result["result_artifact_payload"] = result_payload
+
         checkpoint_digest = result.get("checkpoint_sha256")
         checkpoint_payload = result.get("checkpoint_payload")
         if isinstance(checkpoint_payload, bytes) and checkpoint_payload:
@@ -238,6 +348,15 @@ async def run_worker() -> int:
                 )
             finally:
                 await publisher.close()
+        elif claim.phase == "evaluation":
+            if evaluation_publisher is None or evaluation_model_id is None:
+                raise WorkerAuthorizationError("evaluation lineage publisher is unavailable")
+            final_lineage = await evaluation_publisher.register_model_lineage(
+                model_id=evaluation_model_id,
+                dataset_version=str(claim.dataset_version),
+            )
+            if final_lineage.get("evaluation_eligible") is not True:
+                raise WorkerAuthorizationError("evaluation eligibility changed before fenced completion")
         await queue.complete_owned_job(
             job_id=job_id,
             lease_token=lease_token,
@@ -252,6 +371,8 @@ async def run_worker() -> int:
         )
         return 0
     finally:
+        if evaluation_publisher is not None:
+            await evaluation_publisher.close()
         await repository.close()
         await sources.close()
 
@@ -271,6 +392,26 @@ async def _worker_manifest(
         return (
             f"s3://{bucket}/{reference['object_key']}",
             {"manifest_size_bytes": reference["size_bytes"]},
+        )
+    if phase == "evaluation":
+        reference = await queue.source_registry.training_manifest_reference(str(job["dataset_version"]))
+        if reference["sha256"] != job["input_sha256"]:
+            raise WorkerAuthorizationError("published evaluation manifest hash differs from the queued source")
+        checkpoint_source = EvaluationCheckpointSource.from_dict(refs.get("checkpoint"))
+        if (
+            refs.get("dataset_version") != job["dataset_version"]
+            or refs.get("manifest_sha256") != reference["sha256"]
+            or checkpoint_source.dataset_version != job["dataset_version"]
+            or checkpoint_source.training_manifest_sha256 != reference["sha256"]
+        ):
+            raise WorkerAuthorizationError("evaluation source references do not match the published dataset")
+        bucket = _required("GODS_MLOPS_S3_BUCKET")
+        return (
+            f"s3://{bucket}/{reference['object_key']}",
+            {
+                "manifest_size_bytes": reference["size_bytes"],
+                "evaluation_split": refs["evaluation_split"],
+            },
         )
     if phase == "probe":
         if refs.get("schema") != "gods-mlops-probe-input-v1":
@@ -298,6 +439,48 @@ async def _worker_manifest(
         path.write_bytes(payload)
         return str(path), {}
     raise WorkerAuthorizationError("worker phase is unsupported")
+
+
+async def _load_verified_evaluation_checkpoint(queue, store, source: EvaluationCheckpointSource):
+    """Load model bytes only from a successful training job's current DB commit marker."""
+    try:
+        training_job = await queue.get(source.training_job_id)
+        actual_identity = await queue.repository.checkpoint_identity(source.training_job_id)
+        metadata = await queue.repository.checkpoint_metadata_for(source.training_job_id)
+    except Exception as error:  # noqa: BLE001 - do not expose DB/object identities in worker logs
+        raise WorkerAuthorizationError("evaluation training checkpoint metadata is unavailable") from error
+    if (
+        training_job.get("state") != "completed"
+        or training_job.get("phase") != "training"
+        or training_job.get("target_phase") != "training"
+        or training_job.get("model_kind") != source.model_kind
+        or training_job.get("dataset_version") != source.dataset_version
+        or training_job.get("input_kind") != "dataset_version"
+        or training_job.get("input_id") != source.dataset_version
+        or training_job.get("input_sha256") != source.training_manifest_sha256
+        or metadata is None
+    ):
+        raise WorkerAuthorizationError("evaluation requires a successful training checkpoint for this dataset")
+    if (
+        actual_identity.as_dict() != source.checkpoint_identity
+        or metadata.get("identity") != source.checkpoint_identity
+        or metadata.get("uri") != source.checkpoint_uri
+        or metadata.get("sha256") != source.checkpoint_sha256
+        or metadata.get("size_bytes") != source.checkpoint_size_bytes
+    ):
+        raise WorkerAuthorizationError("evaluation checkpoint metadata differs from the immutable source reference")
+    try:
+        verified = store.load_uri(
+            source.checkpoint_uri,
+            expected_identity=actual_identity,
+            expected_sha256=source.checkpoint_sha256,
+            expected_size_bytes=source.checkpoint_size_bytes,
+        )
+    except Exception as error:  # noqa: BLE001 - map storage details to a bounded authorization failure
+        raise WorkerAuthorizationError("evaluation checkpoint bytes failed immutable verification") from error
+    if verified.identity != actual_identity or verified.sha256 != source.checkpoint_sha256:
+        raise WorkerAuthorizationError("verified evaluation checkpoint identity changed during load")
+    return verified
 
 
 async def _recover_committed_result(
@@ -402,6 +585,10 @@ async def _recover_committed_result(
 def _expected_result_kind(claim: WorkerClaim) -> str:
     if claim.phase == "training" or (claim.phase == "probe" and claim.target_phase == "training"):
         return "model"
+    if claim.phase == "evaluation":
+        return "evaluation"
+    if claim.phase == "probe" and claim.target_phase == "evaluation":
+        return "drafts" if claim.model_kind == "detr" else "evaluation_probe"
     if claim.model_kind == "detr" and claim.target_phase == "preparation":
         return "drafts"
     if claim.model_kind == "qwen" and claim.target_phase == "preparation":
@@ -478,6 +665,14 @@ def _runner_for(phase: str, model_kind: str, target_phase: str):
         from .clip import run
 
         return run
+    if phase == "evaluation" and model_kind == "detr":
+        from .detector import run
+
+        return run
+    if phase == "evaluation" and model_kind == "clip":
+        from .clip import run
+
+        return run
     if phase == "preparation" and model_kind == "detr" and target_phase == "preparation":
         from .detector import run
 
@@ -513,7 +708,7 @@ def _probe_verification(
         and checkpoint_digest is not None
         and weights_updated
     )
-    inference_verified = claim.target_phase == "preparation" and int(
+    inference_verified = claim.target_phase in {"preparation", "evaluation"} and int(
         measurements.get("inference_steps", 0)
     ) >= 1
     if claim.model_kind == "clip" and claim.target_phase == "training":

@@ -33,6 +33,14 @@ class DatasetNotReadyForTrainingError(ValueError):
         super().__init__(", ".join(self.reasons))
 
 
+class DatasetNotReadyForEvaluationError(ValueError):
+    """A queue request does not reference a current, evaluation-eligible target."""
+
+    def __init__(self, reasons: list[str] | tuple[str, ...] | str) -> None:
+        self.reasons = (reasons,) if isinstance(reasons, str) else tuple(sorted(set(reasons)))
+        super().__init__(", ".join(self.reasons))
+
+
 class ResourceProfileNotFoundError(ValueError):
     """The requested immutable model/config profile was never registered."""
 
@@ -272,6 +280,7 @@ class PostgresJobQueueRepository:
         parent_job_id: str | None = None,
         retry_root_id: str | None = None,
         oom_retries: int = 0,
+        stable_source_identity: dict[str, Any] | None = None,
     ) -> str:
         await self.ensure_schema()
         stable_identity = {
@@ -285,7 +294,7 @@ class PostgresJobQueueRepository:
             "config_version": profile["config_version"],
             "config_sha256": profile["config_sha256"],
         }
-        dedupe_key = sha256(_canonical_json(stable_identity).encode("utf-8")).hexdigest()
+        dedupe_key = _enqueue_dedupe_key(stable_identity, stable_source_identity)
         job_id = uuid4()
         pool = await self._get_pool()
         async with pool.acquire() as connection:
@@ -1440,21 +1449,25 @@ class PostgresJobQueueRepository:
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             async with connection.transaction():
-                if operation == "result":
+                if operation == "result" or identity.phase == "evaluation":
                     usage = await connection.fetchrow(
                         "SELECT used_bytes FROM ingestion_storage_usage WHERE singleton=TRUE FOR UPDATE"
                     )
                     if usage is None:
                         raise RuntimeError("the shared object-storage ledger is not initialized")
-                    if identity.phase == "training":
+                    if identity.phase in {"training", "evaluation"}:
                         if source_registry is None:
-                            raise ValueError("Task 6 source registry is required before result artifact I/O")
-                        reasons = await source_registry.training_block_reasons_in_transaction(
+                            raise ValueError("Task 6 source registry is required before dataset artifact I/O")
+                        reasons = await _phase_source_block_reasons_in_transaction(
+                            source_registry,
                             connection,
+                            phase=identity.phase,
                             dataset_version=identity.dataset_version,
                             model_kind=identity.model_kind,
                         )
                         if reasons:
+                            if identity.phase == "evaluation":
+                                raise DatasetNotReadyForEvaluationError(reasons)
                             raise DatasetNotReadyForTrainingError(reasons)
                 job, lease = await self._lock_job_then_lease(
                     connection, job_id=job_id, lease_token=lease_token
@@ -1469,6 +1482,10 @@ class PostgresJobQueueRepository:
                     raise StaleCheckpointOwnerError("artifact writer no longer owns the active GPU lease")
                 if identity != _checkpoint_identity_from_row(job) or str(job["job_id"]) != job_id:
                     raise CheckpointIdentityError("artifact write identity differs from the immutable job")
+                if identity.phase == "evaluation":
+                    checkpoint_error = await _evaluation_checkpoint_source_error(connection, job)
+                    if checkpoint_error:
+                        raise CheckpointIdentityError("evaluation checkpoint source changed before artifact write")
                 if (
                     operation == "checkpoint"
                     and str(job["checkpoint_uri"] or "") == uri
@@ -2150,13 +2167,17 @@ class PostgresJobQueueRepository:
                 )
                 if usage is None:
                     raise RuntimeError("the shared object-storage ledger is not initialized")
-                if identity.phase == "training":
-                    source_reasons = await source_registry.training_block_reasons_in_transaction(
+                if identity.phase in {"training", "evaluation"}:
+                    source_reasons = await _phase_source_block_reasons_in_transaction(
+                        source_registry,
                         connection,
+                        phase=identity.phase,
                         dataset_version=identity.dataset_version,
                         model_kind=identity.model_kind,
                     )
                     if source_reasons:
+                        if identity.phase == "evaluation":
+                            raise DatasetNotReadyForEvaluationError(source_reasons)
                         raise DatasetNotReadyForTrainingError(source_reasons)
                 job, lease = await self._lock_job_then_lease(
                     connection, job_id=job_id, lease_token=lease_token
@@ -2171,6 +2192,10 @@ class PostgresJobQueueRepository:
                 expected = _checkpoint_identity_from_row(job)
                 if identity != expected or prepared.identity != expected or str(job["job_id"]) != job_id:
                     raise CheckpointIdentityError("result artifact input, phase, model, or config identity changed")
+                if identity.phase == "evaluation":
+                    checkpoint_error = await _evaluation_checkpoint_source_error(connection, job)
+                    if checkpoint_error:
+                        raise CheckpointIdentityError("evaluation checkpoint source changed before result commit")
                 profile = await connection.fetchrow(
                     """SELECT result_reservation_bytes FROM gods_mlops_resource_profiles
                        WHERE phase=$1 AND model_kind=$2 AND config_version=$3""",
@@ -2290,13 +2315,17 @@ class PostgresJobQueueRepository:
                 )
                 if usage is None:
                     raise RuntimeError("the shared object-storage ledger is not initialized")
-                if identity.phase == "training":
-                    source_reasons = await source_registry.training_block_reasons_in_transaction(
+                if identity.phase in {"training", "evaluation"}:
+                    source_reasons = await _phase_source_block_reasons_in_transaction(
+                        source_registry,
                         connection,
+                        phase=identity.phase,
                         dataset_version=identity.dataset_version,
                         model_kind=identity.model_kind,
                     )
                     if source_reasons:
+                        if identity.phase == "evaluation":
+                            raise DatasetNotReadyForEvaluationError(source_reasons)
                         raise DatasetNotReadyForTrainingError(source_reasons)
                 job, lease = await self._lock_job_then_lease(
                     connection, job_id=job_id, lease_token=lease_token
@@ -2312,9 +2341,13 @@ class PostgresJobQueueRepository:
                     lease is None
                     or str(job["lease_token"]) != str(lease_token)
                     or job["state"] != "running"
-                    or job["phase"] not in {"preparation", "training"}
+                    or job["phase"] not in {"preparation", "training", "evaluation"}
                 ):
-                    raise StaleCheckpointOwnerError("completion does not own a running Task 8 lease")
+                    raise StaleCheckpointOwnerError("completion does not own a running GPU job lease")
+                if identity.phase == "evaluation":
+                    checkpoint_error = await _evaluation_checkpoint_source_error(connection, job)
+                    if checkpoint_error:
+                        raise CheckpointIdentityError("evaluation checkpoint source changed before completion")
                 profile = await connection.fetchrow(
                     """SELECT result_reservation_bytes FROM gods_mlops_resource_profiles
                        WHERE phase=$1 AND model_kind=$2 AND config_version=$3""",
@@ -3019,19 +3052,37 @@ class PostgresJobQueueRepository:
                 )
                 if usage is None:
                     raise RuntimeError("the shared object-storage ledger is not initialized")
-                if job["phase"] == "training":
-                    source_reasons = await source_registry.training_block_reasons_in_transaction(
+                if job["phase"] in {"training", "evaluation"}:
+                    source_reasons = await _phase_source_block_reasons_in_transaction(
+                        source_registry,
                         connection,
+                        phase=job["phase"],
                         dataset_version=job["dataset_version"],
                         model_kind=job["model_kind"],
                     )
+                    if job["phase"] == "evaluation":
+                        checkpoint_source_error = await _evaluation_checkpoint_source_error(connection, job)
+                        if checkpoint_source_error:
+                            source_reasons = tuple(sorted(set([*source_reasons, checkpoint_source_error])))
                     if source_reasons:
+                        evaluation = job["phase"] == "evaluation"
                         priority = (
-                            "source_sample_explicitly_invalidated",
-                            "dataset_source_unavailable",
-                            "dataset_not_training_ready",
+                            (
+                                "evaluation_checkpoint_source_invalid",
+                                "source_sample_explicitly_invalidated",
+                                "dataset_source_unavailable",
+                                "dataset_not_evaluation_eligible",
+                                "late_cross_boundary_link",
+                            )
+                            if evaluation
+                            else (
+                                "source_sample_explicitly_invalidated",
+                                "dataset_source_unavailable",
+                                "dataset_not_training_ready",
+                            )
                         )
                         reason = next((item for item in priority if item in source_reasons), source_reasons[0])
+                        source_reasons_key = "evaluation_block_reasons" if evaluation else "training_block_reasons"
                         updated = await connection.fetchrow(
                             """
                             UPDATE gods_mlops_jobs SET state='failed', reason_code=$2,
@@ -3042,7 +3093,7 @@ class PostgresJobQueueRepository:
                             """,
                             job_id,
                             reason,
-                            _canonical_json({"training_block_reasons": list(source_reasons)}),
+                            _canonical_json({source_reasons_key: list(source_reasons)}),
                         )
                         if updated is None:
                             current_job = await connection.fetchrow(
@@ -3058,7 +3109,7 @@ class PostgresJobQueueRepository:
                             """,
                             job_id,
                             reason,
-                            _canonical_json({"training_block_reasons": list(source_reasons), "lease_not_granted": True}),
+                            _canonical_json({source_reasons_key: list(source_reasons), "lease_not_granted": True}),
                         )
                         return _job_dict(updated)
                 reservation = await connection.fetchrow(
@@ -3256,6 +3307,89 @@ class JobQueue:
             model_kind=model_kind,
             profile=profile,
             rerun=rerun,
+        )
+
+    async def submit_evaluation(
+        self,
+        *,
+        dataset_version: str,
+        model_kind: str,
+        config_version: str,
+        checkpoint_source,
+        evaluation_split: str = "test",
+        baseline_metadata: dict[str, str | None] | None = None,
+        rerun: bool = False,
+    ) -> str:
+        """Queue evaluation against a prior checkpoint with current source checks."""
+        from gods_mlops.jobs.models import EvaluationCheckpointSource
+
+        if model_kind not in {"detr", "clip"}:
+            raise DatasetNotReadyForEvaluationError("evaluation supports DETR or CLIP checkpoints")
+        if evaluation_split not in {"validation", "test"}:
+            raise ValueError("evaluation_split must be validation or test")
+        if not isinstance(checkpoint_source, EvaluationCheckpointSource):
+            raise ValueError("evaluation requires a typed immutable prior-checkpoint source")
+        if (
+            checkpoint_source.dataset_version != dataset_version
+            or checkpoint_source.model_kind != model_kind
+        ):
+            raise ValueError("evaluation checkpoint source differs from the requested dataset or model")
+        baseline = None
+        if baseline_metadata is not None:
+            if not isinstance(baseline_metadata, dict) or set(baseline_metadata) - {"model_id", "revision"}:
+                raise ValueError("baseline metadata must contain only model_id and revision")
+            model_id = baseline_metadata.get("model_id")
+            revision = baseline_metadata.get("revision")
+            if not isinstance(model_id, str) or not model_id.strip():
+                raise ValueError("baseline model_id metadata must be non-empty")
+            if revision is not None and (not isinstance(revision, str) or not revision.strip()):
+                raise ValueError("baseline revision metadata must be non-empty")
+            baseline = {"model_id": model_id, "revision": revision, "verified": False}
+        try:
+            source: DatasetTrainingSource = await self._sources.get_training_source(dataset_version)
+        except DatasetSourceUnavailableError:
+            raise
+        reasons = source.evaluation_block_reasons()
+        if source.target not in {model_kind, "both"}:
+            reasons = tuple(sorted(set([*reasons, f"dataset_target_not_{model_kind}"])))
+        if checkpoint_source.training_manifest_sha256 != source.manifest_sha256:
+            reasons = tuple(sorted(set([*reasons, "checkpoint_training_manifest_mismatch"])))
+        if reasons:
+            raise DatasetNotReadyForEvaluationError(reasons)
+        profile = await self._repository.get_profile(
+            phase="evaluation", model_kind=model_kind, config_version=config_version
+        )
+        if profile is None:
+            raise ResourceProfileNotFoundError("evaluation config has no phase-specific resource profile")
+        if profile.get("profile_state") != "measured":
+            raise ResourceProfileConflictError("evaluation jobs require a successfully measured phase-specific profile")
+        source_refs = {
+            "schema": "gods-mlops-evaluation-source-v1",
+            "dataset_version": source.dataset_version,
+            "manifest_sha256": source.manifest_sha256,
+            "target": source.target,
+            "evaluation_split": evaluation_split,
+            "checkpoint": checkpoint_source.as_dict(),
+        }
+        if baseline is not None:
+            source_refs["baseline"] = baseline
+        stable_source_identity = {
+            "checkpoint": checkpoint_source.as_dict(),
+            "evaluation_split": evaluation_split,
+        }
+        if baseline is not None:
+            stable_source_identity["baseline"] = baseline
+        return await self._repository.enqueue(
+            phase="evaluation",
+            input_kind="dataset_version",
+            input_id=source.dataset_version,
+            input_sha256=source.manifest_sha256,
+            dataset_version=source.dataset_version,
+            source_refs=source_refs,
+            model_kind=model_kind,
+            profile=profile,
+            rerun=rerun,
+            stable_source_identity=stable_source_identity,
         )
 
     async def submit_probe(
@@ -3675,21 +3809,45 @@ class JobQueue:
             reasons.add(f"dataset_target_not_{job['model_kind']}")
         return tuple(sorted(reasons))
 
+    async def evaluation_source_block_reasons(self, job_id: str) -> tuple[str, ...]:
+        job = await self.get(job_id)
+        if job["phase"] != "evaluation":
+            return ()
+        try:
+            source = await self._sources.get_training_source(job["dataset_version"])
+        except DatasetSourceUnavailableError:
+            return ("dataset_source_unavailable",)
+        reasons = set(source.evaluation_block_reasons())
+        if source.target not in {job["model_kind"], "both"}:
+            reasons.add(f"dataset_target_not_{job['model_kind']}")
+        return tuple(sorted(reasons))
+
     async def fail_for_source_readiness(
         self,
         job_id: str,
         reasons: tuple[str, ...],
     ) -> dict[str, Any]:
+        job = await self.get(job_id)
+        evaluation = job.get("phase") == "evaluation"
         priority = (
-            "source_sample_explicitly_invalidated",
-            "dataset_source_unavailable",
-            "dataset_not_training_ready",
+            (
+                "source_sample_explicitly_invalidated",
+                "dataset_source_unavailable",
+                "dataset_not_evaluation_eligible",
+                "late_cross_boundary_link",
+            )
+            if evaluation
+            else (
+                "source_sample_explicitly_invalidated",
+                "dataset_source_unavailable",
+                "dataset_not_training_ready",
+            )
         )
         reason = next((item for item in priority if item in reasons), reasons[0])
         return await self._repository.fail_job_for_source(
             job_id,
             reason,
-            {"training_block_reasons": list(reasons)},
+            {"evaluation_block_reasons" if evaluation else "training_block_reasons": list(reasons)},
         )
 
     async def close(self) -> None:
@@ -3703,6 +3861,95 @@ class JobQueue:
     @property
     def repository(self) -> PostgresJobQueueRepository:
         return self._repository
+
+
+async def _phase_source_block_reasons_in_transaction(
+    source_registry: DatasetSourceRegistry,
+    connection: asyncpg.Connection,
+    *,
+    phase: str,
+    dataset_version: str | None,
+    model_kind: str,
+) -> tuple[str, ...]:
+    if dataset_version is None:
+        return ("dataset_source_unavailable",)
+    if phase == "training":
+        return await source_registry.training_block_reasons_in_transaction(
+            connection,
+            dataset_version=dataset_version,
+            model_kind=model_kind,
+        )
+    if phase == "evaluation":
+        return await source_registry.evaluation_block_reasons_in_transaction(
+            connection,
+            dataset_version=dataset_version,
+            model_kind=model_kind,
+        )
+    return ()
+
+
+async def _evaluation_checkpoint_source_error(connection: asyncpg.Connection, evaluation_job: Any) -> str | None:
+    """Revalidate a typed prior checkpoint against its durable training/job rows."""
+    from gods_mlops.jobs.models import EvaluationCheckpointSource
+
+    evaluation_row = dict(evaluation_job)
+    source_refs = _json_value(evaluation_row.get("source_refs", {}))
+    if not isinstance(source_refs, dict) or source_refs.get("schema") != "gods-mlops-evaluation-source-v1":
+        return "evaluation_checkpoint_source_invalid"
+    try:
+        source = EvaluationCheckpointSource.from_dict(source_refs.get("checkpoint"))
+    except (TypeError, ValueError):
+        return "evaluation_checkpoint_source_invalid"
+
+    training_job = await connection.fetchrow(
+        "SELECT * FROM gods_mlops_jobs WHERE job_id = $1::uuid",
+        source.training_job_id,
+    )
+    if training_job is None:
+        return "evaluation_checkpoint_source_invalid"
+    training_row = dict(training_job)
+    training_profile = await connection.fetchrow(
+        """SELECT phase, model_kind, config_version, config_sha256,
+                  profile_state, config_json
+           FROM gods_mlops_resource_profiles
+           WHERE phase = 'training' AND model_kind = $1 AND config_version = $2""",
+        training_row.get("model_kind"),
+        training_row.get("config_version"),
+    )
+    if training_profile is None:
+        return "evaluation_checkpoint_source_invalid"
+    checkpoint_event = await connection.fetchrow(
+        """SELECT details FROM gods_mlops_job_events
+           WHERE job_id = $1::uuid AND event_type = 'checkpoint_committed'
+             AND details->>'checkpoint_uri' = $2 AND details->>'sha256' = $3
+           ORDER BY event_id DESC LIMIT 1""",
+        source.training_job_id,
+        source.checkpoint_uri,
+        source.checkpoint_sha256,
+    )
+    if checkpoint_event is None:
+        return "evaluation_checkpoint_source_invalid"
+    details = _json_value(checkpoint_event["details"])
+    try:
+        source.validate_training_origin(
+            training_row,
+            dict(training_profile),
+            details,
+        )
+    except (TypeError, ValueError):
+        return "evaluation_checkpoint_source_invalid"
+    return None
+
+
+def _enqueue_dedupe_key(
+    stable_identity: dict[str, Any],
+    stable_source_identity: dict[str, Any] | None = None,
+) -> str:
+    """Bind an optional typed immutable secondary input into automatic job identity."""
+    value = stable_identity
+    if stable_source_identity is not None:
+        value = {**stable_identity, "stable_source_identity": stable_source_identity}
+    return sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
 def _canonical_json(value: Any) -> str:

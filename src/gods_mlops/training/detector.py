@@ -13,6 +13,7 @@ from .claims import WorkerYieldRequested
 
 from .contracts import load_manifest, locked_model, validate_manifest_identity
 from .data import load_rgb_image
+from .runner_support import resource_measurements, write_json
 
 
 def to_coco_annotations(
@@ -111,6 +112,16 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
     if person_class_id is None:
         raise ValueError("locked RT-DETRv2 revision has no person class mapping")
     output_path = _output_path(output_uri)
+
+    if phase == "evaluation":
+        from gods_mlops.evaluation.eligibility import apply_verified_model_weights
+
+        apply_verified_model_weights(
+            model,
+            config,
+            model_kind="detr",
+            model_revision=model_lock.revision,
+        )
 
     if target_phase in {"preparation", "evaluation"}:
         return _draft_detections(
@@ -359,10 +370,11 @@ def _draft_detections(
             inputs = processor(images=image, return_tensors="pt")
             inputs = _move_inputs(inputs, device)
             outputs = model(**inputs)
+            inference_threshold = 0.0 if config.get("target_phase") == "evaluation" else threshold
             results = processor.post_process_object_detection(
                 outputs,
                 target_sizes=torch.tensor([[image.height, image.width]], device=device),
-                threshold=threshold,
+                threshold=inference_threshold,
             )[0]
             detections = []
             for score, label, box in zip(results["scores"], results["labels"], results["boxes"], strict=True):
@@ -425,6 +437,16 @@ def _detector_items(manifest: dict[str, Any], config: dict[str, Any]) -> list[di
         selected = [item for item in items if item.get("kind") == "frame" and item.get("split") == "train"]
     elif config.get("phase") == "preparation":
         selected = [item for item in items if item.get("item_kind") == "frame"]
+    elif config.get("phase") == "evaluation":
+        split = config.get("evaluation_split")
+        if split not in {"validation", "test"}:
+            raise ValueError("DETR evaluation requires a validation or test split")
+        selected = [
+            item
+            for item in items
+            if (item.get("kind") == "frame" or item.get("item_kind") == "frame")
+            and item.get("split") == split
+        ]
     else:
         selected = [item for item in items if item.get("kind") == "frame" or item.get("item_kind") == "frame"]
     if not selected:
@@ -435,6 +457,12 @@ def _detector_items(manifest: dict[str, Any], config: dict[str, Any]) -> list[di
             raise ValueError("DETR preparation profile needs a positive max_draft_frames bound")
         if len(selected) > limit:
             raise ValueError("DETR preparation input exceeds its versioned max_draft_frames bound")
+    if config.get("phase") == "probe" and config.get("target_phase") == "evaluation":
+        limit = config.get("max_evaluation_frames", 1)
+        if type(limit) is not int or limit < 1:
+            raise ValueError("DETR evaluation probe needs a positive max_evaluation_frames bound")
+        if len(selected) > limit:
+            raise ValueError("DETR evaluation probe input exceeds its versioned frame bound")
     return selected
 
 

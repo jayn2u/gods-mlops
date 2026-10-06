@@ -844,6 +844,8 @@ async def _probe_result_artifact(
     artifacts = await queue.repository.result_artifacts_for(job_id)
     if target_phase == "preparation":
         expected_kind = "drafts" if identity.model_kind == "detr" else "caption_drafts"
+    elif target_phase == "evaluation":
+        expected_kind = "drafts" if identity.model_kind == "detr" else "evaluation_probe"
     else:
         expected_kind = "model"
     matches = [
@@ -865,6 +867,12 @@ async def _probe_result_artifact(
         output = {
             "result_document": json.loads(payload),
             "resource_measurements": artifact.get("runtime_measurements"),
+        }
+    elif target_phase == "evaluation":
+        output = {
+            "fixture_probe_document": json.loads(payload),
+            "resource_measurements": artifact.get("runtime_measurements"),
+            "human_relevance_truth_used": False,
         }
     elif identity.model_kind == "qwen":
         output = json.loads(payload)

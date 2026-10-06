@@ -152,6 +152,40 @@ def validate_worker_claim(
             raise WorkerAuthorizationError("training worker profile is not measured and allowlisted")
     if claim.phase == "training" and claim.input_kind != "dataset_version":
         raise WorkerAuthorizationError("training worker requires a published dataset version")
+    if claim.phase == "evaluation":
+        from gods_mlops.jobs.models import EvaluationCheckpointSource
+
+        if claim.input_kind != "dataset_version" or claim.dataset_version != claim.input_id:
+            raise WorkerAuthorizationError("evaluation worker requires its published dataset version")
+        source_refs = job.get("source_refs")
+        if not isinstance(source_refs, dict) or source_refs.get("schema") != "gods-mlops-evaluation-source-v1":
+            raise WorkerAuthorizationError("evaluation worker has no typed immutable source reference")
+        if (
+            source_refs.get("dataset_version") != claim.dataset_version
+            or source_refs.get("manifest_sha256") != claim.input_sha256
+            or source_refs.get("target") not in {claim.model_kind, "both"}
+            or source_refs.get("evaluation_split") not in {"validation", "test"}
+        ):
+            raise WorkerAuthorizationError("evaluation source dataset identity differs from the immutable job")
+        baseline = source_refs.get("baseline")
+        if baseline is not None and (
+            not isinstance(baseline, dict)
+            or set(baseline) != {"model_id", "revision", "verified"}
+            or baseline.get("verified") is not False
+            or not isinstance(baseline.get("model_id"), str)
+            or not baseline["model_id"].strip()
+        ):
+            raise WorkerAuthorizationError("evaluation baseline is metadata only and cannot claim verification")
+        try:
+            checkpoint_source = EvaluationCheckpointSource.from_dict(source_refs.get("checkpoint"))
+        except (TypeError, ValueError) as error:
+            raise WorkerAuthorizationError("evaluation checkpoint source is invalid") from error
+        if (
+            checkpoint_source.dataset_version != claim.dataset_version
+            or checkpoint_source.training_manifest_sha256 != claim.input_sha256
+            or checkpoint_source.model_kind != claim.model_kind
+        ):
+            raise WorkerAuthorizationError("evaluation checkpoint source differs from the immutable dataset job")
     if claim.phase == "preparation" and claim.input_kind != "annotation_batch":
         raise WorkerAuthorizationError("preparation worker requires an immutable annotation batch")
     if claim.image_id != "sha256:" + claim.image_id.removeprefix("sha256:") or not _SHA256.fullmatch(
@@ -188,6 +222,12 @@ async def validate_current_worker_claim(
         if reasons:
             raise WorkerAuthorizationError(
                 "training source readiness changed: " + ", ".join(reasons)
+            )
+    elif claim.phase == "evaluation":
+        reasons = await queue.evaluation_source_block_reasons(claim.job_id)
+        if reasons:
+            raise WorkerAuthorizationError(
+                "evaluation source readiness changed: " + ", ".join(reasons)
             )
     elif claim.phase == "preparation":
         batch = _annotation_batch_from_job(job)

@@ -69,6 +69,19 @@ def validate_manifest_identity(config: dict[str, Any], manifest: dict[str, Any])
             raise ValueError("training manifest is not training-ready")
         if manifest.get("target") not in {model_kind, "both"}:
             raise ValueError("published dataset target does not include this model")
+    elif phase == "evaluation":
+        if input_kind != "dataset_version" or not dataset_version or str(dataset_version) != input_id:
+            raise ValueError("evaluation requires a published dataset version")
+        if manifest.get("dataset_version") != input_id or manifest.get("schema_version") != 1:
+            raise ValueError("manifest dataset version does not match the immutable evaluation job")
+        if sha256(canonical_json(manifest)).hexdigest() != expected_sha:
+            raise ValueError("evaluation manifest content hash does not match the immutable job")
+        if manifest.get("training", {}).get("ready") is not True:
+            raise ValueError("evaluation manifest was not published training-ready")
+        if manifest.get("target") not in {model_kind, "both"}:
+            raise ValueError("published dataset target does not include this evaluation model")
+        if manifest.get("evaluation", {}).get("eligible") is not True:
+            raise ValueError("evaluation manifest was published with insufficient evaluation inputs")
     elif phase == "preparation":
         if input_kind != "annotation_batch" or dataset_version is not None:
             raise ValueError("preparation requires a pre-publication annotation batch")
@@ -106,7 +119,11 @@ def validate_manifest_identity(config: dict[str, Any], manifest: dict[str, Any])
     if manifest_model is not None and manifest_model != model_kind:
         raise ValueError("manifest model kind does not match the immutable job")
     manifest_config_version = manifest.get("config_version")
-    if manifest_config_version is not None and manifest_config_version != config.get("config_version"):
+    if (
+        phase != "evaluation"
+        and manifest_config_version is not None
+        and manifest_config_version != config.get("config_version")
+    ):
         raise ValueError("manifest config version does not match the immutable job")
     return {
         "phase": phase,

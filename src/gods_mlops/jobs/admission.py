@@ -178,15 +178,19 @@ class GpuAdmission:
         job = await self._queue.get(job_id)
         if job["state"] in {"completed", "failed", "cancelled"}:
             return job
-        source_reasons = await self._queue.training_source_block_reasons(job_id)
+        if job["phase"] == "evaluation":
+            source_reasons = await self._queue.evaluation_source_block_reasons(job_id)
+        else:
+            source_reasons = await self._queue.training_source_block_reasons(job_id)
         if source_reasons:
             current_lease = await self._repository.get_active_lease(observation.gpu_uuid)
             if current_lease is not None and current_lease["job_id"] == job_id:
-                reason = (
-                    "source_sample_explicitly_invalidated"
-                    if "source_sample_explicitly_invalidated" in source_reasons
-                    else "dataset_source_unavailable"
-                )
+                if "source_sample_explicitly_invalidated" in source_reasons:
+                    reason = "source_sample_explicitly_invalidated"
+                elif job["phase"] == "evaluation":
+                    reason = "evaluation_source_eligibility_changed"
+                else:
+                    reason = "dataset_source_unavailable"
                 await self._queue.request_yield(job_id, reason=reason)
                 return await self._queue.get(job_id)
             return await self._queue.fail_for_source_readiness(job_id, source_reasons)
