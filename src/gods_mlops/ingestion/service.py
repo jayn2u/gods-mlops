@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import partial
 from hashlib import sha256
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 import anyio
@@ -23,6 +23,8 @@ from .storage import PostgresIngestionRepository, S3SampleStore, sample_object_k
 
 class IngestionRepository(Protocol):
     """Describe durable sample reservation and receipt operations."""
+
+    async def list_samples(self, *, limit: int = 100, state: str | None = None) -> list[dict[str, Any]]: ...
 
     async def reserve(
         self,
@@ -113,6 +115,10 @@ class IngestionService:
         """Check both durable dependencies before reporting the receiver ready."""
         await self._repository.ready()
         await anyio.to_thread.run_sync(self._objects.ready)
+
+    async def list_samples(self, *, limit: int = 100, state: str | None = None) -> list[dict[str, Any]]:
+        """List durable candidate status without exposing object-store paths."""
+        return await self._repository.list_samples(limit=limit, state=state)
 
     async def prune_expired(self, *, limit: int = 100) -> int:
         """Delete only expired, unselected objects and retain idempotency tombstones."""

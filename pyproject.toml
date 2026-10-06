@@ -35,6 +35,9 @@ dev = [
     "kfp-kubernetes==2.16.1",
     "pytest==8.4.2",
 ]
+e2e = [
+    "playwright==1.63.0",
+]
 
 [build-system]
 requires = ["hatchling==1.27.0"]

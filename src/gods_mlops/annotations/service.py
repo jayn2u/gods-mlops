@@ -15,6 +15,10 @@ class AnnotationService:
         self._repository = repository
         self._label_studio = label_studio
 
+    @property
+    def label_studio_configured(self) -> bool:
+        return self._label_studio is not None
+
     async def finalize_annotation(self, sample_id: str, revision: str) -> dict[str, Any]:
         """Persist a submitted Label Studio annotation as an immutable local revision."""
         sample_uuid = UUID(sample_id)
@@ -33,3 +37,12 @@ class AnnotationService:
             annotation=annotation,
             task=task,
         )
+
+    async def list_reviews(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """List durable assignment and provenance state without labeling drafts as human-approved."""
+        return await self._repository.list_review_assignments(limit=limit)
+
+    async def start_bbox_review(self, sample_id: str, *, project_id: int, workflow) -> dict[str, Any]:
+        """Start a frame review through the existing assignment and Label Studio workflow."""
+        sample_uuid = UUID(sample_id)
+        return await workflow.start_bbox_review(sample_id=sample_uuid, project_id=project_id)

@@ -75,6 +75,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     check_training.add_argument("--require-cuda", action="store_true")
 
+    commands.add_parser("operator-ui", help="start the loopback-only single-operator web interface")
+
     lifecycle = commands.add_parser("lifecycle", help="plan and verify the Gods data-preserving lifecycle")
     lifecycle_commands = lifecycle.add_subparsers(dest="lifecycle_command", required=True)
     for command_name, help_text in (
@@ -181,6 +183,15 @@ def main(argv: list[str] | None = None) -> int:
     privilege_probe.add_argument("--ask-become-pass", action="store_true", help="let Ansible prompt for normal sudo authentication")
 
     args = parser.parse_args(argv)
+    if args.command == "operator-ui":
+        from gods_mlops.web.app import main as operator_ui_main
+
+        try:
+            operator_ui_main()
+        except (ValueError, OSError) as error:
+            print(f"ERROR: {error}", file=sys.stderr)
+            return 1
+        return 0
     try:
         if args.command == "check-locks":
             models = load_model_lock(args.model_lock)

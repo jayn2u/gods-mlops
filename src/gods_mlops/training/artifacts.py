@@ -107,6 +107,16 @@ class S3ResultArtifactStore:
 
     def verify_committed(self, details: dict[str, Any], *, expected_identity: Any) -> VerifiedResultArtifact:
         """Read and verify one already committed S3 result without publishing new bytes."""
+        verified, _payload = self.read_committed(details, expected_identity=expected_identity)
+        return verified
+
+    def read_committed(
+        self,
+        details: dict[str, Any],
+        *,
+        expected_identity: Any,
+    ) -> tuple[VerifiedResultArtifact, bytes]:
+        """Return bytes only after the immutable key, identity, size, and digest match."""
         if not isinstance(details, dict) or details.get("identity") != expected_identity.as_dict():
             raise ResultArtifactIntegrityError("committed result identity differs from the current job")
         kind = details.get("kind")
@@ -123,18 +133,21 @@ class S3ResultArtifactStore:
         uri = f"s3://{self._bucket}/{object_key}"
         if details.get("object_key") != object_key or details.get("uri") != uri:
             raise ResultArtifactIntegrityError("committed result URI differs from its immutable job key")
-        self._objects.read_source(
+        payload = self._objects.read_source(
             object_key=object_key,
             sha256_digest=digest,
             size_bytes=size_bytes,
         )
-        return VerifiedResultArtifact(
-            identity=expected_identity,
-            kind=kind,
-            sha256=digest,
-            size_bytes=size_bytes,
-            uri=uri,
-            object_key=object_key,
+        return (
+            VerifiedResultArtifact(
+                identity=expected_identity,
+                kind=kind,
+                sha256=digest,
+                size_bytes=size_bytes,
+                uri=uri,
+                object_key=object_key,
+            ),
+            payload,
         )
 
 

@@ -137,6 +137,169 @@ class DatasetPublisher:
             ),
         )
 
+    async def list_publications(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """List immutable dataset status and the original eligibility reasons."""
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("dataset list limit must be between 1 and 500")
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT dataset_version, manifest_sha256, manifest_object_key, split_counts,
+                       state, training_ready, training_reasons, evaluation_eligible,
+                       evaluation_reasons, relevance_revision_ids, published_at
+                FROM dataset_versions
+                ORDER BY created_at DESC, dataset_version ASC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return [_response(row) for row in rows]
+
+    async def list_publication_candidates(self, *, limit: int = 100) -> dict[str, list[dict[str, Any]]]:
+        """List received frames and stored crops with their current review state."""
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("publication candidate limit must be between 1 and 500")
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            samples = await connection.fetch(
+                """
+                SELECT sample.sample_id, sample.camera_id, sample.captured_at_utc,
+                       sample.reason, sample.state, sample.selected, sample.object_size_bytes,
+                       head.latest_bbox_revision, head.current_bbox_assignment_revision
+                FROM ingestion_samples AS sample
+                LEFT JOIN sample_annotation_heads AS head USING (sample_id)
+                WHERE sample.state = 'received'
+                ORDER BY sample.captured_at_utc DESC, sample.sample_id ASC
+                LIMIT $1
+                """,
+                limit,
+            )
+            crops = await connection.fetch(
+                """
+                SELECT crop.crop_id, crop.sample_id, crop.bbox_revision,
+                       crop.caption_revision_id, crop.state, crop.caption_state, crop.sha256
+                FROM annotation_crops AS crop
+                JOIN ingestion_samples AS sample USING (sample_id)
+                WHERE crop.state = 'ready' AND sample.state = 'received'
+                ORDER BY crop.updated_at DESC, crop.crop_id ASC
+                LIMIT $1
+                """,
+                limit,
+            )
+        return {
+            "samples": [
+                {
+                    "sample_id": str(row["sample_id"]),
+                    "camera_id": str(row["camera_id"]),
+                    "captured_at_utc": row["captured_at_utc"].isoformat(),
+                    "reason": row["reason"],
+                    "state": row["state"],
+                    "selected": bool(row["selected"]),
+                    "object_size_bytes": row["object_size_bytes"],
+                    "latest_bbox_revision": (
+                        str(row["latest_bbox_revision"]) if row["latest_bbox_revision"] is not None else None
+                    ),
+                    "bbox_reviewed": (
+                        row["latest_bbox_revision"] is not None
+                        and row["current_bbox_assignment_revision"] is None
+                    ),
+                }
+                for row in samples
+            ],
+            "crops": [
+                {
+                    "crop_id": str(row["crop_id"]),
+                    "sample_id": str(row["sample_id"]),
+                    "bbox_revision": str(row["bbox_revision"]),
+                    "caption_revision_id": (
+                        str(row["caption_revision_id"])
+                        if row["caption_revision_id"] is not None
+                        else None
+                    ),
+                    "state": row["state"],
+                    "caption_state": row["caption_state"],
+                    "sha256": row["sha256"].strip(),
+                }
+                for row in crops
+            ],
+        }
+
+    async def publication_selection(
+        self,
+        *,
+        target: str,
+        sample_ids: list[str] | tuple[str, ...] = (),
+        crop_ids: list[str] | tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        """Pin only current finalized review revisions for the existing publisher."""
+        if target not in {"detr", "clip", "both"}:
+            raise ValueError("selection target must be detr, clip, or both")
+        normalized_samples = _uuid_list(list(sample_ids), "sample_ids")
+        normalized_crops = _uuid_list(list(crop_ids), "crop_ids")
+        if target in {"detr", "both"} and not normalized_samples:
+            raise ValueError("DETR publication selection requires reviewed samples")
+        if target in {"clip", "both"} and not normalized_crops:
+            raise ValueError("CLIP publication selection requires reviewed crops")
+
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        bbox_revisions: dict[str, str] = {}
+        caption_revisions: dict[str, str] = {}
+        async with pool.acquire() as connection:
+            if normalized_samples:
+                rows = await connection.fetch(
+                    """
+                    SELECT head.sample_id, head.latest_bbox_revision AS bbox_revision,
+                           head.current_bbox_assignment_revision
+                    FROM sample_annotation_heads AS head
+                    JOIN annotation_revisions AS revision
+                      ON revision.annotation_revision_id = head.latest_bbox_revision
+                    WHERE head.sample_id = ANY($1::uuid[]) AND revision.stage = 'bbox'
+                    """,
+                    [UUID(value) for value in normalized_samples],
+                )
+                for row in rows:
+                    if row["current_bbox_assignment_revision"] is not None:
+                        continue
+                    bbox_revisions[str(row["sample_id"])] = str(row["bbox_revision"])
+            if normalized_crops:
+                rows = await connection.fetch(
+                    """
+                    SELECT crop.crop_id, crop.caption_revision_id
+                    FROM annotation_crops AS crop
+                    JOIN annotation_revisions AS revision
+                      ON revision.annotation_revision_id = crop.caption_revision_id
+                    WHERE crop.crop_id = ANY($1::uuid[])
+                      AND crop.state = 'ready' AND crop.caption_state = 'reviewed'
+                      AND revision.stage = 'caption'
+                    """,
+                    [UUID(value) for value in normalized_crops],
+                )
+                caption_revisions = {
+                    str(row["crop_id"]): str(row["caption_revision_id"])
+                    for row in rows
+                }
+        if target in {"detr", "both"} and set(bbox_revisions) != set(normalized_samples):
+            raise DatasetPublicationError("every selected sample needs a finalized bbox review")
+        if target in {"clip", "both"} and set(caption_revisions) != set(normalized_crops):
+            raise DatasetPublicationError("every selected crop needs a finalized caption review")
+        return _normalize_selection(
+            {
+                "target": target,
+                "sample_ids": normalized_samples,
+                "crop_ids": normalized_crops,
+                "bbox_revisions": bbox_revisions,
+                "caption_revisions": caption_revisions,
+                "evaluation_gallery_crop_ids": [],
+                "event_links": [],
+                "clip_links": [],
+                "relevance_reviews": [],
+            }
+        )
+
     async def publish_dataset(self, selection: dict[str, Any], config_version: str) -> dict[str, Any]:
         normalized = _normalize_selection(selection)
         if not isinstance(config_version, str) or not config_version.strip() or len(config_version) > 255:
@@ -257,6 +420,89 @@ class DatasetPublisher:
 
         await self.ensure_schema()
         return await invalidate_sample_in_repository(self, sample_id)
+
+    async def preview_sample_invalidation(self, sample_id: str) -> dict[str, Any]:
+        """Read dataset, model, review, and active-job impact before explicit invalidation."""
+        try:
+            sample_uuid = UUID(sample_id)
+        except (TypeError, ValueError) as error:
+            raise ValueError("sample_id must be a UUID") from error
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            sample = await connection.fetchrow(
+                "SELECT sample_id, state, selected FROM ingestion_samples WHERE sample_id = $1",
+                sample_uuid,
+            )
+            if sample is None:
+                return {
+                    "sample_id": str(sample_uuid),
+                    "sample_exists": False,
+                    "physical_deletion": False,
+                    "datasets": [],
+                    "dataset_states": {},
+                    "models": [],
+                    "active_review_count": 0,
+                    "active_job_count": 0,
+                    "retained_for_review": False,
+                    "block_training": False,
+                    "block_evaluation": False,
+                }
+            versions = await connection.fetch(
+                """
+                SELECT version.dataset_version, version.state
+                FROM dataset_versions AS version
+                WHERE version.dataset_version IN (
+                    SELECT item.dataset_version FROM dataset_items AS item WHERE item.sample_id = $1
+                ) AND version.state IN ('publishing', 'published', 'invalidated')
+                ORDER BY version.dataset_version
+                """,
+                sample_uuid,
+            )
+            version_ids = [row["dataset_version"] for row in versions]
+            if version_ids:
+                model_rows = await connection.fetch(
+                    """
+                    SELECT DISTINCT model_id FROM dataset_model_lineage
+                    WHERE dataset_version = ANY($1::text[]) ORDER BY model_id
+                    """,
+                    version_ids,
+                )
+                active_jobs = await connection.fetchval(
+                    """
+                    SELECT count(DISTINCT job.job_id)
+                    FROM gods_mlops_jobs AS job
+                    JOIN dataset_items AS item ON item.dataset_version = job.dataset_version
+                    WHERE item.sample_id = $1
+                      AND job.state IN ('queued', 'waiting_profile', 'waiting_gpu', 'waiting_storage',
+                                        'waiting_capacity', 'running', 'yield_requested', 'retrying')
+                    """,
+                    sample_uuid,
+                )
+            else:
+                model_rows = []
+                active_jobs = 0
+            active_reviews = await connection.fetchval(
+                """
+                SELECT count(*) FROM review_assignments
+                WHERE sample_id = $1 AND state IN ('active', 'provisioning')
+                """,
+                sample_uuid,
+            )
+        return {
+            "sample_id": str(sample_uuid),
+            "sample_exists": True,
+            "sample_state": sample["state"],
+            "physical_deletion": False,
+            "datasets": version_ids,
+            "dataset_states": {row["dataset_version"]: row["state"] for row in versions},
+            "models": [row["model_id"] for row in model_rows],
+            "active_review_count": int(active_reviews or 0),
+            "active_job_count": int(active_jobs or 0),
+            "retained_for_review": bool(sample["selected"] or active_reviews),
+            "block_training": True,
+            "block_evaluation": True,
+        }
 
     async def ensure_schema(self) -> None:
         if self._schema_ready:

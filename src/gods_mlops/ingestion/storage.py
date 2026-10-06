@@ -420,6 +420,51 @@ class PostgresIngestionRepository:
                 "SELECT state FROM ingestion_samples WHERE sample_id = $1", sample_id
             )
 
+    async def list_samples(self, *, limit: int = 100, state: str | None = None) -> list[dict[str, Any]]:
+        """Return operator-safe candidate metadata without internal object keys."""
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("sample list limit must be between 1 and 500")
+        if state is not None and state not in {
+            "pending",
+            "received",
+            "storage_limited",
+            "purge_pending",
+            "expired",
+        }:
+            raise ValueError("sample state filter is invalid")
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT sample_id, camera_id, captured_at_utc, reason, sha256, state,
+                       selected, object_size_bytes, last_failure_code, received_at, retention_until
+                FROM ingestion_samples
+                WHERE ($2::text IS NULL OR state = $2)
+                ORDER BY captured_at_utc DESC, sample_id ASC
+                LIMIT $1
+                """,
+                limit,
+                state,
+            )
+        return [
+            {
+                "sample_id": str(row["sample_id"]),
+                "camera_id": str(row["camera_id"]),
+                "captured_at_utc": row["captured_at_utc"].isoformat(),
+                "reason": row["reason"],
+                "sha256": row["sha256"].strip(),
+                "state": row["state"],
+                "selected": bool(row["selected"]),
+                "object_size_bytes": row["object_size_bytes"],
+                "last_failure_code": row["last_failure_code"],
+                "received_at": row["received_at"].isoformat() if row["received_at"] is not None else None,
+                "retention_until": (
+                    row["retention_until"].isoformat() if row["retention_until"] is not None else None
+                ),
+            }
+            for row in rows
+        ]
+
     async def ready(self) -> None:
         """Check that PostgreSQL accepts a process-owned query."""
         pool = await self._get_pool()

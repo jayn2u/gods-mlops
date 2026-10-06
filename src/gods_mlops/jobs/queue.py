@@ -36,6 +36,13 @@ _PROBE_RUNTIME_EVIDENCE_FIELDS = (
     "image_source_commit",
     "source_commit",
 )
+_OPERATOR_QUEUE_STATES = (
+    "queued",
+    "waiting_profile",
+    "waiting_gpu",
+    "waiting_storage",
+    "waiting_capacity",
+)
 
 
 class DatasetNotReadyForTrainingError(ValueError):
@@ -64,6 +71,10 @@ class ResourceProfileConflictError(ValueError):
 
 class ResultArtifactConflictError(ValueError):
     """A job attempted to publish different bytes for the same result artifact kind."""
+
+
+class OperatorRetryIntentConflictError(ValueError):
+    """An operator reused one retry intent for a different immutable request."""
 
 
 class ObservationReplayError(ValueError):
@@ -294,7 +305,12 @@ class PostgresJobQueueRepository:
         retry_root_id: str | None = None,
         oom_retries: int = 0,
         stable_source_identity: dict[str, Any] | None = None,
+        operator_dedupe_key: str | None = None,
     ) -> str:
+        if operator_dedupe_key is not None:
+            _validate_digest(operator_dedupe_key, "operator_dedupe_key")
+            if not rerun or parent_job_id is None:
+                raise ValueError("operator retry deduplication requires an explicit parent rerun")
         await self.ensure_schema()
         stable_identity = {
             "phase": phase,
@@ -308,6 +324,10 @@ class PostgresJobQueueRepository:
             "config_sha256": profile["config_sha256"],
         }
         dedupe_key = _enqueue_dedupe_key(stable_identity, stable_source_identity)
+        if rerun:
+            # Preserve the historical un-deduplicated rerun path unless an
+            # operator supplies a scoped idempotency intent.
+            dedupe_key = operator_dedupe_key
         job_id = uuid4()
         pool = await self._get_pool()
         async with pool.acquire() as connection:
@@ -339,13 +359,48 @@ class PostgresJobQueueRepository:
                     profile["config_sha256"],
                     profile["profile_state"],
                     rerun,
-                    None if rerun else dedupe_key,
+                    dedupe_key,
                     parent_job_id,
                     retry_root_id,
                     oom_retries,
                     profile["artifact_reservation_bytes"],
                 )
                 if inserted is None:
+                    if operator_dedupe_key is not None:
+                        existing = await connection.fetchrow(
+                            """
+                            SELECT job_id, phase, input_kind, input_id, input_sha256, dataset_version,
+                                   source_refs, model_kind, target_phase, config_version, config_sha256,
+                                   profile_state_snapshot, artifact_reservation_bytes, parent_job_id,
+                                   retry_root_id, oom_retries, rerun
+                            FROM gods_mlops_jobs WHERE dedupe_key = $1
+                            """,
+                            dedupe_key,
+                        )
+                        if existing is None:
+                            raise RuntimeError("operator retry intent dedupe record disappeared")
+                        if not _operator_retry_request_matches(
+                            existing,
+                            phase=phase,
+                            input_kind=input_kind,
+                            input_id=input_id,
+                            input_sha256=input_sha256,
+                            dataset_version=dataset_version,
+                            source_refs=source_refs,
+                            model_kind=model_kind,
+                            target_phase=profile["target_phase"] or phase,
+                            config_version=profile["config_version"],
+                            config_sha256=profile["config_sha256"],
+                            profile_state=profile["profile_state"],
+                            reservation_bytes=profile["artifact_reservation_bytes"],
+                            parent_job_id=parent_job_id,
+                            retry_root_id=retry_root_id,
+                            oom_retries=oom_retries,
+                        ):
+                            raise OperatorRetryIntentConflictError(
+                                "operator retry intent was reused for a different immutable request"
+                            )
+                        return str(existing["job_id"])
                     existing = await connection.fetchval(
                         "SELECT job_id FROM gods_mlops_jobs WHERE dedupe_key = $1",
                         dedupe_key,
@@ -380,6 +435,156 @@ class PostgresJobQueueRepository:
         if row is None:
             raise KeyError(f"GPU job {job_id} does not exist")
         return _job_dict(row)
+
+    async def list_jobs(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """List recent job state with active queue positions from durable ordering."""
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("job list limit must be between 1 and 500")
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                WITH queue_positions AS (
+                    SELECT job_id,
+                           row_number() OVER (
+                               ORDER BY queue_order ASC NULLS LAST, created_at ASC, job_id ASC
+                           ) AS queue_position
+                    FROM gods_mlops_jobs
+                    WHERE state = ANY($2::text[])
+                )
+                SELECT job.*, queue_positions.queue_position
+                FROM gods_mlops_jobs AS job
+                LEFT JOIN queue_positions USING (job_id)
+                ORDER BY
+                    CASE WHEN queue_positions.queue_position IS NULL THEN 1 ELSE 0 END,
+                    queue_positions.queue_position ASC NULLS LAST,
+                    job.created_at DESC,
+                    job.job_id ASC
+                LIMIT $1
+                """,
+                limit,
+                list(_OPERATOR_QUEUE_STATES),
+            )
+        return [_job_dict(row) for row in rows]
+
+    async def cancel_queued_job(self, job_id: str, *, actor_sha256: str) -> dict[str, Any]:
+        """Terminalize only an unowned waiting job; settlement happens after this commit."""
+        _validate_digest(actor_sha256, "operator actor SHA-256")
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    "SELECT * FROM gods_mlops_jobs WHERE job_id = $1::uuid FOR UPDATE",
+                    job_id,
+                )
+                if row is None:
+                    raise KeyError(f"GPU job {job_id} does not exist")
+                if row["state"] == "cancelled":
+                    return _job_dict(row)
+                if row["state"] not in _OPERATOR_QUEUE_STATES:
+                    raise ValueError("only queued or waiting jobs can be cancelled")
+                if row["lease_token"] is not None or row["owner_pid"] is not None or row["owner_start_ticks"] is not None:
+                    raise ValueError("jobs with an active lease or process owner cannot be cancelled")
+                cancelled = await connection.fetchrow(
+                    """
+                    UPDATE gods_mlops_jobs SET state = 'cancelled',
+                        reason_code = 'operator_cancelled', reason_detail = $2::jsonb,
+                        retryable = FALSE, completed_at = now(), updated_at = now()
+                    WHERE job_id = $1::uuid AND state = ANY($3::text[])
+                      AND lease_token IS NULL AND owner_pid IS NULL AND owner_start_ticks IS NULL
+                    RETURNING *
+                    """,
+                    job_id,
+                    _canonical_json({"actor_sha256": actor_sha256}),
+                    list(_OPERATOR_QUEUE_STATES),
+                )
+                if cancelled is None:
+                    raise ValueError("job changed before operator cancellation")
+                await connection.execute(
+                    """
+                    INSERT INTO gods_mlops_job_events(job_id, event_type, state, reason_code, details)
+                    VALUES($1::uuid, 'operator_cancelled', 'cancelled', 'operator_cancelled', $2::jsonb)
+                    """,
+                    job_id,
+                    _canonical_json({"actor_sha256": actor_sha256}),
+                )
+                return _job_dict(cancelled)
+
+    async def reorder_queued_jobs(
+        self,
+        job_id: str,
+        *,
+        before_job_id: str | None,
+        actor_sha256: str,
+    ) -> list[str]:
+        """Persist a manual order without changing any creation or checkpoint history."""
+        _validate_digest(actor_sha256, "operator actor SHA-256")
+        try:
+            target_id = str(UUID(job_id))
+            before_id = str(UUID(before_job_id)) if before_job_id is not None else None
+        except (TypeError, ValueError) as error:
+            raise ValueError("queue reorder job IDs must be UUIDs") from error
+        if target_id != job_id.lower() or (before_job_id is not None and before_id != before_job_id.lower()):
+            raise ValueError("queue reorder job IDs must be canonical lowercase UUID text")
+        if before_id == target_id:
+            raise ValueError("a job cannot be moved before itself")
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                rows = await connection.fetch(
+                    """
+                    SELECT job_id, state, queue_order, created_at,
+                           lease_token, owner_pid, owner_start_ticks
+                    FROM gods_mlops_jobs WHERE state = ANY($1::text[])
+                    ORDER BY job_id FOR UPDATE
+                    """,
+                    list(_OPERATOR_QUEUE_STATES),
+                )
+                jobs = [_job_dict(row) for row in rows]
+                if any(
+                    job.get("lease_token") is not None
+                    or job.get("owner_pid") is not None
+                    or job.get("owner_start_ticks") is not None
+                    for job in jobs
+                ):
+                    raise ValueError("queued jobs with an active lease or process owner cannot be reordered")
+                ordered = sorted(jobs, key=_queue_order_sort_key)
+                ordered_ids = [job["job_id"] for job in ordered]
+                if target_id not in ordered_ids:
+                    raise ValueError("only queued or waiting jobs can be reordered")
+                ordered_ids.remove(target_id)
+                if before_id is None:
+                    ordered_ids.append(target_id)
+                else:
+                    if before_id not in ordered_ids:
+                        raise ValueError("the destination job is not queued or waiting")
+                    ordered_ids.insert(ordered_ids.index(before_id), target_id)
+                for position, queued_id in enumerate(ordered_ids, start=1):
+                    await connection.execute(
+                        "UPDATE gods_mlops_jobs SET queue_order = $1 WHERE job_id = $2::uuid",
+                        position,
+                        queued_id,
+                    )
+                target_position = ordered_ids.index(target_id) + 1
+                await connection.execute(
+                    """
+                    INSERT INTO gods_mlops_job_events(job_id, event_type, state, details)
+                    VALUES($1::uuid, 'operator_queue_reordered',
+                           (SELECT state FROM gods_mlops_jobs WHERE job_id = $1::uuid), $2::jsonb)
+                    """,
+                    target_id,
+                    _canonical_json(
+                        {
+                            "actor_sha256": actor_sha256,
+                            "before_job_id": before_id,
+                            "position": target_position,
+                        }
+                    ),
+                )
+                return ordered_ids
 
     async def fail_job_for_source(self, job_id: str, reason_code: str, details: dict[str, Any]) -> dict[str, Any]:
         await self.ensure_schema()
@@ -436,7 +641,7 @@ class PostgresJobQueueRepository:
                     SELECT job_id FROM gods_mlops_jobs
                     WHERE state IN ('queued', 'waiting_gpu', 'waiting_storage', 'waiting_capacity')
                       AND (profile_state_snapshot = 'measured' OR phase = 'probe')
-                    ORDER BY created_at, job_id
+                    ORDER BY queue_order ASC NULLS LAST, created_at, job_id
                     LIMIT 1
                 )
                 SELECT EXISTS (SELECT 1 FROM eligible WHERE job_id = $1::uuid)
@@ -3263,7 +3468,7 @@ class PostgresJobQueueRepository:
                     SELECT job_id FROM gods_mlops_jobs
                     WHERE state IN ('queued', 'waiting_gpu', 'waiting_storage', 'waiting_capacity')
                       AND (profile_state_snapshot = 'measured' OR phase = 'probe')
-                    ORDER BY created_at, job_id
+                    ORDER BY queue_order ASC NULLS LAST, created_at, job_id
                     LIMIT 1
                     """
                 )
@@ -3548,6 +3753,11 @@ class JobQueue:
         model_kind: str,
         config_version: str,
         rerun: bool = False,
+        *,
+        parent_job_id: str | None = None,
+        retry_root_id: str | None = None,
+        operator_id: str | None = None,
+        intent_token: str | None = None,
     ) -> str:
         """Queue a published, current, model-compatible training input."""
         if model_kind not in {"detr", "clip"}:
@@ -3566,6 +3776,12 @@ class JobQueue:
         )
         if profile is None:
             raise ResourceProfileNotFoundError("training config has no versioned resource profile")
+        operator_dedupe_key = _operator_retry_key_for_enqueue(
+            rerun=rerun,
+            parent_job_id=parent_job_id,
+            operator_id=operator_id,
+            intent_token=intent_token,
+        )
         return await self._repository.enqueue(
             phase="training",
             input_kind="dataset_version",
@@ -3580,6 +3796,9 @@ class JobQueue:
             model_kind=model_kind,
             profile=profile,
             rerun=rerun,
+            parent_job_id=parent_job_id,
+            retry_root_id=retry_root_id,
+            operator_dedupe_key=operator_dedupe_key,
         )
 
     async def submit_evaluation(
@@ -3592,6 +3811,10 @@ class JobQueue:
         evaluation_split: str = "test",
         baseline_metadata: dict[str, str | None] | None = None,
         rerun: bool = False,
+        parent_job_id: str | None = None,
+        retry_root_id: str | None = None,
+        operator_id: str | None = None,
+        intent_token: str | None = None,
     ) -> str:
         """Queue evaluation against a prior checkpoint with current source checks."""
         from gods_mlops.jobs.models import EvaluationCheckpointSource
@@ -3636,6 +3859,12 @@ class JobQueue:
             raise ResourceProfileNotFoundError("evaluation config has no phase-specific resource profile")
         if profile.get("profile_state") != "measured":
             raise ResourceProfileConflictError("evaluation jobs require a successfully measured phase-specific profile")
+        operator_dedupe_key = _operator_retry_key_for_enqueue(
+            rerun=rerun,
+            parent_job_id=parent_job_id,
+            operator_id=operator_id,
+            intent_token=intent_token,
+        )
         source_refs = {
             "schema": "gods-mlops-evaluation-source-v1",
             "dataset_version": source.dataset_version,
@@ -3662,7 +3891,10 @@ class JobQueue:
             model_kind=model_kind,
             profile=profile,
             rerun=rerun,
+            parent_job_id=parent_job_id,
+            retry_root_id=retry_root_id,
             stable_source_identity=stable_source_identity,
+            operator_dedupe_key=operator_dedupe_key,
         )
 
     async def submit_probe(
@@ -3754,6 +3986,10 @@ class JobQueue:
         model_kind: str,
         config_version: str,
         rerun: bool = False,
+        parent_job_id: str | None = None,
+        retry_root_id: str | None = None,
+        operator_id: str | None = None,
+        intent_token: str | None = None,
     ) -> str:
         """Queue GPU draft work from immutable frame/crop refs before publication."""
         if model_kind not in {"detr", "qwen"}:
@@ -3779,6 +4015,12 @@ class JobQueue:
                 raise ValueError(
                     f"{model_kind} preparation batch exceeds its versioned {limit_key} bound"
                 )
+        operator_dedupe_key = _operator_retry_key_for_enqueue(
+            rerun=rerun,
+            parent_job_id=parent_job_id,
+            operator_id=operator_id,
+            intent_token=intent_token,
+        )
         return await self._repository.enqueue(
             phase="preparation",
             input_kind="annotation_batch",
@@ -3789,6 +4031,9 @@ class JobQueue:
             model_kind=model_kind,
             profile=profile,
             rerun=rerun,
+            parent_job_id=parent_job_id,
+            retry_root_id=retry_root_id,
+            operator_dedupe_key=operator_dedupe_key,
         )
 
     async def bind_process(
@@ -4106,6 +4351,147 @@ class JobQueue:
     async def get(self, job_id: str) -> dict[str, Any]:
         return await self._repository.get_job(job_id)
 
+    async def list_jobs(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        return await self._repository.list_jobs(limit=limit)
+
+    async def get_job_detail(self, job_id: str) -> dict[str, Any]:
+        job = await self.get(job_id)
+        return {
+            **job,
+            "checkpoint": await self._repository.checkpoint_metadata_for(job_id),
+            "result_artifacts": await self._repository.result_artifacts_for(job_id),
+            "profile_measurement": await self._repository.profile_measurement_for_job(job_id),
+            "review_handoffs": await self._repository.review_handoffs_for(job_id),
+        }
+
+    async def cancel_queued(self, job_id: str, *, operator_id: str) -> dict[str, Any]:
+        actor_sha256 = _operator_actor_sha256(operator_id)
+        job = await self._repository.cancel_queued_job(job_id, actor_sha256=actor_sha256)
+        settlement_error_type = None
+        try:
+            await self._repository.settle_artifact_reservation(job_id)
+        except Exception as error:  # noqa: BLE001 - expose pending settlement without leaking backend details
+            settlement_error_type = type(error).__name__
+        try:
+            reservation = await self._repository.artifact_reservation_for(job_id)
+        except Exception as error:  # noqa: BLE001 - failed readback cannot prove settlement
+            reservation = {"state": "unknown"}
+            settlement_error_type = settlement_error_type or type(error).__name__
+        reservation_state = reservation.get("state") if reservation is not None else None
+        cleanup_status = (
+            "not_reserved"
+            if reservation is None
+            else "settled"
+            if reservation_state == "settled"
+            else "pending"
+        )
+        return {
+            "job": await self.get(job_id),
+            "reservation_cleanup": cleanup_status,
+            "cleanup_pending": cleanup_status == "pending",
+            "settlement_error_type": settlement_error_type,
+        }
+
+    async def reorder_queued(
+        self,
+        job_id: str,
+        *,
+        before_job_id: str | None,
+        operator_id: str,
+    ) -> list[str]:
+        return await self._repository.reorder_queued_jobs(
+            job_id,
+            before_job_id=before_job_id,
+            actor_sha256=_operator_actor_sha256(operator_id),
+        )
+
+    async def retry_job(self, job_id: str, *, operator_id: str, intent_token: str) -> str:
+        """Rerun a terminal public job through its original validation path."""
+        parent = await self.get(job_id)
+        if parent.get("phase") == "probe":
+            raise ValueError("operator retry is not supported for probe jobs")
+        if parent.get("state") not in {"completed", "failed", "cancelled"}:
+            raise ValueError("only completed, failed, or cancelled jobs can be rerun")
+        if parent.get("lease_token") is not None or parent.get("owner_pid") is not None:
+            raise ValueError("jobs with a lease or process owner cannot be rerun")
+
+        parent_job_id = str(UUID(str(parent["job_id"])))
+        retry_root_id = str(UUID(str(parent.get("retry_root_id") or parent_job_id)))
+        common = {
+            "parent_job_id": parent_job_id,
+            "retry_root_id": retry_root_id,
+            "operator_id": operator_id,
+            "intent_token": intent_token,
+            "rerun": True,
+        }
+        phase = parent.get("phase")
+        if phase == "training":
+            return await self.submit(
+                dataset_version=str(parent["dataset_version"]),
+                model_kind=str(parent["model_kind"]),
+                config_version=str(parent["config_version"]),
+                **common,
+            )
+        if phase == "evaluation":
+            from gods_mlops.jobs.models import EvaluationCheckpointSource
+
+            refs = _json_value(parent.get("source_refs"))
+            if not isinstance(refs, dict):
+                raise ValueError("evaluation job source references are unavailable")
+            checkpoint_source = EvaluationCheckpointSource.from_dict(refs.get("checkpoint"))
+            baseline = refs.get("baseline")
+            baseline_metadata = None
+            if baseline is not None:
+                if not isinstance(baseline, dict):
+                    raise ValueError("evaluation baseline source is invalid")
+                baseline_metadata = {
+                    "model_id": baseline.get("model_id"),
+                    "revision": baseline.get("revision"),
+                }
+            return await self.submit_evaluation(
+                dataset_version=str(parent["dataset_version"]),
+                model_kind=str(parent["model_kind"]),
+                config_version=str(parent["config_version"]),
+                checkpoint_source=checkpoint_source,
+                evaluation_split=str(refs.get("evaluation_split", "test")),
+                baseline_metadata=baseline_metadata,
+                **common,
+            )
+        if phase == "preparation":
+            from gods_mlops.jobs.models import AnnotationPreparationBatch, ImmutableAnnotationItem
+
+            refs = _json_value(parent.get("source_refs"))
+            if not isinstance(refs, dict) or not isinstance(refs.get("items"), list):
+                raise ValueError("preparation job source references are unavailable")
+            try:
+                batch = AnnotationPreparationBatch(
+                    batch_id=str(refs["batch_id"]),
+                    input_sha256=str(refs["input_sha256"]),
+                    items=tuple(
+                        ImmutableAnnotationItem(
+                            item_kind=str(item["item_kind"]),
+                            item_id=str(item["item_id"]),
+                            sample_id=str(item["sample_id"]),
+                            sha256=str(item["sha256"]),
+                            object_key=str(item["object_key"]),
+                            object_size_bytes=int(item["object_size_bytes"]),
+                            revision_id=(
+                                str(item["revision_id"]) if item.get("revision_id") is not None else None
+                            ),
+                        )
+                        for item in refs["items"]
+                    ),
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("preparation job source references are malformed") from error
+            return await self.submit_preparation(
+                batch=batch,
+                model_kind=str(parent["model_kind"]),
+                config_version=str(parent["config_version"]),
+                **common,
+            )
+        raise ValueError("operator retry is not supported for this job phase")
+
     async def training_source_block_reasons(self, job_id: str) -> tuple[str, ...]:
         job = await self.get(job_id)
         if job["phase"] != "training":
@@ -4401,6 +4787,107 @@ def _enqueue_dedupe_key(
     if stable_source_identity is not None:
         value = {**stable_identity, "stable_source_identity": stable_source_identity}
     return sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _operator_actor_sha256(operator_id: str) -> str:
+    if not isinstance(operator_id, str) or not operator_id.strip() or len(operator_id) > 255:
+        raise ValueError("operator identity must contain 1 to 255 characters")
+    return sha256(operator_id.encode("utf-8")).hexdigest()
+
+
+def _queue_order_sort_key(job: dict[str, Any]) -> tuple[bool, int, str, str]:
+    queue_order = job.get("queue_order")
+    return (
+        queue_order is None,
+        queue_order if queue_order is not None else 0,
+        str(job.get("created_at", "")),
+        str(job.get("job_id", "")),
+    )
+
+
+def _operator_retry_dedupe_key(*, parent_job_id: str, operator_id: str, intent_token: str) -> str:
+    """Hash a browser retry intent into the existing durable queue dedupe key."""
+    try:
+        canonical_parent_id = str(UUID(parent_job_id))
+    except (TypeError, ValueError) as error:
+        raise ValueError("operator retry parent_job_id must be a UUID") from error
+    if canonical_parent_id != parent_job_id.lower():
+        raise ValueError("operator retry parent_job_id must be canonical lowercase UUID text")
+    if not isinstance(operator_id, str) or not operator_id.strip() or len(operator_id) > 255:
+        raise ValueError("operator retry operator_id must contain 1 to 255 characters")
+    if not isinstance(intent_token, str) or len(intent_token) < 32 or len(intent_token) > 512:
+        raise ValueError("operator retry intent token must contain at least 32 characters")
+    material = {
+        "kind": "operator-retry-v1",
+        "parent_job_id": canonical_parent_id,
+        "operator_sha256": sha256(operator_id.encode("utf-8")).hexdigest(),
+        "intent_sha256": sha256(intent_token.encode("utf-8")).hexdigest(),
+    }
+    return sha256(_canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def _operator_retry_key_for_enqueue(
+    *,
+    rerun: bool,
+    parent_job_id: str | None,
+    operator_id: str | None,
+    intent_token: str | None,
+) -> str | None:
+    supplied = (parent_job_id is not None, operator_id is not None, intent_token is not None)
+    if not any(supplied):
+        return None
+    if not rerun or not all(supplied):
+        raise ValueError("operator retry intent requires rerun, parent_job_id, operator_id, and intent_token")
+    assert parent_job_id is not None and operator_id is not None and intent_token is not None
+    return _operator_retry_dedupe_key(
+        parent_job_id=parent_job_id,
+        operator_id=operator_id,
+        intent_token=intent_token,
+    )
+
+
+def _operator_retry_request_matches(
+    existing: Any,
+    *,
+    phase: str,
+    input_kind: str,
+    input_id: str,
+    input_sha256: str,
+    dataset_version: str | None,
+    source_refs: dict[str, Any],
+    model_kind: str,
+    target_phase: str,
+    config_version: str,
+    config_sha256: str,
+    profile_state: str,
+    reservation_bytes: int,
+    parent_job_id: str,
+    retry_root_id: str | None,
+    oom_retries: int,
+) -> bool:
+    """Require duplicate browser intent to describe the same immutable job."""
+    expected_parent = str(UUID(parent_job_id))
+    existing_parent = str(existing["parent_job_id"]) if existing["parent_job_id"] is not None else None
+    expected_root = str(UUID(retry_root_id)) if retry_root_id is not None else None
+    existing_root = str(existing["retry_root_id"]) if existing["retry_root_id"] is not None else None
+    return (
+        existing["phase"] == phase
+        and existing["input_kind"] == input_kind
+        and existing["input_id"] == input_id
+        and str(existing["input_sha256"]).strip() == input_sha256
+        and existing["dataset_version"] == dataset_version
+        and _canonical_json(_json_value(existing["source_refs"])) == _canonical_json(source_refs)
+        and existing["model_kind"] == model_kind
+        and existing["target_phase"] == target_phase
+        and existing["config_version"] == config_version
+        and str(existing["config_sha256"]).strip() == config_sha256
+        and existing["profile_state_snapshot"] == profile_state
+        and existing["artifact_reservation_bytes"] == reservation_bytes
+        and existing_parent == expected_parent
+        and existing_root == expected_root
+        and existing["oom_retries"] == oom_retries
+        and existing["rerun"] is True
+    )
 
 
 def _canonical_json(value: Any) -> str:

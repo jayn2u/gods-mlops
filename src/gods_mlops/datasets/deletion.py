@@ -27,6 +27,24 @@ async def invalidate_sample(
             await publisher.close()
 
 
+async def preview_invalidate_sample(
+    sample_id: str,
+    *,
+    publisher: Any | None = None,
+) -> dict[str, Any]:
+    """Read the existing eligibility and in-use impact without changing source state."""
+    owned = publisher is None
+    if publisher is None:
+        from .publish import DatasetPublisher
+
+        publisher = DatasetPublisher.from_environment()
+    try:
+        return await publisher.preview_sample_invalidation(sample_id)
+    finally:
+        if owned:
+            await publisher.close()
+
+
 async def invalidate_sample_in_repository(publisher: Any, sample_id: str) -> dict[str, Any]:
     sample_uuid = UUID(sample_id)
     pool: asyncpg.Pool = await publisher._get_pool()

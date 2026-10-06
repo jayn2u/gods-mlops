@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>$title · Gods MLOps</title>
+    <link rel="stylesheet" href="/static/operator.css">
+    <script src="/static/csrf.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="/samples">Gods MLOps</a>
+      <nav aria-label="Operator pages">
+        <a href="/samples">Samples</a>
+        <a href="/reviews">Reviews</a>
+        <a href="/datasets">Datasets</a>
+        <a href="/jobs">Jobs</a>
+        <a href="/actions">Actions</a>
+      </nav>
+      <form method="post" action="/logout" data-csrf-form>
+        <button class="quiet" type="submit">Sign out</button>
+      </form>
+    </header>
+    <main>
+      <h1>$title</h1>
+      $content
+    </main>
+  </body>
+</html>

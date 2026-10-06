@@ -30,6 +30,19 @@ class LabelStudioReviewWorkflow:
         self._label_studio = label_studio
         self._media_cleanup = media_cleanup
 
+    async def start_bbox_review(self, *, sample_id: UUID, project_id: int) -> dict[str, Any]:
+        """Create a durable frame assignment, then provision its Label Studio task."""
+        source = await self._repository.bbox_review_source(sample_id)
+        assignment = await self.prepare_assignment(
+            sample_id=sample_id,
+            stage="bbox",
+            project_id=project_id,
+            bbox_revision=None,
+            media_object_key=source["object_key"],
+            required_bytes=source["object_size_bytes"],
+        )
+        return await self.provision_task(revision=assignment.revision, project_id=project_id)
+
     async def prepare_assignment(
         self,
         *,

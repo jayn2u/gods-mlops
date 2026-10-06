@@ -105,6 +105,101 @@ def build_evaluation_report(
     return report
 
 
+async def load_operator_evaluation_report(job_id: str, *, queue, result_store) -> dict[str, Any]:
+    """Read one committed evaluation artifact and reapply the existing release gate."""
+    job = await queue.get(job_id)
+
+    def unavailable(reason_code: str) -> dict[str, Any]:
+        return {
+            "availability": "not_available",
+            "job_id": job_id,
+            "reason_code": reason_code,
+            "report": None,
+            "deployment_eligibility": None,
+            "current_source_reasons": [],
+        }
+
+    if job.get("phase") != "evaluation":
+        return unavailable("job_is_not_an_evaluation")
+    if job.get("state") != "completed":
+        return unavailable(str(job.get("reason_code") or "evaluation_job_not_completed"))
+    repository = queue.repository
+    artifacts = await repository.result_artifacts_for(job_id)
+    matches = [artifact for artifact in artifacts if artifact.get("kind") == "evaluation"]
+    if not matches:
+        return unavailable("evaluation_result_artifact_missing")
+    if len(matches) != 1:
+        return unavailable("evaluation_result_artifact_ambiguous")
+
+    identity = await repository.checkpoint_identity(job_id)
+    try:
+        _verified, payload = result_store.read_committed(matches[0], expected_identity=identity)
+    except Exception as error:  # noqa: BLE001 - hide object-store details from rendered pages
+        return unavailable("evaluation_result_artifact_invalid")
+    try:
+        report = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return unavailable("evaluation_result_artifact_invalid")
+    if not isinstance(report, dict) or report.get("schema_version") != 1:
+        return unavailable("evaluation_result_artifact_invalid")
+
+    evaluation_job = report.get("evaluation_job")
+    source = report.get("source")
+    config = report.get("evaluation_config")
+    candidate = report.get("candidate")
+    source_refs = job.get("source_refs")
+    if isinstance(source_refs, str):
+        try:
+            source_refs = json.loads(source_refs)
+        except json.JSONDecodeError:
+            return unavailable("evaluation_result_artifact_identity_mismatch")
+    checkpoint = source_refs.get("checkpoint") if isinstance(source_refs, dict) else None
+    if (
+        not isinstance(evaluation_job, dict)
+        or evaluation_job.get("job_id") != job_id
+        or evaluation_job.get("config_version") != job.get("config_version")
+        or evaluation_job.get("config_sha256") != job.get("config_sha256")
+        or not isinstance(source, dict)
+        or source.get("dataset_version") != job.get("dataset_version")
+        or source.get("manifest_sha256") != job.get("input_sha256")
+        or not isinstance(config, dict)
+        or config.get("version") != job.get("config_version")
+        or config.get("sha256") != job.get("config_sha256")
+        or not isinstance(checkpoint, dict)
+        or not isinstance(candidate, dict)
+        or candidate.get("checkpoint_sha256") != checkpoint.get("checkpoint_sha256")
+    ):
+        return unavailable("evaluation_result_artifact_identity_mismatch")
+    if report.get("execution_status") != "succeeded":
+        return unavailable("evaluation_execution_not_succeeded")
+
+    eligibility = deployment_eligibility(report)
+    try:
+        current_source_reasons = sorted(set(await queue.evaluation_source_block_reasons(job_id)))
+    except Exception:  # noqa: BLE001 - fail closed when current source authority cannot be read
+        current_source_reasons = ["current_eligibility_unavailable"]
+    if current_source_reasons:
+        eligibility = {
+            **eligibility,
+            "eligible": False,
+            "status": "blocked",
+            "reasons": sorted(set([*eligibility["reasons"], *current_source_reasons])),
+        }
+    return {
+        "availability": "available",
+        "job_id": job_id,
+        "reason_code": None,
+        "report": report,
+        "artifact": {
+            "kind": "evaluation",
+            "sha256": matches[0].get("sha256"),
+            "size_bytes": matches[0].get("size_bytes"),
+        },
+        "deployment_eligibility": eligibility,
+        "current_source_reasons": current_source_reasons,
+    }
+
+
 async def _evaluate_with_task7_owned_worker(
     manifest_uri: str,
     checkpoint_uri: str,

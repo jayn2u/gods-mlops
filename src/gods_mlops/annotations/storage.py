@@ -40,6 +40,7 @@ _MIGRATIONS = (
     (11, "0011_immutable_datasets.sql"),
     (12, "0012_dataset_authority_and_invalidations.sql"),
     (13, "0013_gpu_job_queue.sql"),
+    (14, "0014_operator_queue_order.sql"),
 )
 _MIGRATION_RESOURCES = files("gods_mlops.migrations")
 
@@ -1776,6 +1777,78 @@ class PostgresAnnotationRepository:
         if record is None:
             raise ReviewAssignmentNotFoundError("review revision does not exist")
         return assignment_from_record(record)
+
+    async def bbox_review_source(self, sample_id: UUID) -> dict[str, Any]:
+        """Resolve only a currently received frame for a new bbox assignment."""
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT sample_id, state, object_key, object_size_bytes
+                FROM ingestion_samples WHERE sample_id = $1
+                """,
+                sample_id,
+            )
+        if row is None or row["state"] != "received":
+            raise ReviewAssignmentConflictError("only a received sample can be assigned for bbox review")
+        return {
+            "sample_id": str(row["sample_id"]),
+            "object_key": row["object_key"],
+            "object_size_bytes": row["object_size_bytes"],
+        }
+
+    async def list_review_assignments(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return saved assignment state and exact Label Studio provenance for the operator UI."""
+        if type(limit) is not int or not 1 <= limit <= 500:
+            raise ValueError("review list limit must be between 1 and 500")
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT assignment.sample_id, assignment.revision, assignment.stage,
+                       assignment.state AS assignment_state, assignment.label_studio_task_id,
+                       assignment.created_at, assignment.finished_at,
+                       media.project_id, revision.annotation_revision_id,
+                       revision.provenance
+                FROM review_assignments AS assignment
+                LEFT JOIN annotation_revisions AS revision
+                  ON revision.assignment_revision = assignment.revision
+                LEFT JOIN label_studio_media_uploads AS media
+                  ON media.assignment_revision = assignment.revision
+                ORDER BY assignment.created_at DESC, assignment.revision ASC
+                LIMIT $1
+                """,
+                limit,
+            )
+        result = []
+        for row in rows:
+            provenance = _json_value(row["provenance"]) if row["provenance"] is not None else None
+            human_review_recorded = bool(
+                isinstance(provenance, dict)
+                and provenance.get("source") == "label_studio"
+                and provenance.get("label_studio_annotation_id")
+                and (provenance.get("reviewer_id") or provenance.get("completed_by"))
+            )
+            result.append(
+                {
+                    "sample_id": str(row["sample_id"]),
+                    "revision": str(row["revision"]),
+                    "stage": row["stage"],
+                    "state": row["assignment_state"],
+                    "label_studio_task_id": row["label_studio_task_id"],
+                    "project_id": row["project_id"],
+                    "created_at": row["created_at"].isoformat(),
+                    "finished_at": row["finished_at"].isoformat() if row["finished_at"] else None,
+                    "annotation_revision_id": (
+                        str(row["annotation_revision_id"])
+                        if row["annotation_revision_id"] is not None
+                        else None
+                    ),
+                    "provenance": provenance,
+                    "human_review_recorded": human_review_recorded,
+                }
+            )
+        return result
 
     async def review_media_source(self, sample_id: UUID, revision: UUID) -> dict[str, Any]:
         pool = await self._get_pool()
