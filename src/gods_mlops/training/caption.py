@@ -45,7 +45,6 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
     import torch
     from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2_5_VLProcessor
 
-    from .data import dataset_object_store_from_environment
     from .runner_support import cache_directory, output_directory, require_cuda, resource_measurements, write_json
 
     bounds = validate_generation_config(config)
@@ -179,6 +178,8 @@ def _caption_items(manifest: dict[str, Any], config: dict[str, Any]) -> list[dic
 
 def _object_store_if_needed(items: list[dict[str, Any]]):
     if any(not isinstance(item.get("image_path"), str) for item in items):
+        from .data import dataset_object_store_from_environment
+
         return dataset_object_store_from_environment()
     return None
 
