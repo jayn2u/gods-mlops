@@ -5,10 +5,13 @@ import json
 import os
 import re
 import stat
+import struct
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
+import zlib
 
 import pytest
 import yaml
@@ -158,6 +161,14 @@ def _relative_parts(value: Any) -> tuple[str, ...]:
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError("artifact path must be a safe relative path")
     return parts
+
+
+def _safe_reference(value: Any) -> bool:
+    try:
+        _relative_parts(value)
+        return True
+    except ValueError:
+        return False
 
 
 def _read_beneath(root_fd: int, relative_path: str) -> bytes:
@@ -366,6 +377,88 @@ def _add_error(errors: dict[str, list[str]], case: str, code: str) -> None:
         errors[case].append(code)
 
 
+def _native_receipt_binding_errors(
+    receipt: dict[str, Any],
+    bundle: dict[str, Any],
+    artifacts: dict[str, Any],
+    observation_id: Any,
+) -> list[str]:
+    errors: list[str] = []
+    output_ids = receipt.get("native_output_artifact_ids")
+    typed_id = receipt.get("native_receipt_artifact_id")
+    typed = _artifact_value(artifacts, typed_id)
+    if (
+        not isinstance(output_ids, list)
+        or not all(isinstance(item, str) for item in output_ids)
+        or len(output_ids) != len(set(output_ids))
+        or observation_id not in output_ids
+        or not isinstance(typed_id, str)
+        or typed_id not in output_ids
+        or len(set(output_ids) - {observation_id, typed_id}) < 1
+    ):
+        return ["native_outputs_not_independently_bound"]
+    if not isinstance(typed, dict):
+        return ["typed_native_receipt_missing"]
+    artifact_hashes = artifacts.get("artifact_hashes")
+    if not isinstance(artifact_hashes, dict):
+        return ["native_artifact_hash_index_invalid"]
+    raw_ids = set(output_ids) - {observation_id, typed_id}
+    expected = {
+        "schema_version": 1,
+        "kind": "native_stage_receipt",
+        "stage": receipt.get("stage"),
+        "attempt_id": receipt.get("attempt_id"),
+        "source_commit": bundle.get("source_commit"),
+        "plan_id": bundle.get("plan_id"),
+        "exit_status": receipt.get("exit_status"),
+        "started_at": receipt.get("started_at"),
+        "ended_at": receipt.get("ended_at"),
+        "output_artifact_ids": sorted(raw_ids),
+        "output_sha256": {identifier: artifact_hashes.get(identifier) for identifier in raw_ids},
+    }
+    if any(typed.get(key) != value for key, value in expected.items()):
+        errors.append("typed_native_receipt_binding_mismatch")
+    return errors
+
+
+def _native_provenance_errors(
+    provenance: Any,
+    receipts: list[dict[str, Any]],
+    artifacts: dict[str, Any],
+) -> list[str]:
+    if not isinstance(provenance, dict) or provenance.get("kind") != "native":
+        return []
+    errors: list[str] = []
+    origin = provenance.get("origin")
+    normalized_origin = origin.casefold() if isinstance(origin, str) else ""
+    if (
+        provenance.get("execution_mode") != "recorded_native"
+        or provenance.get("offline_fixture") is True
+        or provenance.get("fixture_only") is True
+        or "source test fixture" in normalized_origin
+        or "offline fixture" in normalized_origin
+    ):
+        errors.append("native_provenance_contradicts_offline_fixture")
+    for receipt in receipts:
+        recipe = _artifact_value(artifacts, receipt.get("recipe_artifact_id"))
+        native_receipt = _artifact_value(artifacts, receipt.get("native_receipt_artifact_id"))
+        if isinstance(recipe, dict) and recipe.get("fixture_only") is True:
+            errors.append("native_recipe_marked_fixture_only")
+            break
+        if isinstance(native_receipt, dict) and native_receipt.get("fixture_only") is True:
+            errors.append("native_receipt_marked_fixture_only")
+            break
+        output_ids = receipt.get("native_output_artifact_ids")
+        if isinstance(output_ids, list) and any(
+            isinstance(_artifact_value(artifacts, identifier), bytes)
+            and b"synthetic native output for " in _artifact_value(artifacts, identifier)
+            for identifier in output_ids
+        ):
+            errors.append("native_output_marked_fixture_only")
+            break
+    return errors
+
+
 def _hash_mapping(value: Any) -> bool:
     return isinstance(value, dict) and bool(value) and all(
         isinstance(key, str) and key and _is_sha256(digest) for key, digest in value.items()
@@ -450,6 +543,8 @@ def _check_deploy_observation(
     observation: Any,
     inventory: dict[str, Any],
     bundle: dict[str, Any],
+    artifacts: dict[str, Any],
+    deploy_receipt: dict[str, Any] | None,
     errors: list[str],
 ) -> None:
     if not isinstance(observation, dict):
@@ -462,6 +557,7 @@ def _check_deploy_observation(
     identities = bundle.get("identities")
     if not isinstance(identities, dict):
         identities = {}
+    kubeconfig_identity = identities.get("kubeconfig")
     input_versions = identities.get("input_versions")
     k3s_identity = input_versions.get("k3s") if isinstance(input_versions, dict) else None
     expected_k3s_version = k3s_identity.get("version") if isinstance(k3s_identity, dict) else None
@@ -475,11 +571,47 @@ def _check_deploy_observation(
         or not _is_sha256(preflight.get("render_sha256"))
     ):
         errors.append("authenticated_preflight_missing")
-    if not isinstance(cluster, dict) or not cluster.get("uid") or not cluster.get("context") or cluster.get("context") == "default":
+    if not isinstance(cluster, dict) or not cluster.get("uid") or not cluster.get("context"):
         errors.append("generated_kubeconfig_identity_missing")
     kubeconfig = observation.get("generated_kubeconfig")
-    cluster_uid = cluster.get("uid") if isinstance(cluster, dict) else None
-    if not isinstance(kubeconfig, dict) or kubeconfig.get("mode") != "0600" or not kubeconfig.get("cluster_uid") or kubeconfig.get("cluster_uid") != cluster_uid:
+    kubeconfig_artifact_id = kubeconfig.get("artifact_id") if isinstance(kubeconfig, dict) else None
+    kubeconfig_facts = _artifact_value(artifacts, kubeconfig_artifact_id)
+    deploy_outputs = deploy_receipt.get("native_output_artifact_ids") if isinstance(deploy_receipt, dict) else None
+    if not isinstance(deploy_outputs, list):
+        deploy_outputs = []
+    facts_match = (
+        isinstance(kubeconfig_facts, dict)
+        and isinstance(kubeconfig_identity, dict)
+        and _safe_reference(kubeconfig_identity.get("reference"))
+        and kubeconfig_facts.get("schema_version") == 1
+        and all(
+            kubeconfig_facts.get(key) == kubeconfig_identity.get(key)
+            for key in ("reference", "sha256", "mode", "context", "server", "certificate_authority_sha256", "cluster_uid")
+        )
+        and kubeconfig_artifact_id in deploy_outputs
+    )
+    cluster_match = (
+        isinstance(cluster, dict)
+        and isinstance(kubeconfig_facts, dict)
+        and cluster.get("uid") == kubeconfig_facts.get("cluster_uid")
+        and cluster.get("context") == kubeconfig_facts.get("context")
+        and cluster.get("server") == kubeconfig_facts.get("server")
+        and cluster.get("certificate_authority_sha256") == kubeconfig_facts.get("certificate_authority_sha256")
+    )
+    if (
+        not isinstance(kubeconfig, dict)
+        or not isinstance(kubeconfig_identity, dict)
+        or kubeconfig.get("mode") != "0600"
+        or kubeconfig.get("reference") != kubeconfig_identity.get("reference")
+    ):
+        errors.append("generated_kubeconfig_not_bound")
+    elif (
+        not _is_sha256(kubeconfig.get("sha256"))
+        or not _is_sha256(kubeconfig.get("certificate_authority_sha256"))
+        or not facts_match
+        or not cluster_match
+        or any(kubeconfig.get(key) != kubeconfig_facts.get(key) for key in ("sha256", "context", "server", "certificate_authority_sha256", "cluster_uid"))
+    ):
         errors.append("generated_kubeconfig_not_bound")
     if not isinstance(nodes, dict) or set(nodes) != set(expected_nodes):
         errors.append("node_identity_set_mismatch")
@@ -667,7 +799,7 @@ def _state_artifact(
     if (
         state.get("step") != "service_stopped"
         or state.get("runtime_status") != "verified_stopped"
-        or state.get("retained_failures") != []
+        or ("retained_failures" in state and state.get("retained_failures") != [])
         or not isinstance(cold_paths, dict)
         or set(cold_paths) != set(retained_ids)
         or not all(_is_sha256(value) for value in cold_paths.values())
@@ -757,18 +889,65 @@ def _check_retained_ids(records: Any) -> bool:
     return True
 
 
-def _check_rtsp_snapshots(observation: Any, protected_services: list[str]) -> bool:
+def _check_rtsp_snapshots(
+    observation: Any,
+    protected_services: list[str],
+    artifacts: dict[str, Any],
+    receipts: dict[str, dict[str, Any]],
+) -> bool:
     if not isinstance(observation, dict):
         return False
-    snapshots = [observation.get(name) for name in ("before", "during", "after")]
+    phases = {"before": "baseline", "during": "reclaim_resume", "after": "reconnect"}
+    snapshots = [(phase, observation.get(phase)) for phase in phases]
     normalized: list[dict[str, Any]] = []
+    capture_ids: set[str] = set()
+    capture_paths: set[str] = set()
+    capture_hashes: set[str] = set()
+    capture_times: list[datetime] = []
     expected_containers = set(protected_services)
-    if not expected_containers or any(not isinstance(item, dict) for item in snapshots):
+    if not expected_containers or any(not isinstance(snapshot, dict) for _, snapshot in snapshots):
         return False
-    for snapshot in snapshots:
+    for phase, snapshot in snapshots:
+        stage = phases[phase]
+        receipt = receipts.get(stage)
+        capture_id = snapshot.get("capture_artifact_id")
+        observed_at = _iso_time(snapshot.get("observed_at"))
+        capture = _artifact_value(artifacts, capture_id)
+        artifact_paths = artifacts.get("artifact_paths")
+        artifact_hashes = artifacts.get("artifact_hashes")
+        capture_path = artifact_paths.get(capture_id) if isinstance(artifact_paths, dict) else None
+        capture_hash = artifact_hashes.get(capture_id) if isinstance(artifact_hashes, dict) else None
+        stage_outputs = receipt.get("native_output_artifact_ids") if isinstance(receipt, dict) else None
+        if (
+            not isinstance(capture_id, str)
+            or capture_id in capture_ids
+            or not isinstance(receipt, dict)
+            or not isinstance(stage_outputs, list)
+            or capture_id not in stage_outputs
+            or observed_at is None
+            or not isinstance(capture, dict)
+            or not isinstance(capture_path, str)
+            or not _is_sha256(capture_hash)
+            or capture_path in capture_paths
+            or capture_hash in capture_hashes
+        ):
+            return False
+        capture_ids.add(capture_id)
+        capture_paths.add(capture_path)
+        capture_hashes.add(capture_hash)
+        start = _iso_time(receipt.get("started_at"))
+        end = _iso_time(receipt.get("ended_at"))
+        if start is None or end is None or not start <= observed_at <= end:
+            return False
+        capture_times.append(observed_at)
         containers = snapshot.get("containers")
         content = snapshot.get("selected_content_sha256")
         probe = snapshot.get("read_only_stream_probe")
+        if any(
+            capture.get(key) != snapshot.get(key)
+            for key in ("observed_at", "containers", "selected_content_sha256", "read_only_stream_probe")
+        ) or capture.get("phase") != phase or capture.get("stage") != stage:
+            return False
         if not isinstance(containers, dict) or set(containers) != expected_containers or not _hash_mapping(content):
             return False
         if not isinstance(probe, dict) or probe.get("status") != "readable" or not isinstance(probe.get("bytes_read"), int) or probe["bytes_read"] <= 0:
@@ -782,6 +961,7 @@ def _check_rtsp_snapshots(observation: Any, protected_services: list[str]) -> bo
                 or re.fullmatch(r"sha256:[0-9a-f]{64}", container.get("image_id", "")) is None
                 or container.get("running") is not True
                 or _iso_time(container.get("started_at")) is None
+                or _iso_time(container.get("started_at")) > observed_at
                 or not isinstance(container.get("mounts"), list)
                 or not container["mounts"]
                 or any(
@@ -804,7 +984,201 @@ def _check_rtsp_snapshots(observation: Any, protected_services: list[str]) -> bo
                 "mounts": sorted(container["mounts"], key=lambda item: json.dumps(item, sort_keys=True)),
             }
         normalized.append({"containers": current, "content": content})
-    return normalized[0] == normalized[1] == normalized[2]
+    return capture_times[0] < capture_times[1] < capture_times[2] and normalized[0] == normalized[1] == normalized[2]
+
+
+def _valid_png(payload: Any) -> bool:
+    if not isinstance(payload, bytes) or len(payload) < 33 or not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+        return False
+    if payload[12:16] != b"IHDR" or int.from_bytes(payload[8:12], "big") != 13:
+        return False
+    width = int.from_bytes(payload[16:20], "big")
+    height = int.from_bytes(payload[20:24], "big")
+    return width > 0 and height > 0 and payload.endswith(b"IEND\xaeB`\x82")
+
+
+def _valid_row_count(value: Any) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _is_loopback_origin(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlsplit(value)
+        return (
+            parsed.scheme in {"http", "https"}
+            and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            and parsed.username is None
+            and parsed.password is None
+            and parsed.path in {"", "/"}
+            and not parsed.query
+            and not parsed.fragment
+        )
+    except ValueError:
+        return False
+
+
+def _within_receipt_interval(value: datetime | None, receipt: dict[str, Any] | None) -> bool:
+    if value is None or not isinstance(receipt, dict):
+        return False
+    start = _iso_time(receipt.get("started_at"))
+    end = _iso_time(receipt.get("ended_at"))
+    return start is not None and end is not None and start <= value <= end
+
+
+def _check_logical_readback(
+    continuity: Any,
+    baseline: Any,
+    manifest: Any,
+    artifacts: dict[str, Any],
+    receipts: dict[str, dict[str, Any]],
+) -> bool:
+    if not isinstance(continuity, dict) or not isinstance(baseline, dict) or not isinstance(manifest, dict):
+        return False
+    metadata = continuity.get("logical_restore")
+    if not isinstance(metadata, dict):
+        return False
+    database_entries = manifest.get("database_restores")
+    if not isinstance(database_entries, list):
+        return False
+    restore_id = metadata.get("database_restore_manifest_id")
+    manifest_entry = next(
+        (item for item in database_entries if isinstance(item, dict) and item.get("id") == restore_id),
+        None,
+    )
+    report = _artifact_value(artifacts, metadata.get("access_report_artifact_id"))
+    if not isinstance(manifest_entry, dict) or not isinstance(report, dict):
+        return False
+    database_ids = [
+        metadata.get("source_database_id"),
+        metadata.get("restore_database_id"),
+        metadata.get("backup_validation_database_id"),
+        metadata.get("restore_validation_database_id"),
+    ]
+    if any(not isinstance(value, str) or not value for value in database_ids) or len(set(database_ids)) != len(database_ids):
+        return False
+    row_counts = (metadata.get("source_row_count"), metadata.get("restored_row_count"), metadata.get("readback_row_count"))
+    if not all(_valid_row_count(value) for value in row_counts):
+        return False
+    hashes = (
+        metadata.get("source_query_sha256"),
+        metadata.get("restored_query_sha256"),
+        metadata.get("readback_query_sha256"),
+    )
+    if not all(_is_sha256(value) for value in hashes) or len(set(hashes)) != 1:
+        return False
+    if (
+        metadata.get("restore_status") != "verified"
+        or metadata.get("backup_dump_path") != manifest_entry.get("backup_dump_path")
+        or metadata.get("restored_dump_path") != manifest_entry.get("restored_dump_path")
+        or metadata.get("backup_dump_path") == metadata.get("restored_dump_path")
+    ):
+        return False
+    bound_fields = (
+        "database_restore_manifest_id",
+        "source_database_id",
+        "restore_database_id",
+        "backup_validation_database_id",
+        "restore_validation_database_id",
+        "backup_dump_path",
+        "restored_dump_path",
+        "source_query_sha256",
+        "restored_query_sha256",
+        "readback_query_sha256",
+        "source_row_count",
+        "restored_row_count",
+        "readback_row_count",
+    )
+    if any(report.get(key) != metadata.get(key) for key in bound_fields):
+        return False
+    if report.get("status") != "verified" or report.get("readback_status") != "verified":
+        return False
+    report_time = _iso_time(report.get("observed_at"))
+    reconnect_receipt = receipts.get("reconnect")
+    reconnect_ended = _iso_time(reconnect_receipt.get("ended_at")) if isinstance(reconnect_receipt, dict) else None
+    if (
+        not _within_receipt_interval(report_time, receipts.get("continuity"))
+        or reconnect_ended is None
+        or report_time < reconnect_ended
+    ):
+        return False
+    return True
+
+
+def _check_operator_authentication(
+    continuity: Any,
+    baseline: Any,
+    bundle: dict[str, Any],
+    artifacts: dict[str, Any],
+    receipts: dict[str, dict[str, Any]],
+) -> bool:
+    if not isinstance(continuity, dict) or not isinstance(baseline, dict):
+        return False
+    identities = bundle.get("identities")
+    operator = identities.get("operator") if isinstance(identities, dict) else None
+    auth = continuity.get("authentication")
+    if not isinstance(operator, dict) or not isinstance(auth, dict):
+        return False
+    browser_receipt = _artifact_value(artifacts, auth.get("browser_receipt_artifact_id"))
+    screenshot_id = auth.get("screenshot_artifact_id")
+    if not isinstance(screenshot_id, str):
+        return False
+    screenshot = _artifact_value(artifacts, screenshot_id)
+    artifact_hashes = artifacts.get("artifact_hashes")
+    continuity_receipt = receipts.get("continuity")
+    continuity_outputs = continuity_receipt.get("native_output_artifact_ids") if isinstance(continuity_receipt, dict) else None
+    if not isinstance(continuity_outputs, list):
+        return False
+    identity_hash = baseline.get("account_identity_sha256")
+    credential_hash = baseline.get("credential_identity_sha256")
+    if not isinstance(browser_receipt, dict) or not isinstance(artifact_hashes, dict):
+        return False
+    captured_at = _iso_time(auth.get("observed_at"))
+    reconnect_receipt = receipts.get("reconnect")
+    reconnect_ended = _iso_time(reconnect_receipt.get("ended_at")) if isinstance(reconnect_receipt, dict) else None
+    if (
+        not _is_sha256(identity_hash)
+        or not _is_sha256(credential_hash)
+        or identity_hash != operator.get("account_identity_sha256")
+        or credential_hash != operator.get("credential_identity_sha256")
+        or auth.get("account_identity_sha256") != identity_hash
+        or auth.get("credential_identity_sha256") != credential_hash
+        or auth.get("login_status") != 303
+        or auth.get("redirect_followed") is not True
+        or auth.get("protected_access_status") != 200
+        or auth.get("protected_path") != operator.get("protected_path")
+        or auth.get("operator_service") != operator.get("service_id")
+        or not _is_loopback_origin(operator.get("origin"))
+        or auth.get("origin") != operator.get("origin")
+        or not _is_sha256(auth.get("session_fingerprint_sha256"))
+        or any(key in auth for key in ("session_id", "session_token", "cookie", "password"))
+        or captured_at is None
+        or not _within_receipt_interval(captured_at, receipts.get("continuity"))
+        or reconnect_ended is None
+        or captured_at < reconnect_ended
+        or auth.get("browser_receipt_artifact_id") not in continuity_outputs
+        or screenshot_id not in continuity_outputs
+        or not isinstance(browser_receipt.get("screenshot_sha256"), str)
+        or browser_receipt.get("screenshot_sha256") != artifact_hashes.get(screenshot_id)
+        or not _valid_png(screenshot)
+    ):
+        return False
+    return all(
+        browser_receipt.get(key) == auth.get(key)
+        for key in (
+            "login_status",
+            "redirect_followed",
+            "protected_access_status",
+            "protected_path",
+            "account_identity_sha256",
+            "credential_identity_sha256",
+            "session_fingerprint_sha256",
+            "operator_service",
+            "origin",
+            "observed_at",
+        )
+    ) and not any(key in browser_receipt for key in ("session_id", "session_token", "cookie", "password"))
 
 
 def _verify_lifecycle_evidence(config: dict[str, Any], artifacts: dict[str, Any]) -> dict[str, Any]:
@@ -871,6 +1245,7 @@ def _verify_lifecycle_evidence(config: dict[str, Any], artifacts: dict[str, Any]
     else:
         previous_end: datetime | None = None
         names: list[str] = []
+        attempt_names: dict[str, str] = {}
         observation_id = bundle.get("observations_artifact_id")
         for receipt in receipts:
             if not isinstance(receipt, dict):
@@ -886,6 +1261,12 @@ def _verify_lifecycle_evidence(config: dict[str, Any], artifacts: dict[str, Any]
             output_ids = receipt.get("native_output_artifact_ids")
             if not _valid_uuid(attempt):
                 _add_error(errors, name, "attempt_id_invalid")
+            else:
+                previous_stage = attempt_names.get(attempt)
+                if previous_stage is not None:
+                    _add_error(errors, previous_stage, "attempt_id_duplicate")
+                    _add_error(errors, name, "attempt_id_duplicate")
+                attempt_names[attempt] = name
             if start is None or end is None or end <= start or (previous_end is not None and start < previous_end):
                 _add_error(errors, name, "stage_timestamps_invalid")
             else:
@@ -910,6 +1291,8 @@ def _verify_lifecycle_evidence(config: dict[str, Any], artifacts: dict[str, Any]
                 or observation_id not in output_ids
             ):
                 _add_error(errors, name, "native_outputs_missing_or_unbound")
+            for code in _native_receipt_binding_errors(receipt, bundle, artifacts, observation_id):
+                _add_error(errors, name, code)
             status = receipt.get("exit_status")
             if type(status) is not int or (name == "reclaim_interrupted" and status == 0) or (name != "reclaim_interrupted" and status != 0):
                 _add_error(errors, name, "stage_exit_status_unexpected")
@@ -926,6 +1309,13 @@ def _verify_lifecycle_evidence(config: dict[str, Any], artifacts: dict[str, Any]
     if provenance_kind not in {"native", "synthetic_offline"}:
         for case in _STAGES:
             _add_error(errors, case, "provenance_kind_invalid")
+    for code in _native_provenance_errors(
+        provenance,
+        [receipt for receipt in receipt_by_name.values()],
+        artifacts,
+    ):
+        for case in _STAGES:
+            _add_error(errors, case, code)
 
     bindings = bundle.get("bindings")
     inventory = None
@@ -999,7 +1389,14 @@ def _verify_lifecycle_evidence(config: dict[str, Any], artifacts: dict[str, Any]
 
     if provenance_kind in {"native", "synthetic_offline"} and inventory is not None and isinstance(stage_observations, dict):
         deploy = stage_observations.get("deploy")
-        _check_deploy_observation(deploy, inventory, bundle, errors["deploy"])
+        _check_deploy_observation(
+            deploy,
+            inventory,
+            bundle,
+            artifacts,
+            receipt_by_name.get("deploy"),
+            errors["deploy"],
+        )
         _check_reapply_observation(stage_observations.get("reapply"), deploy, errors["reapply"])
 
         baseline = stage_observations.get("baseline")
@@ -1040,14 +1437,25 @@ def _verify_lifecycle_evidence(config: dict[str, Any], artifacts: dict[str, Any]
                 not isinstance(value, dict)
                 or type(value.get("active")) is not bool
                 or _iso_time(value.get("observed_at")) is None
-                or value.get("runtime_status") not in {"pending", "verified_stopped"}
+                or not isinstance(value.get("runtime_status"), str)
+                or not value["runtime_status"]
                 for value in service_status.values()
             )
         ):
             errors["reclaim_interrupted"].append("measured_service_and_runtime_status_missing")
         elif interrupted_states is None or any(
-            service_status[node].get("runtime_status") != interrupted_states[node].get("runtime_status")
-            or (interrupted_states[node].get("step") == "service_stopped" and service_status[node].get("active") is not False)
+            (
+                interrupted_states[node].get("runtime_status") is not None
+                and service_status[node].get("runtime_status") != interrupted_states[node].get("runtime_status")
+            )
+            or (
+                interrupted_states[node].get("step") == "runtime_verification_pending"
+                and service_status[node].get("runtime_status") not in {"pending", "verified_stopped"}
+            )
+            or (
+                interrupted_states[node].get("step") == "service_stopped"
+                and service_status[node].get("active") is not False
+            )
             for node in expected_node_names
         ):
             errors["reclaim_interrupted"].append("measured_service_status_conflicts_with_node_record")
@@ -1152,49 +1560,13 @@ def _verify_lifecycle_evidence(config: dict[str, Any], artifacts: dict[str, Any]
             after = continuity.get("selected_records")
             if not isinstance(before, dict) or after != before:
                 errors["continuity"].append("selected_data_or_job_history_changed")
-            metadata = continuity.get("logical_restore")
-            access_report = _artifact_value(artifacts, metadata.get("access_report_artifact_id")) if isinstance(metadata, dict) else None
-            if (
-                not isinstance(metadata, dict)
-                or not metadata.get("source_database_id")
-                or not metadata.get("restore_database_id")
-                or metadata.get("source_database_id") == metadata.get("restore_database_id")
-                or metadata.get("backup_validation_database_id") == metadata.get("restore_validation_database_id")
-                or not metadata.get("backup_validation_database_id")
-                or not metadata.get("restore_validation_database_id")
-                or not metadata.get("backup_dump_path")
-                or not metadata.get("restored_dump_path")
-                or metadata.get("backup_dump_path") == metadata.get("restored_dump_path")
-                or not _is_sha256(metadata.get("source_query_sha256"))
-                or metadata.get("source_query_sha256") != metadata.get("restored_query_sha256")
-                or metadata.get("source_row_count") != metadata.get("restored_row_count")
-                or metadata.get("restore_status") != "verified"
-                or not isinstance(access_report, dict)
-                or access_report.get("status") != "verified"
-                or access_report.get("source_rows") != metadata.get("source_row_count")
-                or access_report.get("restored_rows") != metadata.get("restored_row_count")
-            ):
+            if not _check_logical_readback(continuity, baseline, manifest, artifacts, receipt_by_name):
                 errors["continuity"].append("distinct_database_restore_and_readback_missing")
-            auth = continuity.get("authentication")
-            browser_receipt = _artifact_value(artifacts, auth.get("browser_receipt_artifact_id")) if isinstance(auth, dict) else None
-            screenshot = _artifact_value(artifacts, auth.get("screenshot_artifact_id")) if isinstance(auth, dict) else None
-            if (
-                not isinstance(auth, dict)
-                or auth.get("fresh_login_status") != 200
-                or auth.get("protected_access_status") != 200
-                or not auth.get("session_id")
-                or not _is_sha256(auth.get("credential_identity_sha256"))
-                or auth.get("credential_identity_sha256") != baseline.get("credential_identity_sha256")
-                or not isinstance(browser_receipt, dict)
-                or browser_receipt.get("login_status") != 200
-                or browser_receipt.get("protected_access_status") != 200
-                or not isinstance(screenshot, bytes)
-                or not screenshot
-            ):
+            if not _check_operator_authentication(continuity, baseline, bundle, artifacts, receipt_by_name):
                 errors["continuity"].append("fresh_preserved_credential_access_missing")
         rtsp = stage_observations.get("rtsp_preserved")
         services = inventory.get("protected_services", [])
-        if not _check_rtsp_snapshots(rtsp, services):
+        if not _check_rtsp_snapshots(rtsp, services, artifacts, receipt_by_name):
             errors["rtsp_preserved"].append("original_rtsp_identity_mount_or_stream_changed")
 
     cases: dict[str, dict[str, Any]] = {}
@@ -1355,9 +1727,9 @@ def _complete_state(
         "plan_id": plan_id,
         "step": "service_stopped",
         "runtime_status": "verified_stopped",
-        "retained_failures": [],
         "service": node["service"],
         "k3s_data_dir": node["k3s_data_dir"],
+        "daemonset_snapshot_path": "/secure/recovery/daemonsets.json",
         "daemonset_snapshot_sha256": snapshot_sha256,
         "cold_retained_paths": {
             identifier: hashlib.sha256(f"{node['name']}:{identifier}".encode()).hexdigest()
@@ -1383,6 +1755,20 @@ def _complete_state(
     return state
 
 
+def _fixture_png() -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        checksum = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\xff\xff\xff"))
+        + chunk(b"IEND", b"")
+    )
+
+
 def _make_evidence_fixture(root: Path, *, provenance_kind: str = "synthetic_offline") -> tuple[dict[str, Any], dict[str, Any]]:
     from gods_mlops.lifecycle.recovery import build_daemonset_snapshot
 
@@ -1405,6 +1791,22 @@ def _make_evidence_fixture(root: Path, *, provenance_kind: str = "synthetic_offl
         "input_versions": {
             "dataset": {"version": "synthetic-v1", "sha256": "3" * 64},
             "k3s": {"version": "v1.36.2+k3s1", "sha256": "4" * 64},
+        },
+        "kubeconfig": {
+            "reference": "infra/ansible/generated/kubeconfig",
+            "sha256": "5" * 64,
+            "mode": "0600",
+            "context": "default",
+            "server": "https://k3s.example.invalid:6443",
+            "certificate_authority_sha256": "6" * 64,
+            "cluster_uid": "synthetic-cluster-uid",
+        },
+        "operator": {
+            "service_id": "gods-mlops-operator",
+            "origin": "http://127.0.0.1:8080",
+            "protected_path": "/samples",
+            "account_identity_sha256": "7" * 64,
+            "credential_identity_sha256": "c" * 64,
         },
     }
     deploy_nodes: dict[str, Any] = {}
@@ -1462,8 +1864,16 @@ def _make_evidence_fixture(root: Path, *, provenance_kind: str = "synthetic_offl
             "image_digests": identities["images"],
             "render_sha256": "d" * 64,
         },
-        "cluster": {"uid": "synthetic-cluster-uid", "context": "gods-test-context"},
-        "generated_kubeconfig": {"mode": "0600", "cluster_uid": "synthetic-cluster-uid"},
+        "cluster": {
+            "uid": "synthetic-cluster-uid",
+            "context": "default",
+            "server": "https://k3s.example.invalid:6443",
+            "certificate_authority_sha256": "6" * 64,
+        },
+        "generated_kubeconfig": {
+            **identities["kubeconfig"],
+            "artifact_id": "kubeconfig-facts",
+        },
         "nodes": deploy_nodes,
         "pv_bindings": deploy_pvs,
         "image_digests": identities["images"],
@@ -1496,6 +1906,19 @@ def _make_evidence_fixture(root: Path, *, provenance_kind: str = "synthetic_offl
     add_artifact("storage", "retained-storage.yml", storage_path.read_bytes(), "yaml")
     add_artifact("manifest", "manifest.json", manifest, "json")
     add_artifact("snapshot", "snapshot.json", snapshot, "json")
+    add_artifact(
+        "kubeconfig-facts",
+        "kubeconfig-facts.json",
+        {"schema_version": 1, **identities["kubeconfig"]},
+        "json",
+    )
+    stage_times = {
+        stage: (
+            f"2026-10-07T10:{2 + 2 * index:02d}:00+09:00",
+            f"2026-10-07T10:{3 + 2 * index:02d}:00+09:00",
+        )
+        for index, stage in enumerate(_STAGES)
+    }
     for node in inventory["nodes"]:
         sliced = slice_retained_manifest_for_node(manifest, inventory, node["name"])
         completed_node_state = _complete_state(inventory, node, plan_id, snapshot_sha256)
@@ -1543,23 +1966,71 @@ def _make_evidence_fixture(root: Path, *, provenance_kind: str = "synthetic_offl
         node_state_artifacts[name] = f"resume-state-{name}"
         repeat_state_artifacts[name] = f"repeat-state-{name}"
         reconnect_state_artifacts[name] = f"reconnect-state-{name}"
-        interrupted_state = dict(state)
         if node["role"] == "server":
-            interrupted_state.update(
-                {
-                    "step": "runtime_verification_pending",
-                    "runtime_status": "pending",
-                    "cold_retained_paths": {},
-                    "cold_k3s_state": {},
-                }
-            )
+            interrupted_state = {
+                "schema_version": 1,
+                "owner": "gods-mlops",
+                "node": name,
+                "plan_id": plan_id,
+                "step": "runtime_verification_pending",
+                "service": node["service"],
+                "k3s_data_dir": node["k3s_data_dir"],
+                "daemonset_snapshot_path": "/secure/recovery/daemonsets.json",
+                "daemonset_snapshot_sha256": snapshot_sha256,
+            }
+        else:
+            interrupted_state = state
         add_artifact(f"interrupted-state-{name}", f"interrupted-state-{name}.json", interrupted_state, "json")
         interrupted_state_artifacts[name] = f"interrupted-state-{name}"
 
     add_artifact("offline-trace", "offline-trace.json", {"selected_branch": "offline_resume", "api_request_events": []}, "json")
-    add_artifact("database-access", "database-access.json", {"status": "verified", "source_rows": 2, "restored_rows": 2}, "json")
-    add_artifact("browser-receipt", "browser-receipt.json", {"login_status": 200, "protected_access_status": 200}, "json")
-    add_artifact("browser-screenshot", "browser-screenshot.bin", b"synthetic screenshot fixture", "bytes")
+    database_restore = manifest["database_restores"][0]
+    query_sha256 = "9" * 64
+    readback_at = "2026-10-07T10:16:30+09:00"
+    logical_restore = {
+        "database_restore_manifest_id": database_restore["id"],
+        "source_database_id": "source-db",
+        "restore_database_id": "restored-db",
+        "backup_validation_database_id": "backup-validation-db",
+        "restore_validation_database_id": "restore-validation-db",
+        "backup_dump_path": database_restore["backup_dump_path"],
+        "restored_dump_path": database_restore["restored_dump_path"],
+        "source_query_sha256": query_sha256,
+        "restored_query_sha256": query_sha256,
+        "readback_query_sha256": query_sha256,
+        "source_row_count": 2,
+        "restored_row_count": 2,
+        "readback_row_count": 2,
+        "restore_status": "verified",
+        "access_report_artifact_id": "database-access",
+    }
+    database_access = {
+        "status": "verified",
+        "readback_status": "verified",
+        "observed_at": readback_at,
+        **logical_restore,
+    }
+    add_artifact("database-access", "database-access.json", database_access, "json")
+    screenshot_bytes = _fixture_png()
+    add_artifact("browser-screenshot", "browser-screenshot.png", screenshot_bytes, "bytes")
+    browser_observation = {
+        "login_status": 303,
+        "redirect_followed": True,
+        "protected_access_status": 200,
+        "protected_path": identities["operator"]["protected_path"],
+        "account_identity_sha256": identities["operator"]["account_identity_sha256"],
+        "credential_identity_sha256": identities["operator"]["credential_identity_sha256"],
+        "session_fingerprint_sha256": "a" * 64,
+        "operator_service": identities["operator"]["service_id"],
+        "origin": identities["operator"]["origin"],
+        "observed_at": readback_at,
+    }
+    add_artifact(
+        "browser-receipt",
+        "browser-receipt.json",
+        {**browser_observation, "screenshot_sha256": _sha256(screenshot_bytes)},
+        "json",
+    )
     live_daemonsets = _daemonset_document()
     add_artifact("restored-daemonsets", "restored-daemonsets.json", live_daemonsets, "json")
 
@@ -1568,16 +2039,34 @@ def _make_evidence_fixture(root: Path, *, provenance_kind: str = "synthetic_offl
             "container_id": f"synthetic-{name}-container-id",
             "image_id": "sha256:" + "7" * 64,
             "running": True,
-            "started_at": "2026-10-07T10:00:00+09:00",
+            "started_at": "2026-10-07T09:00:00+09:00",
             "mounts": [{"name": f"{name}-volume", "destination": "/recordings", "source": "/srv/recordings"}],
         }
         for name in inventory["protected_services"]
     }
-    rtsp_snapshot = {
-        "containers": rtsp_containers,
-        "selected_content_sha256": {"recording-1": "8" * 64},
-        "read_only_stream_probe": {"status": "readable", "bytes_read": 1024},
-    }
+    rtsp_snapshots: dict[str, dict[str, Any]] = {}
+    for phase, stage in (("before", "baseline"), ("during", "reclaim_resume"), ("after", "reconnect")):
+        start_at = stage_times[stage][0]
+        observed_at = start_at.replace(":00+09:00", ":30+09:00")
+        capture_id = f"rtsp-capture-{phase}"
+        snapshot = {
+            "capture_artifact_id": capture_id,
+            "observed_at": observed_at,
+            "containers": rtsp_containers,
+            "selected_content_sha256": {"recording-1": "8" * 64},
+            "read_only_stream_probe": {"status": "readable", "bytes_read": 1024},
+        }
+        capture = {
+            "schema_version": 1,
+            "phase": phase,
+            "stage": stage,
+            "observed_at": observed_at,
+            "containers": snapshot["containers"],
+            "selected_content_sha256": snapshot["selected_content_sha256"],
+            "read_only_stream_probe": snapshot["read_only_stream_probe"],
+        }
+        add_artifact(capture_id, f"{capture_id}.json", capture, "json")
+        rtsp_snapshots[phase] = snapshot
     observations = {
         "schema_version": 1,
         "stages": {
@@ -1587,6 +2076,7 @@ def _make_evidence_fixture(root: Path, *, provenance_kind: str = "synthetic_offl
                 "recovery_report_artifacts": {node["name"]: f"baseline-report-{node['name']}" for node in inventory["nodes"]},
                 "selected_records": selected_records,
                 "credential_identity_sha256": "c" * 64,
+                "account_identity_sha256": identities["operator"]["account_identity_sha256"],
             },
             "reclaim_interrupted": {
                 "controller": {
@@ -1627,45 +2117,58 @@ def _make_evidence_fixture(root: Path, *, provenance_kind: str = "synthetic_offl
             },
             "continuity": {
                 "selected_records": selected_records,
-                "logical_restore": {
-                    "source_database_id": "source-db",
-                    "restore_database_id": "isolated-restore-db",
-                    "backup_validation_database_id": "backup-validation-db",
-                    "restore_validation_database_id": "restore-validation-db",
-                    "backup_dump_path": "/recovery/source.sql",
-                    "restored_dump_path": "/recovery/restored.sql",
-                    "source_query_sha256": "9" * 64,
-                    "restored_query_sha256": "9" * 64,
-                    "source_row_count": 2,
-                    "restored_row_count": 2,
-                    "restore_status": "verified",
-                    "access_report_artifact_id": "database-access",
-                },
+                "logical_restore": logical_restore,
                 "authentication": {
-                    "fresh_login_status": 200,
-                    "protected_access_status": 200,
-                    "session_id": "synthetic-fresh-session",
-                    "credential_identity_sha256": "c" * 64,
+                    **browser_observation,
                     "browser_receipt_artifact_id": "browser-receipt",
                     "screenshot_artifact_id": "browser-screenshot",
                 },
             },
-            "rtsp_preserved": {"before": rtsp_snapshot, "during": rtsp_snapshot, "after": rtsp_snapshot},
+            "rtsp_preserved": rtsp_snapshots,
         },
     }
     add_artifact("observations", "observations.json", observations, "json")
 
     stage_receipts: list[dict[str, Any]] = []
-    start_minute = 0
+    extra_outputs = {
+        "deploy": ["kubeconfig-facts"],
+        "baseline": ["rtsp-capture-before"],
+        "reclaim_resume": ["rtsp-capture-during"],
+        "reconnect": ["rtsp-capture-after"],
+        "continuity": ["database-access", "browser-receipt", "browser-screenshot"],
+    }
     for stage in _STAGES:
         attempt_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"synthetic:{stage}"))
-        start_minute += 2
-        start = f"2026-10-07T10:{start_minute:02d}:00+09:00"
-        end = f"2026-10-07T10:{start_minute + 1:02d}:00+09:00"
+        start, end = stage_times[stage]
         recipe_id = f"recipe-{stage}"
-        add_artifact(recipe_id, f"{recipe_id}.json", {"fixture_only": True, "stage": stage}, "json")
+        add_artifact(
+            recipe_id,
+            f"{recipe_id}.json",
+            {"fixture_only": True, "execution_mode": "fixture_only", "stage": stage},
+            "json",
+        )
         raw_id = f"native-output-{stage}"
         add_artifact(raw_id, f"{raw_id}.bin", f"synthetic native output for {stage}".encode(), "bytes")
+        output_ids = [raw_id, *extra_outputs.get(stage, [])]
+        native_receipt_id = f"native-receipt-{stage}"
+        native_receipt = {
+            "schema_version": 1,
+            "kind": "native_stage_receipt",
+            "fixture_only": True,
+            "stage": stage,
+            "attempt_id": attempt_id,
+            "source_commit": source_commit,
+            "plan_id": plan_id,
+            "exit_status": 130 if stage == "reclaim_interrupted" else 0,
+            "started_at": start,
+            "ended_at": end,
+            "output_artifact_ids": sorted(output_ids),
+            "output_sha256": {
+                identifier: next(item["sha256"] for item in artifacts if item["id"] == identifier)
+                for identifier in output_ids
+            },
+        }
+        add_artifact(native_receipt_id, f"{native_receipt_id}.json", native_receipt, "json")
         stage_receipts.append(
             {
                 "stage": stage,
@@ -1678,7 +2181,8 @@ def _make_evidence_fixture(root: Path, *, provenance_kind: str = "synthetic_offl
                 **({"snapshot_sha256": snapshot_sha256} if stage not in {"deploy", "reapply"} else {}),
                 "recipe_artifact_id": recipe_id,
                 "recipe_sha256": next(item["sha256"] for item in artifacts if item["id"] == recipe_id),
-                "native_output_artifact_ids": ["observations", raw_id],
+                "native_receipt_artifact_id": native_receipt_id,
+                "native_output_artifact_ids": ["observations", native_receipt_id, *output_ids],
             }
         )
     observations["stages"]["reclaim_interrupted"]["controller"]["attempt_id"] = next(
@@ -1693,7 +2197,12 @@ def _make_evidence_fixture(root: Path, *, provenance_kind: str = "synthetic_offl
         "source_commit": source_commit,
         "plan_id": plan_id,
         "snapshot_sha256": snapshot_sha256,
-        "provenance": {"kind": provenance_kind, "origin": "source test fixture; no live operations"},
+        "provenance": {
+            "kind": provenance_kind,
+            "execution_mode": "fixture_only",
+            "origin": "source test fixture; no live operations",
+            "data_origin": "synthetic",
+        },
         "identities": identities,
         "bindings": {
             "inventory_artifact_id": "inventory",
@@ -1949,7 +2458,7 @@ def test_continuity_requires_distinct_restore_and_fresh_preserved_authentication
 
     root, config, bundle, _ = _loaded_fixture(tmp_path / "auth")
     observations = _artifact_value(_load_bound_artifacts(config), "observations")
-    observations["stages"]["continuity"]["authentication"]["fresh_login_status"] = 401
+    observations["stages"]["continuity"]["authentication"]["login_status"] = 401
     _resign_artifact(root, config, bundle, "observations", observations)
     result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
     assert result["cases"]["continuity"]["status"] == "failed"
@@ -2018,3 +2527,187 @@ def test_lifecycle_cycle_evidence_from_root_acknowledged_bundle() -> None:
     assert report["lifecycle_pass_claimed"] is False
     assert report["overall"] == "evidence_consistent"
     assert all(case["status"] == "verified_evidence" for case in report["cases"].values())
+
+
+def test_native_completed_state_accepts_the_literal_producer_record(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    state = _artifact_value(_load_bound_artifacts(config), "resume-state-ubuntu")
+    state.pop("retained_failures", None)
+    _resign_artifact(root, config, bundle, "resume-state-ubuntu", state)
+
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+
+    assert result["cases"]["reclaim_resume"]["status"] == "not_run"
+
+    root, config, bundle, _ = _loaded_fixture(tmp_path / "contradiction")
+    state = _artifact_value(_load_bound_artifacts(config), "resume-state-ubuntu")
+    state["retained_failures"] = ["tree_hash"]
+    _resign_artifact(root, config, bundle, "resume-state-ubuntu", state)
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+    assert result["cases"]["reclaim_resume"]["status"] == "failed"
+
+
+def test_first_runtime_pending_state_may_lack_a_runtime_result(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    state = _artifact_value(_load_bound_artifacts(config), "interrupted-state-vis-lab")
+    state.pop("runtime_status", None)
+    state.pop("retained_failures", None)
+    state.pop("cold_retained_paths", None)
+    state.pop("cold_k3s_state", None)
+    _resign_artifact(root, config, bundle, "interrupted-state-vis-lab", state)
+
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+
+    assert result["cases"]["reclaim_interrupted"]["status"] == "not_run"
+
+
+def test_native_receipt_bindings_reject_duplicate_outputs_and_attempt_ids(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    bundle["stages"][0]["native_output_artifact_ids"] = ["observations", "observations"]
+    _resign_artifact(root, config, bundle, "observations", _artifact_value(_load_bound_artifacts(config), "observations"))
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+    assert result["cases"]["deploy"]["status"] == "failed"
+
+    root, config, bundle, _ = _loaded_fixture(tmp_path / "attempt")
+    bundle["stages"][1]["attempt_id"] = bundle["stages"][0]["attempt_id"]
+    _resign_artifact(root, config, bundle, "observations", _artifact_value(_load_bound_artifacts(config), "observations"))
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+    assert result["cases"]["reapply"]["status"] == "failed"
+
+    for field, wrong_value in (
+        ("stage", "wrong-stage"),
+        ("source_commit", "b" * 40),
+        ("plan_id", "0" * 64),
+        ("attempt_id", str(uuid.uuid4())),
+    ):
+        root, config, bundle, _ = _loaded_fixture(tmp_path / field)
+        native_receipt = _artifact_value(_load_bound_artifacts(config), "native-receipt-deploy")
+        native_receipt[field] = wrong_value
+        _resign_artifact(root, config, bundle, "native-receipt-deploy", native_receipt)
+        result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+        assert result["cases"]["deploy"]["status"] == "failed"
+
+
+def test_native_provenance_rejects_explicit_fixture_only_recipe_and_outputs(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    bundle["provenance"]["kind"] = "native"
+    _resign_artifact(root, config, bundle, "observations", _artifact_value(_load_bound_artifacts(config), "observations"))
+
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+
+    assert result["overall"] == "incomplete_or_failed"
+    assert all(case["status"] == "failed" for case in result["cases"].values())
+
+
+def test_recorded_native_execution_may_use_synthetic_input_data() -> None:
+    provenance = {
+        "kind": "native",
+        "execution_mode": "recorded_native",
+        "origin": "operator-recorded Ansible execution",
+        "data_origin": "synthetic",
+    }
+    receipt = {
+        "recipe_artifact_id": "recipe",
+        "native_receipt_artifact_id": "native-receipt",
+        "native_output_artifact_ids": ["observations", "native-receipt", "native-output"],
+    }
+    artifacts = {
+        "artifact_values": {
+            "recipe": {"fixture_only": False},
+            "native-receipt": {"fixture_only": False},
+            "native-output": b"recorded native output for a synthetic dataset run",
+        }
+    }
+
+    assert _native_provenance_errors(provenance, [receipt], artifacts) == []
+
+
+def test_continuity_requires_bound_row_counts_and_authenticated_receipt(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    observations = _artifact_value(_load_bound_artifacts(config), "observations")
+    logical_restore = observations["stages"]["continuity"]["logical_restore"]
+    logical_restore.pop("source_row_count", None)
+    logical_restore.pop("restored_row_count", None)
+    access_report = _artifact_value(_load_bound_artifacts(config), "database-access")
+    access_report.pop("source_rows", None)
+    access_report.pop("restored_rows", None)
+    _resign_artifact(root, config, bundle, "database-access", access_report)
+    _resign_artifact(root, config, bundle, "observations", observations)
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+    assert result["cases"]["continuity"]["status"] == "failed"
+
+    root, config, bundle, _ = _loaded_fixture(tmp_path / "stale-auth")
+    browser_receipt = _artifact_value(_load_bound_artifacts(config), "browser-receipt")
+    browser_receipt.update(
+        {
+            "account_identity_sha256": "0" * 64,
+            "credential_identity_sha256": "0" * 64,
+            "session_fingerprint_sha256": "0" * 64,
+            "operator_service": "unrelated-service",
+            "origin": "https://unrelated.invalid",
+            "observed_at": "2000-01-01T00:00:00Z",
+        }
+    )
+    _resign_artifact(root, config, bundle, "browser-receipt", browser_receipt)
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+    assert result["cases"]["continuity"]["status"] == "failed"
+
+    root, config, bundle, _ = _loaded_fixture(tmp_path / "image")
+    _resign_artifact(root, config, bundle, "browser-screenshot", b"not an image")
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+    assert result["cases"]["continuity"]["status"] == "failed"
+
+
+def test_native_login_303_followed_by_protected_200_is_accepted(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    browser_receipt = _artifact_value(_load_bound_artifacts(config), "browser-receipt")
+    browser_receipt["login_status"] = 303
+    _resign_artifact(root, config, bundle, "browser-receipt", browser_receipt)
+    observations = _artifact_value(_load_bound_artifacts(config), "observations")
+    observations["stages"]["continuity"]["authentication"]["login_status"] = 303
+    _resign_artifact(root, config, bundle, "observations", observations)
+
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+
+    assert result["cases"]["continuity"]["status"] == "not_run"
+
+
+def test_rtsp_snapshots_require_distinct_time_bound_native_captures(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    observations = _artifact_value(_load_bound_artifacts(config), "observations")
+    snapshots = observations["stages"]["rtsp_preserved"]
+    for phase in ("before", "during", "after"):
+        snapshots[phase]["observed_at"] = "2000-01-01T00:00:00Z"
+        for container in snapshots[phase]["containers"].values():
+            container["started_at"] = "2099-01-01T00:00:00Z"
+    _resign_artifact(root, config, bundle, "observations", observations)
+
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+
+    assert result["cases"]["rtsp_preserved"]["status"] == "failed"
+
+    root, config, bundle, _ = _loaded_fixture(tmp_path / "duplicate")
+    observations = _artifact_value(_load_bound_artifacts(config), "observations")
+    snapshots = observations["stages"]["rtsp_preserved"]
+    snapshots["during"] = dict(snapshots["before"])
+    snapshots["after"] = dict(snapshots["before"])
+    _resign_artifact(root, config, bundle, "observations", observations)
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+    assert result["cases"]["rtsp_preserved"]["status"] == "failed"
+
+
+def test_explicitly_bound_default_kubeconfig_alias_is_allowed_but_wrong_cluster_fails(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    observations = _artifact_value(_load_bound_artifacts(config), "observations")
+    observations["stages"]["deploy"]["cluster"]["context"] = "default"
+    observations["stages"]["deploy"]["generated_kubeconfig"]["context"] = "default"
+    _resign_artifact(root, config, bundle, "observations", observations)
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+    assert result["cases"]["deploy"]["status"] == "not_run"
+
+    root, config, bundle, _ = _loaded_fixture(tmp_path / "wrong-cluster")
+    observations = _artifact_value(_load_bound_artifacts(config), "observations")
+    observations["stages"]["deploy"]["cluster"]["uid"] = "other-cluster-uid"
+    _resign_artifact(root, config, bundle, "observations", observations)
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+    assert result["cases"]["deploy"]["status"] == "failed"
