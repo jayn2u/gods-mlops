@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from gods_mlops.datasets.deletion import invalidate_sample, preview_invalidate_sample
 from gods_mlops.evaluation.report import load_operator_evaluation_report
-from gods_mlops.jobs.queue import OperatorRetryIntentCapacityError
+from gods_mlops.jobs.queue import OperatorRetryIntentCapacityError, OperatorRetrySessionExpiredError
 
 from .auth import AUTH_COOKIE, OperatorAuth
 
@@ -434,8 +434,12 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
                 scope_sha256,
                 session_expires_at=datetime.fromtimestamp(session_expiry, UTC),
             )
+            if _retry_session_identity(request, auth) != (session_nonce, session_expiry):
+                raise HTTPException(status_code=401, detail="operator authentication required")
         except HTTPException:
             raise
+        except OperatorRetrySessionExpiredError as error:
+            raise HTTPException(status_code=401, detail="operator session expired") from error
         except ValueError as error:
             return _error_page(request, "Jobs", error, status_code=409)
         except Exception as error:  # noqa: BLE001 - intent projection remains a bounded service failure
@@ -489,10 +493,14 @@ def build_operator_router(*, auth: OperatorAuth) -> APIRouter:
                 scope_sha256,
                 session_expires_at=datetime.fromtimestamp(session_expiry, UTC),
             )
+            if _retry_session_identity(request, auth) != (session_nonce, session_expiry):
+                raise HTTPException(status_code=401, detail="operator authentication required")
         except OperatorRetryIntentCapacityError as error:
             return _error_page(request, "Jobs", error, status_code=503)
         except HTTPException:
             raise
+        except OperatorRetrySessionExpiredError as error:
+            raise HTTPException(status_code=401, detail="operator session expired") from error
         except ValueError as error:
             return _error_page(request, "Jobs", error, status_code=409)
         except Exception as error:  # noqa: BLE001 - generation advances only the selected session/job scope

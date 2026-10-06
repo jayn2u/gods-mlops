@@ -82,6 +82,10 @@ class OperatorRetryIntentCapacityError(ValueError):
     """The bounded active server-side retry-intent generation table is full."""
 
 
+class OperatorRetrySessionExpiredError(ValueError):
+    """The signed operator session expired before its retry intent was read."""
+
+
 class ObservationReplayError(ValueError):
     """An observation ID or timestamp was repeated and cannot extend the idle window."""
 
@@ -453,17 +457,21 @@ class PostgresJobQueueRepository:
         current = now or datetime.now(UTC)
         if current.tzinfo is None or session_expires_at.tzinfo is None:
             raise ValueError("retry intent read time and session expiry must be timezone-aware")
+        if session_expires_at <= current:
+            raise OperatorRetrySessionExpiredError("operator session expired before retry generation lookup")
         await self.ensure_schema()
         pool = await self._get_pool()
         async with pool.acquire() as connection:
             row = await connection.fetchrow(
-                """SELECT generation FROM gods_mlops_operator_retry_intent_generations
-                   WHERE scope_sha256=$1 AND expires_at=$2 AND expires_at > $3""",
+                """SELECT generation,expires_at FROM gods_mlops_operator_retry_intent_generations
+                   WHERE scope_sha256=$1""",
                 scope_sha256,
-                session_expires_at,
-                current,
             )
-        return int(row["generation"]) if row is not None else 0
+        if row is None:
+            return 0
+        if row["expires_at"] <= current or row["expires_at"] != session_expires_at:
+            raise OperatorRetrySessionExpiredError("operator retry generation has expired or changed session")
+        return int(row["generation"])
 
     async def advance_operator_retry_intent_generation(
         self,
@@ -475,8 +483,10 @@ class PostgresJobQueueRepository:
         """Atomically advance an explicit rerun generation, bounded by live sessions."""
         _validate_digest(scope_sha256, "operator retry intent scope SHA-256")
         current = now or datetime.now(UTC)
-        if current.tzinfo is None or expires_at.tzinfo is None or expires_at <= current:
+        if current.tzinfo is None or expires_at.tzinfo is None:
             raise ValueError("retry intent session expiry must be future and timezone-aware")
+        if expires_at <= current:
+            raise OperatorRetrySessionExpiredError("operator session expired before retry generation advance")
         await self.ensure_schema()
         pool = await self._get_pool()
         async with pool.acquire() as connection:

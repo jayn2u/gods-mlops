@@ -616,6 +616,48 @@ def test_explicit_retry_generation_survives_new_auth_app_instance() -> None:
         browser.close()
 
 
+def test_retry_revalidates_the_same_session_after_generation_lookup_expires(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import gods_mlops.web.auth as auth_module
+
+    services = _services()
+    parent = services.queue.parent_job_id
+    app, browser = _client(services)
+    try:
+        browser.login()
+        auth = app.state.operator_auth
+        session_cookie = browser.cookie(AUTH_COOKIE)
+        session_identity = auth.session_identity(session_cookie)
+        assert session_identity is not None
+        _session_nonce, session_expiry = session_identity
+        fake_now = [session_expiry - 0.5]
+        monkeypatch.setattr(auth_module, "time", SimpleNamespace(time=lambda: fake_now[0]))
+        original_generation_read = services.queue.retry_intent_generation
+
+        async def generation_read_that_crosses_expiry(scope_sha256, *, session_expires_at):
+            generation = await original_generation_read(
+                scope_sha256,
+                session_expires_at=session_expires_at,
+            )
+            assert fake_now[0] < session_expiry
+            fake_now[0] = session_expiry + 0.5
+            return generation
+
+        services.queue.retry_intent_generation = generation_read_that_crosses_expiry
+        response = browser.request(
+            f"/jobs/{parent}/retry",
+            method="POST",
+            headers={"X-CSRF-Token": browser.cookie(CSRF_COOKIE)},
+        )
+
+        assert response.status_code == 401
+        assert services.queue.retry_calls == []
+        assert services.queue.queued_jobs == {}
+    finally:
+        browser.close()
+
+
 def test_actions_page_renders_rerun_without_issuing_per_job_cookies() -> None:
     services = _services()
     app, browser = _client(services)

@@ -145,7 +145,7 @@ class OperatorAuth:
                 return None
             decoded: Any = json.loads(payload)
             expiry = decoded.get("exp") if isinstance(decoded, dict) else None
-            if not isinstance(expiry, int) or expiry < int(time.time()):
+            if not isinstance(expiry, int) or expiry <= time.time():
                 return None
             return expiry
         except (ValueError, TypeError, json.JSONDecodeError):

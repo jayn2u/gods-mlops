@@ -474,15 +474,11 @@ class _RetryIntentConnection:
         raise AssertionError(f"unexpected retry-intent execute query: {query}")
 
     async def fetchrow(self, query, *args):
-        if query.startswith("SELECT generation FROM gods_mlops_operator_retry_intent_generations"):
+        if query.startswith("SELECT generation") and "FROM gods_mlops_operator_retry_intent_generations" in query:
             row = self.rows.get(args[0])
             if row is None:
                 return None
-            if len(args) > 2 and row["expires_at"] != args[1]:
-                return None
-            if len(args) > 1 and row["expires_at"] <= args[-1]:
-                return None
-            return {"generation": row["generation"]}
+            return {"generation": row["generation"], "expires_at": row["expires_at"]}
         raise AssertionError(f"unexpected retry-intent fetchrow query: {query}")
 
     async def fetchval(self, query, *args):
@@ -556,10 +552,28 @@ def test_retry_intent_generation_cleanup_and_capacity_are_bounded(monkeypatch) -
             session_expires_at=expiry,
             now=now,
         ) == 1
+        expired_generation_scope = "e" * 64
+        connection.rows[expired_generation_scope] = {
+            "generation": 3,
+            "expires_at": now - timedelta(seconds=1),
+            "updated_at": now - timedelta(hours=1),
+        }
+        with pytest.raises(ValueError, match="expired"):
+            await repository.get_operator_retry_intent_generation(
+                expired_generation_scope,
+                session_expires_at=expiry,
+                now=now,
+            )
+        with pytest.raises(ValueError, match="session expired"):
+            await repository.get_operator_retry_intent_generation(
+                active_scope,
+                session_expires_at=expiry,
+                now=expiry,
+            )
         assert await repository.get_operator_retry_intent_generation(
-            active_scope,
+            "d" * 64,
             session_expires_at=expiry,
-            now=now + timedelta(hours=2),
+            now=now,
         ) == 0
 
     asyncio.run(exercise())
