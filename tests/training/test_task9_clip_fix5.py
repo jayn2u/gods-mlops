@@ -665,3 +665,150 @@ def test_runner_accepts_only_the_verified_clip_probe_pin_and_keeps_public_paths_
     }
     with pytest.raises(ValueError):
         validate_manifest_identity(evaluation_probe_config, manifest, probe_manifest_pin=pin)
+
+
+def test_clip_probe_worker_dispatch_forwards_profile_pin_through_both_real_runners(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import asyncio
+    import importlib
+    from contextlib import nullcontext
+    from dataclasses import replace
+    from types import SimpleNamespace
+
+    import torch
+
+    from gods_mlops.training.claims import validate_worker_claim
+    from gods_mlops.training.worker import _runner_for, _worker_manifest
+
+    probe = importlib.import_module("gods_mlops.training.probe")
+    clip = importlib.import_module("gods_mlops.training.clip")
+    training_data = importlib.import_module("gods_mlops.training.data")
+    runner_support = importlib.import_module("gods_mlops.training.runner_support")
+    transformers = importlib.import_module("transformers")
+
+    objects = _ImmutableObjects()
+    probe_input = create_probe_input(objects=objects, model_kind="clip")
+    profile = _registered_clip_profile()
+    job, lease, claim = _worker_fixture(probe_input, profile)
+    pin = validate_worker_claim(claim, job=job, lease=lease, profile=profile)
+    manifest_root = tmp_path / "manifest"
+    manifest_root.mkdir()
+    manifest_uri, extra = asyncio.run(
+        _worker_manifest(
+            job,
+            None,
+            objects,
+            root=manifest_root,
+            claim=claim,
+            profile=profile,
+        )
+    )
+    manifest_bytes = objects.read_source(
+        object_key=CLIP_MANIFEST_KEY,
+        sha256_digest=CLIP_INPUT_SHA256,
+        size_bytes=1268,
+    )
+    assert (manifest_root / "probe-manifest.json").read_bytes() == manifest_bytes
+    assert extra["_probe_manifest_pin"] == pin
+    config = {
+        **_clip_runner_config(profile, probe_input),
+        "job_id": claim.job_id,
+        **extra,
+    }
+
+    # Keep the actual manifest/media path; only the external object-store transport is in memory.
+    monkeypatch.setattr(training_data, "dataset_object_store_from_environment", lambda: objects)
+
+    class FakeClipModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.logits = torch.nn.Parameter(
+                torch.tensor(
+                    [[29.984375, 5.48828125], [13.34375, 30.03125]],
+                    dtype=torch.float32,
+                )
+            )
+
+        def forward(self, **_kwargs):
+            return SimpleNamespace(
+                loss=None,
+                logits_per_image=self.logits.to(dtype=torch.float16),
+            )
+
+    class FakeScaler:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.scale_value = 65536.0
+
+        def scale(self, loss):
+            return loss * self.scale_value
+
+        def unscale_(self, optimizer):
+            for group in optimizer.param_groups:
+                for parameter in group["params"]:
+                    if parameter.grad is not None:
+                        parameter.grad.div_(self.scale_value)
+
+        def step(self, optimizer):
+            optimizer.step()
+
+        def update(self):
+            return None
+
+        def get_scale(self):
+            return self.scale_value
+
+        def state_dict(self):
+            return {"scale": self.scale_value}
+
+        def load_state_dict(self, state):
+            self.scale_value = float(state["scale"])
+
+    models = [FakeClipModel(), FakeClipModel()]
+    model_loads = []
+
+    def load_fake_model(*args, **kwargs):
+        model_loads.append((args, kwargs))
+        return models.pop(0)
+
+    monkeypatch.setattr(transformers.CLIPModel, "from_pretrained", load_fake_model)
+    monkeypatch.setattr(transformers.CLIPProcessor, "from_pretrained", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runner_support, "cache_directory", lambda *_args, **_kwargs: tmp_path)
+    monkeypatch.setattr(runner_support, "require_cuda", lambda: torch.device("cpu"))
+    monkeypatch.setattr(torch.cuda, "reset_peak_memory_stats", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(torch, "autocast", lambda **_kwargs: nullcontext())
+    monkeypatch.setattr(torch.amp, "GradScaler", FakeScaler)
+    monkeypatch.setattr(clip, "_encode_contrastive_batch", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(runner_support, "model_bundle", lambda *_args, **_kwargs: (b"model-bundle", "e" * 64))
+
+    runner = _runner_for("probe", "clip", "training")
+    assert runner is probe.run
+    result = runner(config, manifest_uri, str(tmp_path / "output"))
+
+    assert result["status"] == "succeeded"
+    assert len(model_loads) == 2
+    assert result["resource_measurements"]["initial_optimizer_steps"] == 3
+    assert result["resource_measurements"]["resume_steps"] == 1
+    assert result["resource_measurements"]["optimizer_steps"] == 4
+    assert result["resource_measurements"]["finite_nonzero_gradient_updates"] == 4
+    assert result["resource_measurements"]["training_loss_reduction_precision"] == "float64"
+
+    model_load_count = len(model_loads)
+    missing_pin_config = dict(config)
+    missing_pin_config.pop("_probe_manifest_pin")
+    with pytest.raises(ValueError):
+        runner(missing_pin_config, manifest_uri, str(tmp_path / "missing-pin-output"))
+    assert len(model_loads) == model_load_count
+
+    invalid_pin_config = {
+        **config,
+        "_probe_manifest_pin": replace(pin, input_sha256="c" * 64),
+    }
+    with pytest.raises(ValueError):
+        clip.run(invalid_pin_config, manifest_uri, str(tmp_path / "invalid-pin-output"))
+    assert len(model_loads) == model_load_count

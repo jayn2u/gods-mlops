@@ -12,7 +12,11 @@ def run(config: dict[str, Any], manifest_uri: str, output_uri: str) -> dict[str,
     if config.get("phase") != "probe" or config.get("input_kind") != "probe_input":
         raise ValueError("readiness probes require an explicit probe_input job identity")
     manifest = load_manifest(manifest_uri, config=config)
-    validate_manifest_identity(config, manifest)
+    validate_manifest_identity(
+        config,
+        manifest,
+        probe_manifest_pin=config.get("_probe_manifest_pin"),
+    )
     model_kind = config.get("model_kind")
     target_phase = config.get("target_phase")
     if model_kind == "detr":
