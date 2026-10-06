@@ -1091,6 +1091,84 @@ def test_probe_remote_docker_runner_writes_private_ephemeral_environment_file(mo
     assert "private-test-secret" not in capsys.readouterr().out
 
 
+def test_training_probe_finalizer_registers_the_exact_readback_evidence_bytes(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from gods_mlops.jobs.checkpoints import CheckpointIdentity
+
+    module = importlib.import_module("gods_mlops.training.docker_probe")
+    identity = CheckpointIdentity(
+        job_id="a0320b59-663c-4cdc-b893-086bb970ea60",
+        input_kind="probe_input",
+        input_id="task8-clip-probe-v1",
+        input_sha256="1" * 64,
+        phase="probe",
+        model_kind="clip",
+        config_version="clip-real-probe-v1",
+        config_sha256="2" * 64,
+        dataset_version=None,
+    )
+    checkpoint_digest = "3" * 64
+    checkpoint_commit = {
+        "uri": f"s3://gods-test/jobs/{identity.job_id}/checkpoints/{'4' * 64}/{checkpoint_digest}.checkpoint",
+        "sha256": checkpoint_digest,
+        "size_bytes": 1234,
+        "identity": identity.as_dict(),
+    }
+    evidence_value = {
+        "event": "task8_real_model_probe_complete",
+        "job_id": identity.job_id,
+        "model_kind": "clip",
+        "target_phase": "training",
+        "config_version": identity.config_version,
+        "input_sha256": identity.input_sha256,
+        "docker_image_id": "sha256:" + "a" * 64,
+        "image_source_commit": "b" * 40,
+        "source_commit": "b" * 40,
+    }
+    evidence = SimpleNamespace(target_phase="training", job_id=identity.job_id, as_dict=lambda: evidence_value)
+    order = []
+
+    class Repository:
+        async def checkpoint_identity(self, _job_id):
+            return identity
+
+        async def checkpoint_metadata_for(self, _job_id):
+            return checkpoint_commit
+
+        async def _record_probe_runtime_evidence(self, payload):
+            order.append(("register", payload))
+            return {"evidence_sha256": sha256(payload).hexdigest()}
+
+    class CheckpointStore:
+        def __init__(self, *, objects, bucket):
+            self.objects = objects
+            self.bucket = bucket
+
+        def load_uri(self, uri, *, expected_identity, expected_sha256, expected_size_bytes):
+            order.append(("checkpoint_read", uri, expected_sha256, expected_size_bytes))
+            return SimpleNamespace(
+                identity=expected_identity,
+                sha256=expected_sha256,
+                size_bytes=expected_size_bytes,
+            )
+
+    monkeypatch.setattr("gods_mlops.training.checkpoints.S3CheckpointStore", CheckpointStore)
+    payload = asyncio.run(
+        module._finalize_probe_runtime_evidence(
+            repository=Repository(),
+            objects=object(),
+            bucket="gods-test",
+            evidence=evidence,
+        )
+    )
+
+    expected = (json.dumps(evidence_value, sort_keys=True, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    assert payload == expected
+    assert order[0] == ("checkpoint_read", checkpoint_commit["uri"], checkpoint_digest, 1234)
+    assert order[1] == ("register", expected)
+
+
 def test_clip_runner_requires_versioned_distinct_negative_pairs() -> None:
     validate_clip_pairs = _require("gods_mlops.training.clip", "validate_contrastive_pairs")
     good = {

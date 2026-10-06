@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
@@ -247,8 +248,8 @@ class EvaluationProbeCheckpointSource:
         training_profile: dict[str, Any],
         measurement: dict[str, Any],
         checkpoint_commit: dict[str, Any],
-        runtime_evidence: dict[str, Any] | None = None,
-        runtime_evidence_sha256: str | None = None,
+        runtime_evidence_record: dict[str, Any],
+        result_artifact: dict[str, Any],
     ) -> None:
         """Require successful, measured training-target probe provenance and commit bytes."""
 
@@ -329,6 +330,8 @@ class EvaluationProbeCheckpointSource:
         ):
             raise ValueError("evaluation probe checkpoint commit marker differs from its typed source")
 
+        authority = mapping(runtime_evidence_record, "persisted runtime evidence")
+        evidence = mapping(authority.get("evidence"), "runtime evidence projection")
         evidence_identity = {
             "job_id": self.training_probe_job_id,
             "model_kind": self.model_kind,
@@ -339,14 +342,43 @@ class EvaluationProbeCheckpointSource:
             "image_source_commit": self.source_commit,
             "source_commit": self.source_commit,
         }
-        if runtime_evidence is not None:
-            if (
-                runtime_evidence_sha256 != self.runtime_evidence_sha256
-                or runtime_evidence.get("event") != "task8_real_model_probe_complete"
-                or any(runtime_evidence.get(key) != value for key, value in evidence_identity.items())
-                or self.source_commit != runtime_evidence.get("image_source_commit")
-            ):
-                raise ValueError("evaluation probe source runtime image/source evidence differs from its origin")
+        result = mapping(result_artifact, "committed result artifact")
+        result_projection = {
+            key: result.get(key)
+            for key in ("kind", "uri", "sha256", "size_bytes", "identity", "object_key")
+        }
+        recorded_result = mapping(authority.get("result_artifact"), "runtime evidence result binding")
+        evidence_projection_sha256 = sha256(
+            json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+        if (
+            authority.get("schema") != "gods-mlops-probe-runtime-evidence-v1"
+            or authority.get("evidence_projection_sha256") != evidence_projection_sha256
+            or authority.get("job_id") != self.training_probe_job_id
+            or authority.get("evidence_sha256") != self.runtime_evidence_sha256
+            or not isinstance(authority.get("evidence_canonical_sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", authority["evidence_canonical_sha256"])
+            or authority.get("measurement_id") != str(measurement.get("measurement_id", ""))
+            or authority.get("checkpoint_sha256") != self.checkpoint_sha256
+            or authority.get("checkpoint_identity") != identity
+            or recorded_result != result_projection
+            or not isinstance(result.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", result["sha256"])
+            or type(result.get("size_bytes")) is not int
+            or result["size_bytes"] <= 0
+            or result.get("kind") != "model"
+            or result.get("identity") != identity
+            or evidence.get("event") != "task8_real_model_probe_complete"
+            or evidence.get("job_id") != self.training_probe_job_id
+            or evidence.get("model_kind") != self.model_kind
+            or evidence.get("target_phase") != "training"
+            or evidence.get("config_version") != identity["config_version"]
+            or evidence.get("input_sha256") != identity["input_sha256"]
+            or any(evidence.get(key) != value for key, value in evidence_identity.items())
+        ):
+            raise ValueError("evaluation probe source runtime evidence authority differs from its origin")
 
 
 @dataclass(frozen=True, slots=True)

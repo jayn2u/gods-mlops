@@ -106,6 +106,40 @@ class DockerProbeEvidence:
         return result
 
 
+async def _finalize_probe_runtime_evidence(
+    *,
+    repository: PostgresJobQueueRepository,
+    objects,
+    bucket: str,
+    evidence: DockerProbeEvidence,
+) -> bytes:
+    """Finalize exact controller evidence bytes, then persist authority for training probes."""
+    payload = (json.dumps(evidence.as_dict(), sort_keys=True, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if evidence.target_phase == "training":
+        from .checkpoints import S3CheckpointStore
+
+        identity = await repository.checkpoint_identity(evidence.job_id)
+        commit = await repository.checkpoint_metadata_for(evidence.job_id)
+        if commit is None or identity.as_dict() != commit["identity"]:
+            raise DockerProbeError("successful training probe has no matching committed checkpoint identity")
+        checkpoint_store = S3CheckpointStore(objects=objects, bucket=bucket)
+        verified_checkpoint = await asyncio.to_thread(
+            checkpoint_store.load_uri,
+            commit["uri"],
+            expected_identity=identity,
+            expected_sha256=commit["sha256"],
+            expected_size_bytes=commit["size_bytes"],
+        )
+        if (
+            verified_checkpoint.identity != identity
+            or verified_checkpoint.sha256 != commit["sha256"]
+            or verified_checkpoint.size_bytes != commit["size_bytes"]
+        ):
+            raise DockerProbeError("successful training probe checkpoint failed exact S3 readback")
+        await repository._record_probe_runtime_evidence(payload)
+    return payload
+
+
 class DockerProbeError(RuntimeError):
     """A bounded real-model Docker probe failed before or during execution."""
 
@@ -404,12 +438,15 @@ async def run_docker_model_probe(
                 else None
             ),
         )
+        evidence_payload = await _finalize_probe_runtime_evidence(
+            repository=repository,
+            objects=objects,
+            bucket=_required("GODS_MLOPS_S3_BUCKET"),
+            evidence=evidence,
+        )
         evidence_path = Path(evidence_directory) / f"{model_kind}-{job_id}.json"
         evidence_path.parent.mkdir(parents=True, exist_ok=True)
-        evidence_path.write_text(
-            json.dumps(evidence.as_dict(), sort_keys=True, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        evidence_path.write_bytes(evidence_payload)
         print(json.dumps({"evidence": str(evidence_path), **evidence.as_dict()}, sort_keys=True))
         return evidence
     finally:

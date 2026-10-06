@@ -576,9 +576,20 @@ async def _load_verified_evaluation_probe_checkpoint(
             config_version=source.checkpoint_identity["config_version"],
         )
         measurement = await queue.repository.profile_measurement_for_job(source.training_probe_job_id)
+        runtime_evidence_record = await queue.repository.probe_runtime_evidence_for_job(
+            source.training_probe_job_id
+        )
+        result_artifacts = await queue.repository.result_artifacts_for(source.training_probe_job_id)
     except Exception as error:  # noqa: BLE001 - keep source metadata out of worker logs
         raise WorkerAuthorizationError("evaluation probe training checkpoint metadata is unavailable") from error
-    if metadata is None or measurement is None or probe_profile is None or training_profile is None:
+    if (
+        metadata is None
+        or measurement is None
+        or probe_profile is None
+        or training_profile is None
+        or runtime_evidence_record is None
+        or len(result_artifacts) != 1
+    ):
         raise WorkerAuthorizationError("evaluation probe training checkpoint origin is incomplete")
     source.validate_training_probe_origin(
         training_probe,
@@ -586,6 +597,8 @@ async def _load_verified_evaluation_probe_checkpoint(
         training_profile,
         measurement,
         metadata,
+        runtime_evidence_record,
+        result_artifacts[0],
     )
     if actual_identity.as_dict() != source.checkpoint_identity:
         raise WorkerAuthorizationError("evaluation probe checkpoint identity differs from its DB origin")
@@ -706,13 +719,16 @@ async def _recover_committed_result(
     await validate_current_worker_claim(queue, claim, object_store=objects)
 
     if claim.phase == "probe":
-        result_payload = objects.read_source(
-            object_key=verified.object_key,
-            sha256_digest=verified.sha256,
-            size_bytes=verified.size_bytes,
-        )
+        result_payload = None
         evaluation_probe_source = None
         if claim.target_phase == "evaluation":
+            if verified.object_key is None:
+                raise WorkerAuthorizationError("evaluation probe result has no immutable S3 object key")
+            result_payload = objects.read_source(
+                object_key=verified.object_key,
+                sha256_digest=verified.sha256,
+                size_bytes=verified.size_bytes,
+            )
             try:
                 evaluation_probe_source = ProbeInput.from_dict(job.get("source_refs")).evaluation_checkpoint_source
             except (TypeError, ValueError) as error:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import importlib
+import json
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
@@ -164,6 +165,7 @@ def _evaluation_probe_origin(source):
         "profile_state": "measured",
     }
     measurement = {
+        "measurement_id": "0be230aa-c85b-4fa5-9d7a-9f2de81d8b1e",
         "result_state": "succeeded",
         "target_phase": "training",
         "model_kind": source.model_kind,
@@ -173,6 +175,7 @@ def _evaluation_probe_origin(source):
         "checkpoint_resumed": True,
         "checkpoint_sha256": source.checkpoint_sha256,
         "exit_code": 0,
+        "measured_at": "2026-10-06T00:00:00+00:00",
         "verification_details": {
             "passed": True,
             "learning_signal_verified": True,
@@ -205,6 +208,121 @@ def _evaluation_probe_origin(source):
         runtime_evidence,
         content_sha256(canonical_json(runtime_evidence)),
     )
+
+
+def _probe_result_artifact(source):
+    return {
+        "kind": "model",
+        "uri": f"s3://gods-task8-test/jobs/{source.training_probe_job_id}/results/model.artifact",
+        "sha256": "c" * 64,
+        "size_bytes": 2048,
+        "identity": source.checkpoint_identity,
+        "object_key": f"jobs/{source.training_probe_job_id}/results/model.artifact",
+    }
+
+
+def _probe_runtime_evidence_record(source):
+    _job, _probe, _training, measurement, _commit, evidence, evidence_sha = _evaluation_probe_origin(source)
+    artifact = _probe_result_artifact(source)
+    return {
+        "schema": "gods-mlops-probe-runtime-evidence-v1",
+        "evidence_sha256": evidence_sha,
+        "evidence_canonical_sha256": hashlib.sha256(canonical_json(evidence)).hexdigest(),
+        "evidence_projection_sha256": hashlib.sha256(canonical_json(evidence)).hexdigest(),
+        "evidence": evidence,
+        "job_id": source.training_probe_job_id,
+        "measurement_id": measurement["measurement_id"],
+        "checkpoint_sha256": source.checkpoint_sha256,
+        "checkpoint_identity": source.checkpoint_identity,
+        "result_artifact": {
+            key: artifact[key]
+            for key in ("kind", "uri", "sha256", "size_bytes", "identity", "object_key")
+        },
+    }
+
+
+def _evaluation_probe_queue_case(source=None):
+    from gods_mlops.jobs.queue import _enqueue_dedupe_key
+
+    source = source or _evaluation_probe_checkpoint_source()
+    probe_input = ProbeInput(
+        probe_input_id="task9-detr-evaluation-probe-" + source.checkpoint_sha256,
+        model_kind=source.model_kind,
+        target_phase="evaluation",
+        config_version="task9-detr-person-coco-evaluation-probe-v1",
+        manifest_object_key="probe-inputs/task9-evaluation/manifest.json",
+        input_sha256="e" * 64,
+        object_size_bytes=512,
+        evaluation_checkpoint_source=source,
+    )
+    job = {
+        "job_id": "e4d82c26-8f0a-4f45-8b88-5fe84302d948",
+        "phase": "probe",
+        "target_phase": "evaluation",
+        "input_kind": "probe_input",
+        "input_id": probe_input.probe_input_id,
+        "input_sha256": probe_input.input_sha256,
+        "dataset_version": None,
+        "model_kind": source.model_kind,
+        "config_version": probe_input.config_version,
+        "config_sha256": "f" * 64,
+        "rerun": False,
+        "dedupe_key": None,
+        "source_refs": probe_input.as_dict(),
+    }
+    identity = {
+        key: job[key]
+        for key in (
+            "phase",
+            "target_phase",
+            "input_kind",
+            "input_id",
+            "input_sha256",
+            "dataset_version",
+            "model_kind",
+            "config_version",
+            "config_sha256",
+        )
+    }
+    job["dedupe_key"] = _enqueue_dedupe_key(
+        identity,
+        {"evaluation_checkpoint_source": source.as_dict()},
+    )
+    prior_job, probe_profile, training_profile, measurement, commit, _evidence, _evidence_sha = (
+        _evaluation_probe_origin(source)
+    )
+    runtime_authority = _probe_runtime_evidence_record(source)
+    result_artifact = _probe_result_artifact(source)
+
+    class Connection:
+        def __init__(self):
+            self.prior_job = prior_job
+            self.probe_profile = probe_profile
+            self.training_profile = training_profile
+            self.measurement = measurement
+            self.commit = commit
+            self.runtime_authority_rows = [{"details": runtime_authority}]
+            self.result_artifact_rows = [{"details": result_artifact}]
+
+        async def fetchrow(self, query, *_args):
+            if "FROM gods_mlops_jobs" in query:
+                return self.prior_job
+            if "FROM gods_mlops_resource_profiles" in query:
+                return self.probe_profile if "phase='probe'" in query else self.training_profile
+            if "FROM gods_mlops_profile_measurements" in query:
+                return self.measurement
+            if "checkpoint_committed" in query:
+                return {"details": self.commit}
+            raise AssertionError("unexpected query in probe-source fence")
+
+        async def fetch(self, query, *_args):
+            if "probe_runtime_evidence_committed" in query:
+                return self.runtime_authority_rows
+            if "result_artifact_committed" in query:
+                return self.result_artifact_rows
+            raise AssertionError("unexpected query in probe-source fence")
+
+    return source, probe_input, job, identity, prior_job, Connection()
 
 
 class EvaluationCheckpointSourceTests(unittest.TestCase):
@@ -314,25 +432,48 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
     def test_probe_checkpoint_source_accepts_verified_null_dataset_training_probe(self) -> None:
         source = _evaluation_probe_checkpoint_source()
         restored = type(source).from_dict(source.as_dict())
-        origin = _evaluation_probe_origin(source)
+        job, probe_profile, training_profile, measurement, commit, _evidence, _evidence_sha = (
+            _evaluation_probe_origin(source)
+        )
 
         self.assertEqual(restored, source)
         self.assertEqual(restored.as_dict()["schema"], "gods-mlops-evaluation-probe-checkpoint-v1")
         self.assertIsNone(restored.checkpoint_identity["dataset_version"])
-        source.validate_training_probe_origin(*origin)
+        source.validate_training_probe_origin(
+            job,
+            probe_profile,
+            training_profile,
+            measurement,
+            commit,
+            _probe_runtime_evidence_record(source),
+            _probe_result_artifact(source),
+        )
 
     def test_probe_checkpoint_source_rejects_wrong_origin_profile_measurement_or_evidence(self) -> None:
         source = _evaluation_probe_checkpoint_source()
-        origin = _evaluation_probe_origin(source)
-        job, probe_profile, training_profile, measurement, commit, runtime_evidence, evidence_sha256 = origin
+        job, probe_profile, training_profile, measurement, commit, _evidence, _evidence_sha = (
+            _evaluation_probe_origin(source)
+        )
+        authority = _probe_runtime_evidence_record(source)
+        result_artifact = _probe_result_artifact(source)
         invalid_origins = (
-            ({**job, "state": "failed"}, probe_profile, training_profile, measurement, commit, runtime_evidence, evidence_sha256),
-            ({**job, "target_phase": "evaluation"}, probe_profile, training_profile, measurement, commit, runtime_evidence, evidence_sha256),
-            ({**job, "dataset_version": "forged-dataset"}, probe_profile, training_profile, measurement, commit, runtime_evidence, evidence_sha256),
-            (job, probe_profile, {**training_profile, "profile_state": "candidate"}, measurement, commit, runtime_evidence, evidence_sha256),
-            (job, probe_profile, training_profile, {**measurement, "optimizer_steps": 0}, commit, runtime_evidence, evidence_sha256),
-            (job, probe_profile, training_profile, measurement, {**commit, "size_bytes": 1}, runtime_evidence, evidence_sha256),
-            (job, probe_profile, training_profile, measurement, commit, {**runtime_evidence, "docker_image_id": "sha256:" + "c" * 64}, evidence_sha256),
+            ({**job, "state": "failed"}, probe_profile, training_profile, measurement, commit, authority, result_artifact),
+            ({**job, "target_phase": "evaluation"}, probe_profile, training_profile, measurement, commit, authority, result_artifact),
+            ({**job, "dataset_version": "forged-dataset"}, probe_profile, training_profile, measurement, commit, authority, result_artifact),
+            (job, probe_profile, {**training_profile, "profile_state": "candidate"}, measurement, commit, authority, result_artifact),
+            (job, probe_profile, training_profile, {**measurement, "optimizer_steps": 0}, commit, authority, result_artifact),
+            (job, probe_profile, training_profile, measurement, {**commit, "size_bytes": 1}, authority, result_artifact),
+            (
+                job,
+                probe_profile,
+                training_profile,
+                measurement,
+                commit,
+                {**authority, "evidence": {**authority["evidence"], "docker_image_id": "sha256:" + "c" * 64}},
+                result_artifact,
+            ),
+            (job, probe_profile, training_profile, measurement, commit, {**authority, "evidence_sha256": "0" * 64}, result_artifact),
+            (job, probe_profile, training_profile, measurement, commit, {**authority, "result_artifact": {}}, result_artifact),
         )
         for invalid_origin in invalid_origins:
             with self.subTest(invalid_origin=invalid_origin):
@@ -460,12 +601,15 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
             hashlib.sha256(payload).hexdigest(),
             checkpoint_size_bytes=len(payload),
         )
-        job, probe_profile, training_profile, measurement, commit, runtime_evidence, evidence_sha = (
+        job, probe_profile, training_profile, measurement, commit, _runtime_evidence, _evidence_sha = (
             _evaluation_probe_origin(source)
         )
         identity = CheckpointIdentity.from_dict(source.checkpoint_identity)
 
         class Repository:
+            def __init__(self):
+                self.evidence_reads = []
+
             async def get_job(self, _job_id):
                 return job
 
@@ -481,6 +625,13 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
             async def profile_measurement_for_job(self, _job_id):
                 return measurement
 
+            async def probe_runtime_evidence_for_job(self, job_id):
+                self.evidence_reads.append(job_id)
+                return _probe_runtime_evidence_record(source)
+
+            async def result_artifacts_for(self, _job_id):
+                return [_probe_result_artifact(source)]
+
         class Objects:
             def __init__(self):
                 self.reads = []
@@ -492,23 +643,172 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
                 return payload
 
         objects = Objects()
-        with patch(
-            "gods_mlops.training.probe_setup._recorded_training_probe_evidence",
-            return_value=(runtime_evidence, evidence_sha),
-        ):
-            resolved = asyncio.run(
-                load_evaluation_probe_checkpoint_source(
-                    repository=Repository(),
-                    objects=objects,
-                    bucket="gods-task8-test",
-                    training_probe_job_id=source.training_probe_job_id,
-                    model_kind=source.model_kind,
-                )
+        repository = Repository()
+        resolved = asyncio.run(
+            load_evaluation_probe_checkpoint_source(
+                repository=repository,
+                objects=objects,
+                bucket="gods-task8-test",
+                training_probe_job_id=source.training_probe_job_id,
+                model_kind=source.model_kind,
             )
+        )
 
         self.assertEqual(resolved, source)
         self.assertEqual(len(objects.reads), 1)
         self.assertEqual(objects.reads[0][1:], (source.checkpoint_sha256, len(payload)))
+        self.assertEqual(repository.evidence_reads, [source.training_probe_job_id])
+
+    def test_d4d_backfill_rejects_unreviewed_evidence_before_any_repository_write(self) -> None:
+        from tempfile import TemporaryDirectory
+        from pathlib import Path
+
+        from gods_mlops.training import probe_setup
+
+        with TemporaryDirectory() as directory:
+            evidence_path = Path(directory) / "detr-d4d.json"
+            payload = b'{"job_id":"d4d6e1a4-d788-4722-8de8-25b9ccfe87bd"}'
+            evidence_path.write_bytes(payload)
+            with (
+                patch.object(probe_setup, "_D4D_TRAINING_PROBE_EVIDENCE_PATH", evidence_path),
+                patch.object(probe_setup, "_D4D_TRAINING_PROBE_EVIDENCE_SIZE_BYTES", len(payload)),
+                patch.object(probe_setup, "_D4D_TRAINING_PROBE_EVIDENCE_SHA256", "0" * 64),
+            ):
+                with self.assertRaisesRegex(ValueError, "pinned Task 8 record"):
+                    probe_setup._load_reviewed_d4d_runtime_evidence()
+
+    def test_d4d_backfill_verifies_pinned_identity_and_checkpoint_result_bytes_before_registration(self) -> None:
+        import io
+        import tarfile
+        from dataclasses import replace
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from types import SimpleNamespace
+
+        from gods_mlops.jobs.checkpoints import CheckpointIdentity
+        from gods_mlops.training.artifacts import S3ResultArtifactStore
+        from gods_mlops.training import probe_setup
+
+        checkpoint_sha = "f59b1eaef140229b9b1e4239c91550744461cfd81456159a4d383ef2ade28f63"
+        source = _evaluation_probe_checkpoint_source(checkpoint_sha, checkpoint_size_bytes=244_331_513)
+        identity = {
+            **source.checkpoint_identity,
+            "input_sha256": "360eaf37b568049b82504a38980c8ad6a929028a167b640256247ecc639de7d5",
+            "config_sha256": "7aee75e99a4f5b96ffc8c2373048f64dbf6d69ce4bd10949f0b42f12f5eb5a3b",
+        }
+        source = replace(
+            source,
+            checkpoint_identity=identity,
+            worker_image_id="sha256:ae56b05de4393a9fb84fb266b662eb85311d10775110230f79cbfce58c122c28",
+            source_commit="fa092fe485a47932eff1ebcf66f31957ee34ad12",
+        )
+        job, probe_profile, training_profile, measurement, commit, runtime_evidence, _evidence_sha = (
+            _evaluation_probe_origin(source)
+        )
+        result_metrics = {"status": "succeeded", "resource_measurements": {"optimizer_steps": 4}}
+        result_bytes = canonical_json(result_metrics)
+        result_tar = io.BytesIO()
+        with tarfile.open(fileobj=result_tar, mode="w") as archive:
+            info = tarfile.TarInfo("metrics.json")
+            info.size = len(result_bytes)
+            archive.addfile(info, io.BytesIO(result_bytes))
+        result_payload = result_tar.getvalue()
+        result_identity = CheckpointIdentity.from_dict(identity)
+        prepared = S3ResultArtifactStore(objects=object(), bucket="gods-task8-test").prepare(
+            identity=result_identity,
+            kind="model",
+            payload=result_payload,
+            reservation_bytes=len(result_payload) + 1,
+        )
+        artifact = {
+            "kind": prepared.kind,
+            "uri": prepared.uri,
+            "sha256": prepared.sha256,
+            "size_bytes": prepared.size_bytes,
+            "identity": identity,
+            "object_key": prepared.object_key,
+        }
+        evidence = {
+            **runtime_evidence,
+            "image_reference": source.worker_image_id,
+            "docker_image_id": source.worker_image_id,
+            "image_source_commit": source.source_commit,
+            "source_commit": source.source_commit,
+            "result_artifact": artifact,
+            "measurement": measurement,
+            "output": result_metrics,
+        }
+        evidence_payload = json.dumps(evidence, sort_keys=True, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+        with TemporaryDirectory() as directory:
+            evidence_path = Path(directory) / "detr-d4d.json"
+            evidence_path.write_bytes(evidence_payload)
+            job.update({"input_sha256": identity["input_sha256"], "config_sha256": identity["config_sha256"]})
+            measurement.update({"input_sha256": identity["input_sha256"], "config_sha256": identity["config_sha256"]})
+            probe_profile.update({"config_sha256": identity["config_sha256"]})
+            training_profile.update({"config_sha256": identity["config_sha256"]})
+
+            class Repository:
+                registered_payload = None
+
+                async def get_job(self, _job_id):
+                    return job
+
+                async def checkpoint_identity(self, _job_id):
+                    return result_identity
+
+                async def checkpoint_metadata_for(self, _job_id):
+                    return commit
+
+                async def get_profile(self, *, phase, **_kwargs):
+                    return probe_profile if phase == "probe" else training_profile
+
+                async def profile_measurement_for_job(self, _job_id):
+                    return measurement
+
+                async def result_artifacts_for(self, _job_id):
+                    return [artifact]
+
+                async def _record_probe_runtime_evidence(self, payload):
+                    self.registered_payload = payload
+                    return {"evidence_sha256": hashlib.sha256(payload).hexdigest()}
+
+            class Objects:
+                def read_source(self, *, object_key, sha256_digest, size_bytes):
+                    self.last_read = (object_key, sha256_digest, size_bytes)
+                    return result_payload
+
+            objects = Objects()
+            repo = Repository()
+            with (
+                patch.object(probe_setup, "_D4D_TRAINING_PROBE_EVIDENCE_PATH", evidence_path),
+                patch.object(
+                    probe_setup,
+                    "_D4D_TRAINING_PROBE_EVIDENCE_SHA256",
+                    hashlib.sha256(evidence_payload).hexdigest(),
+                ),
+                patch.object(probe_setup, "_D4D_TRAINING_PROBE_EVIDENCE_SIZE_BYTES", len(evidence_payload)),
+                patch(
+                    "gods_mlops.training.checkpoints.S3CheckpointStore.load_uri",
+                    return_value=SimpleNamespace(
+                        identity=result_identity,
+                        sha256=checkpoint_sha,
+                        size_bytes=244_331_513,
+                    ),
+                ) as read_checkpoint,
+            ):
+                record = asyncio.run(
+                    probe_setup.backfill_d4d_probe_runtime_evidence(
+                        repository=repo,
+                        objects=objects,
+                        bucket="gods-task8-test",
+                    )
+                )
+
+        self.assertEqual(repo.registered_payload, evidence_payload)
+        self.assertEqual(record["evidence_sha256"], hashlib.sha256(evidence_payload).hexdigest())
+        self.assertEqual(objects.last_read, (prepared.object_key, prepared.sha256, prepared.size_bytes))
+        self.assertEqual(read_checkpoint.call_args.kwargs["expected_sha256"], checkpoint_sha)
+        self.assertEqual(read_checkpoint.call_args.kwargs["expected_size_bytes"], 244_331_513)
 
     def test_probe_submit_binds_checkpoint_source_into_dedupe_only_for_calibration(self) -> None:
         from gods_mlops.jobs.queue import JobQueue
@@ -633,94 +933,175 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
         )
 
     def test_queue_origin_fence_checks_probe_source_and_checkpoint_commit_before_write(self) -> None:
+        from gods_mlops.jobs.queue import _evaluation_probe_checkpoint_source_error
+
+        _source, _probe_input, job, _identity, _prior_job, connection = _evaluation_probe_queue_case()
+        self.assertIsNone(asyncio.run(_evaluation_probe_checkpoint_source_error(connection, job)))
+        self.assertEqual(
+            asyncio.run(
+                _evaluation_probe_checkpoint_source_error(
+                    connection,
+                    {**job, "dedupe_key": "0" * 64},
+                )
+            ),
+            "evaluation_probe_checkpoint_source_invalid",
+        )
+        connection.measurement = {**connection.measurement, "result_state": "failed"}
+        self.assertEqual(
+            asyncio.run(_evaluation_probe_checkpoint_source_error(connection, job)),
+            "evaluation_probe_checkpoint_source_invalid",
+        )
+        connection.runtime_authority_rows = [
+            _probe_runtime_evidence_record(_source),
+            _probe_runtime_evidence_record(_source),
+        ]
+        self.assertEqual(
+            asyncio.run(_evaluation_probe_checkpoint_source_error(connection, job)),
+            "evaluation_probe_checkpoint_source_invalid",
+        )
+
+    def test_queue_origin_fence_normalizes_postgres_uuid_prior_job_id(self) -> None:
+        from uuid import UUID
+
+        from gods_mlops.jobs.queue import _evaluation_probe_checkpoint_source_error
+
+        source, _probe_input, job, _identity, _prior_job, connection = _evaluation_probe_queue_case()
+
+        class AsyncpgConnection:
+            async def fetchrow(self, query, *args):
+                row = await connection.fetchrow(query, *args)
+                if "FROM gods_mlops_jobs" in query:
+                    return {**row, "job_id": UUID(source.training_probe_job_id)}
+                return row
+
+            async def fetch(self, query, *args):
+                return await connection.fetch(query, *args)
+
+        self.assertIsNone(
+            asyncio.run(_evaluation_probe_checkpoint_source_error(AsyncpgConnection(), job)),
+            "a valid asyncpg UUID must compare equal to the canonical source job ID",
+        )
+
+    def test_queue_origin_fence_rejects_rehashed_caller_image_source_and_evidence(self) -> None:
         from gods_mlops.jobs.queue import _enqueue_dedupe_key, _evaluation_probe_checkpoint_source_error
 
-        source = _evaluation_probe_checkpoint_source()
-        eval_probe_input = ProbeInput(
-            probe_input_id="task9-detr-evaluation-probe-" + source.checkpoint_sha256,
-            model_kind="detr",
-            target_phase="evaluation",
-            config_version="task9-detr-person-coco-evaluation-probe-v1",
-            manifest_object_key="probe-inputs/task9-evaluation/manifest.json",
-            input_sha256="e" * 64,
-            object_size_bytes=512,
-            evaluation_checkpoint_source=source,
+        source, probe_input, job, identity, _prior_job, connection = _evaluation_probe_queue_case()
+        altered_source = replace(
+            source,
+            worker_image_id="sha256:" + "9" * 64,
+            source_commit="8" * 40,
+            runtime_evidence_sha256="7" * 64,
         )
-        eval_probe_job = {
-            "job_id": "e4d82c26-8f0a-4f45-8b88-5fe84302d948",
-            "phase": "probe",
-            "target_phase": "evaluation",
-            "input_kind": "probe_input",
-            "input_id": eval_probe_input.probe_input_id,
-            "input_sha256": eval_probe_input.input_sha256,
-            "dataset_version": None,
-            "model_kind": "detr",
-            "config_version": eval_probe_input.config_version,
-            "config_sha256": "f" * 64,
-            "rerun": False,
-            "dedupe_key": None,
-            "source_refs": eval_probe_input.as_dict(),
+        altered_input = replace(probe_input, evaluation_checkpoint_source=altered_source)
+        altered_job = {
+            **job,
+            "source_refs": altered_input.as_dict(),
+            "dedupe_key": _enqueue_dedupe_key(
+                identity,
+                {"evaluation_checkpoint_source": altered_source.as_dict()},
+            ),
         }
-        stable_identity = {
-            "phase": "probe",
-            "target_phase": "evaluation",
-            "input_kind": "probe_input",
-            "input_id": eval_probe_job["input_id"],
-            "input_sha256": eval_probe_job["input_sha256"],
-            "dataset_version": None,
-            "model_kind": "detr",
-            "config_version": eval_probe_job["config_version"],
-            "config_sha256": eval_probe_job["config_sha256"],
-        }
-        eval_probe_job["dedupe_key"] = _enqueue_dedupe_key(
-            stable_identity,
-            {"evaluation_checkpoint_source": source.as_dict()},
-        )
-        prior_job, probe_profile, training_profile, measurement, commit, _evidence, _evidence_sha = (
-            _evaluation_probe_origin(source)
+
+        self.assertEqual(
+            asyncio.run(_evaluation_probe_checkpoint_source_error(connection, altered_job)),
+            "evaluation_probe_checkpoint_source_invalid",
+            "the durable origin fence must reject provenance substitution after valid dedupe recomputation",
         )
 
+    def test_queue_origin_fence_requires_exactly_one_authority_event(self) -> None:
+        from gods_mlops.jobs.queue import _evaluation_probe_checkpoint_source_error
+
+        _source, _probe_input, job, _identity, _prior_job, connection = _evaluation_probe_queue_case()
+        connection.runtime_authority_rows = []
+        self.assertEqual(
+            asyncio.run(_evaluation_probe_checkpoint_source_error(connection, job)),
+            "evaluation_probe_checkpoint_source_invalid",
+        )
+
+    def test_probe_runtime_evidence_registration_is_idempotent_and_rejects_divergent_replay(self) -> None:
+        from gods_mlops.jobs.checkpoints import CheckpointIdentityError
+        from gods_mlops.jobs.queue import PostgresJobQueueRepository
+
+        source = _evaluation_probe_checkpoint_source()
+        job, probe_profile, training_profile, measurement, commit, _projection, _sha = _evaluation_probe_origin(source)
+        artifact = _probe_result_artifact(source)
+        evidence = {
+            **_projection,
+            "image_reference": source.worker_image_id,
+            "container_id": "a" * 64,
+            "measurement": measurement,
+            "result_artifact": artifact,
+            "output": {"resource_measurements": artifact.get("runtime_measurements", {})},
+        }
+        payload = canonical_json(evidence)
+
         class Connection:
+            def __init__(self):
+                self.events = []
+                self.writes = []
+
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
             async def fetchrow(self, query, *_args):
-                if "FROM gods_mlops_jobs" in query:
-                    return prior_job
+                if "SELECT * FROM gods_mlops_jobs" in query:
+                    return job
                 if "FROM gods_mlops_resource_profiles" in query:
                     return probe_profile if "phase='probe'" in query else training_profile
                 if "FROM gods_mlops_profile_measurements" in query:
                     return measurement
                 if "checkpoint_committed" in query:
                     return {"details": commit}
-                raise AssertionError("unexpected query in probe-source fence")
+                return None
+
+            async def fetch(self, query, *args):
+                if "result_artifact_committed" in query:
+                    return [{"details": artifact}]
+                if "event_type=$2" in query and len(args) > 1 and args[1] == "probe_runtime_evidence_committed":
+                    return self.events
+                return []
+
+            async def execute(self, query, *args):
+                self.writes.append(query)
+                if len(args) > 1 and args[1] == "probe_runtime_evidence_committed":
+                    self.events.append({"details": json.loads(args[-1])})
 
         connection = Connection()
-        self.assertIsNone(asyncio.run(_evaluation_probe_checkpoint_source_error(connection, eval_probe_job)))
-        self.assertEqual(
-            asyncio.run(
-                _evaluation_probe_checkpoint_source_error(
-                    connection,
-                    {**eval_probe_job, "dedupe_key": "0" * 64},
-                )
-            ),
-            "evaluation_probe_checkpoint_source_invalid",
-        )
-        bad_measurement = {**measurement, "result_state": "failed"}
 
-        async def fetch_bad_measurement(query, *_args):
-            if "FROM gods_mlops_jobs" in query:
-                return prior_job
-            if "FROM gods_mlops_resource_profiles" in query:
-                return probe_profile if "phase='probe'" in query else training_profile
-            if "FROM gods_mlops_profile_measurements" in query:
-                return bad_measurement
-            return {"details": commit}
+        class Pool:
+            def acquire(self):
+                return connection
 
-        connection.fetchrow = fetch_bad_measurement
-        self.assertEqual(
-            asyncio.run(_evaluation_probe_checkpoint_source_error(connection, eval_probe_job)),
-            "evaluation_probe_checkpoint_source_invalid",
-        )
+        class Repository(PostgresJobQueueRepository):
+            async def ensure_schema(self):
+                return None
 
-    def test_probe_checkpoint_intent_then_origin_change_blocks_s3_commit_and_stale_owner(self) -> None:
+            async def _get_pool(self):
+                return Pool()
+
+        repository = Repository(database_url="postgresql://unused")
+        registered = asyncio.run(repository._record_probe_runtime_evidence(payload))
+        canonical_replay = json.dumps(evidence, sort_keys=True, ensure_ascii=False, indent=4).encode("utf-8")
+        replayed = asyncio.run(repository._record_probe_runtime_evidence(canonical_replay))
+        self.assertEqual(registered, replayed)
+        self.assertEqual(len(connection.events), 1)
+        self.assertEqual(registered["evidence_sha256"], hashlib.sha256(payload).hexdigest())
+
+        divergent = {
+            **evidence,
+            "image_source_commit": "8" * 40,
+            "source_commit": "8" * 40,
+        }
+        with self.assertRaisesRegex(CheckpointIdentityError, "different runtime evidence"):
+            asyncio.run(repository._record_probe_runtime_evidence(canonical_json(divergent)))
+
+    def test_probe_checkpoint_intent_then_runtime_authority_loss_blocks_s3_commit_and_stale_owner(self) -> None:
         from gods_mlops.jobs.checkpoints import CheckpointIdentity, CheckpointIdentityError, StaleCheckpointOwnerError
         from gods_mlops.jobs.queue import PostgresJobQueueRepository
 
@@ -728,6 +1109,8 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
         prior_job, probe_profile, training_profile, measurement, commit, _evidence, _evidence_sha = (
             _evaluation_probe_origin(source)
         )
+        runtime_authority = _probe_runtime_evidence_record(source)
+        result_artifact = _probe_result_artifact(source)
         current_config_sha = "f" * 64
         current_config_version = "task9-detr-person-coco-evaluation-probe-v1"
         probe_input = ProbeInput(
@@ -791,7 +1174,7 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
         )
         lease = {"job_id": job["job_id"], "lease_token": job["lease_token"], "fencing_token": 1}
         reservation = {"job_id": job["job_id"], "reserved_bytes": 4096, "consumed_bytes": 0, "state": "reserved"}
-        changes = {"origin_invalidated": False, "writes": []}
+        changes = {"authority_valid": True, "writes": []}
 
         class Connection:
             def transaction(self):
@@ -813,14 +1196,22 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
                 if "FROM gods_mlops_resource_profiles" in query:
                     return probe_profile if "phase='probe'" in query else training_profile
                 if "FROM gods_mlops_profile_measurements" in query:
-                    return {**measurement, "result_state": "failed"} if changes["origin_invalidated"] else measurement
+                    return measurement
                 if "checkpoint_committed" in query:
                     return {"details": commit}
                 if "FROM gods_mlops_artifact_reservations" in query:
                     return reservation
                 return None
 
-            async def fetch(self, _query, *_args):
+            async def fetch(self, query, *_args):
+                if "event_type IN" in query:
+                    return []
+                if "probe_runtime_evidence_committed" in query:
+                    return [{"details": runtime_authority}] if changes["authority_valid"] else []
+                if "result_artifact_committed" in query:
+                    if "SELECT event_type,details" in query:
+                        return [{"event_type": "result_artifact_committed", "details": result_artifact}]
+                    return [{"details": result_artifact}]
                 return []
 
             async def execute(self, query, *_args):
@@ -858,38 +1249,34 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
         )
         store = SimpleNamespace(_bucket="gods-task8-test", _prefix="jobs", commit=lambda _item: self.fail("stale result reached S3 commit"))
 
-        with patch(
-            "gods_mlops.jobs.queue._evaluation_probe_checkpoint_source_error",
-            new=AsyncMock(side_effect=[None, "evaluation_probe_checkpoint_source_invalid"]),
-        ):
-            operation_id = asyncio.run(
-                repository.begin_artifact_write(
+        operation_id = asyncio.run(
+            repository.begin_artifact_write(
+                job_id=job["job_id"],
+                lease_token=job["lease_token"],
+                identity=identity,
+                prepared=prepared,
+                store=store,
+                operation="result",
+                runtime_measurements={"optimizer_steps": 0},
+            )
+        )
+        self.assertTrue(operation_id)
+        self.assertTrue(any("artifact_write_pending" in write for write in changes["writes"]))
+        changes["authority_valid"] = False
+        with self.assertRaisesRegex(CheckpointIdentityError, "source changed before result commit"):
+            asyncio.run(
+                repository.commit_result_artifact(
                     job_id=job["job_id"],
                     lease_token=job["lease_token"],
                     identity=identity,
                     prepared=prepared,
                     store=store,
-                    operation="result",
+                    source_registry=object(),
+                    operation_id=operation_id,
+                    precharged=True,
                     runtime_measurements={"optimizer_steps": 0},
                 )
             )
-            self.assertTrue(operation_id)
-            self.assertTrue(any("artifact_write_pending" in write for write in changes["writes"]))
-            changes["origin_invalidated"] = True
-            with self.assertRaisesRegex(CheckpointIdentityError, "source changed before result commit"):
-                asyncio.run(
-                    repository.commit_result_artifact(
-                        job_id=job["job_id"],
-                        lease_token=job["lease_token"],
-                        identity=identity,
-                        prepared=prepared,
-                        store=store,
-                        source_registry=object(),
-                        operation_id=operation_id,
-                        precharged=True,
-                        runtime_measurements={"optimizer_steps": 0},
-                    )
-                )
 
         class StaleRepository(Repository):
             async def _lock_job_then_lease(self, _connection, **_kwargs):
@@ -909,6 +1296,91 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
                     runtime_measurements={"optimizer_steps": 0},
                 )
             )
+
+    def test_probe_measurement_fails_closed_without_runtime_authority(self) -> None:
+        from gods_mlops.jobs.queue import PostgresJobQueueRepository
+
+        source, _probe_input, job, _identity, prior_job, _connection = _evaluation_probe_queue_case()
+        job = {
+            **job,
+            "state": "running",
+            "lease_token": "8ad96890-3434-4f07-85bb-8cde17a2b009",
+        }
+        lease = {"job_id": job["job_id"], "lease_token": job["lease_token"], "fencing_token": 1}
+        probe_profile = {
+            "phase": "probe",
+            "target_phase": "evaluation",
+            "model_kind": source.model_kind,
+            "config_version": job["config_version"],
+            "profile_state": "candidate",
+            "memory_requirement_mib": 36_000,
+        }
+        _job, training_probe_profile, training_profile, training_measurement, commit, _evidence, _sha = (
+            _evaluation_probe_origin(source)
+        )
+        changes = []
+
+        class Connection:
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def fetchrow(self, query, *_args):
+                if "SELECT * FROM gods_mlops_resource_profiles" in query:
+                    return probe_profile
+                if "FROM gods_mlops_jobs" in query:
+                    return prior_job
+                if "FROM gods_mlops_resource_profiles" in query:
+                    return training_probe_profile if "phase='probe'" in query else training_profile
+                if "FROM gods_mlops_profile_measurements" in query:
+                    return training_measurement
+                if "checkpoint_committed" in query:
+                    return {"details": commit}
+                return None
+
+            async def fetch(self, _query, *_args):
+                return []
+
+            async def execute(self, query, *_args):
+                changes.append(query)
+
+        connection = Connection()
+
+        class Pool:
+            def acquire(self):
+                return connection
+
+        class Repository(PostgresJobQueueRepository):
+            async def ensure_schema(self):
+                return None
+
+            async def _get_pool(self):
+                return Pool()
+
+            async def _lock_job_then_lease(self, _connection, **_kwargs):
+                return job, lease
+
+        with self.assertRaisesRegex(ValueError, "checkpoint source changed before measurement commit"):
+            asyncio.run(
+                Repository(database_url="postgresql://unused").record_probe_measurement(
+                    job_id=job["job_id"],
+                    lease_token=job["lease_token"],
+                    exit_code=0,
+                    peak_allocated_mib=100,
+                    peak_reserved_mib=100,
+                    optimizer_steps=0,
+                    checkpoint_resumed=False,
+                    checkpoint_sha256=None,
+                    inference_steps=1,
+                    verification_details={"passed": True},
+                )
+            )
+        self.assertEqual(changes, [])
 
     def test_evaluation_profile_probe_and_clip_fixture_can_name_evaluation_phase(self) -> None:
         profile = ExecutionProfile(

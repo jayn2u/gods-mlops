@@ -499,6 +499,202 @@ class EvaluationWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(WorkerAuthorizationError, "training_probe_checkpoint_commit_changed"):
             asyncio.run(validate_current_worker_claim(Queue(), claim, object_store=Objects()))
 
+    def test_worker_checkpoint_reload_rejects_missing_persisted_runtime_authority(self) -> None:
+        from gods_mlops.training.worker import _load_verified_evaluation_probe_checkpoint
+
+        source = _evaluation_probe_source()
+        identity = CheckpointIdentity.from_dict(source.checkpoint_identity)
+        job = {
+            "job_id": source.training_probe_job_id,
+            "state": "completed",
+            "phase": "probe",
+            "target_phase": "training",
+            "input_kind": "probe_input",
+            "input_id": identity.input_id,
+            "input_sha256": identity.input_sha256,
+            "dataset_version": None,
+            "model_kind": source.model_kind,
+            "config_version": identity.config_version,
+            "config_sha256": identity.config_sha256,
+            "checkpoint_uri": source.checkpoint_uri,
+            "checkpoint_sha256": source.checkpoint_sha256,
+            "checkpoint_identity": source.checkpoint_identity,
+        }
+        metadata = {
+            "uri": source.checkpoint_uri,
+            "sha256": source.checkpoint_sha256,
+            "size_bytes": source.checkpoint_size_bytes,
+            "identity": source.checkpoint_identity,
+        }
+
+        class Repository:
+            async def checkpoint_identity(self, _job_id):
+                return identity
+
+            async def checkpoint_metadata_for(self, _job_id):
+                return metadata
+
+            async def get_profile(self, *, phase, **_kwargs):
+                return {"phase": phase}
+
+            async def profile_measurement_for_job(self, _job_id):
+                return {"result_state": "succeeded"}
+
+            async def probe_runtime_evidence_for_job(self, _job_id):
+                return None
+
+            async def result_artifacts_for(self, _job_id):
+                return []
+
+        class Queue:
+            repository = Repository()
+
+            async def get(self, _job_id):
+                return job
+
+        class Store:
+            loaded = False
+
+            def load_uri(self, *_args, **_kwargs):
+                self.loaded = True
+                raise AssertionError("missing runtime authority must fail before checkpoint S3 load")
+
+        store = Store()
+        with self.assertRaisesRegex(WorkerAuthorizationError, "origin is incomplete"):
+            asyncio.run(_load_verified_evaluation_probe_checkpoint(Queue(), store, source))
+        self.assertFalse(store.loaded)
+
+    def test_worker_checkpoint_reload_uses_authoritative_image_source_record(self) -> None:
+        from dataclasses import replace
+
+        from gods_mlops.datasets.manifest import canonical_json
+        from gods_mlops.training.worker import _load_verified_evaluation_probe_checkpoint
+
+        source = _evaluation_probe_source()
+        identity = CheckpointIdentity.from_dict(source.checkpoint_identity)
+        evidence = {
+            "event": "task8_real_model_probe_complete",
+            "job_id": source.training_probe_job_id,
+            "model_kind": source.model_kind,
+            "target_phase": "training",
+            "config_version": identity.config_version,
+            "input_sha256": identity.input_sha256,
+            "docker_image_id": source.worker_image_id,
+            "image_source_commit": source.source_commit,
+            "source_commit": source.source_commit,
+        }
+        evidence_sha256 = hashlib.sha256(canonical_json(evidence)).hexdigest()
+        source = replace(source, runtime_evidence_sha256=evidence_sha256)
+        result_artifact = {
+            "kind": "model",
+            "uri": f"s3://gods-task8-test/jobs/{source.training_probe_job_id}/results/model.artifact",
+            "sha256": "c" * 64,
+            "size_bytes": 2048,
+            "identity": source.checkpoint_identity,
+            "object_key": f"jobs/{source.training_probe_job_id}/results/model.artifact",
+        }
+        authority = {
+            "schema": "gods-mlops-probe-runtime-evidence-v1",
+            "evidence_sha256": evidence_sha256,
+            "evidence_canonical_sha256": evidence_sha256,
+            "evidence_projection_sha256": evidence_sha256,
+            "evidence": evidence,
+            "job_id": source.training_probe_job_id,
+            "measurement_id": "0be230aa-c85b-4fa5-9d7a-9f2de81d8b1e",
+            "checkpoint_sha256": source.checkpoint_sha256,
+            "checkpoint_identity": source.checkpoint_identity,
+            "result_artifact": result_artifact,
+        }
+        job = {
+            "job_id": source.training_probe_job_id,
+            "state": "completed",
+            "phase": "probe",
+            "target_phase": "training",
+            "profile_state_snapshot": "candidate",
+            "input_kind": "probe_input",
+            "input_id": identity.input_id,
+            "input_sha256": identity.input_sha256,
+            "dataset_version": None,
+            "model_kind": source.model_kind,
+            "config_version": identity.config_version,
+            "config_sha256": identity.config_sha256,
+            "checkpoint_uri": source.checkpoint_uri,
+            "checkpoint_sha256": source.checkpoint_sha256,
+            "checkpoint_identity": identity.as_dict(),
+        }
+        profile_config = {"model_id": source.model_id, "model_revision": source.model_revision}
+        probe_profile = {
+            "phase": "probe", "target_phase": "training", "model_kind": source.model_kind,
+            "config_version": identity.config_version, "config_sha256": identity.config_sha256,
+            "profile_state": "candidate", "config_json": profile_config,
+        }
+        training_profile = {
+            **probe_profile, "phase": "training", "target_phase": None, "profile_state": "measured",
+        }
+        measurement = {
+            "measurement_id": authority["measurement_id"],
+            "result_state": "succeeded",
+            "target_phase": "training",
+            "model_kind": source.model_kind,
+            "input_sha256": identity.input_sha256,
+            "config_sha256": identity.config_sha256,
+            "optimizer_steps": 4,
+            "checkpoint_resumed": True,
+            "checkpoint_sha256": source.checkpoint_sha256,
+            "exit_code": 0,
+            "verification_details": {
+                "passed": True,
+                "learning_signal_verified": True,
+                "checkpoint_resume_verified": True,
+            },
+        }
+        checkpoint_commit = {
+            "uri": source.checkpoint_uri,
+            "sha256": source.checkpoint_sha256,
+            "size_bytes": source.checkpoint_size_bytes,
+            "identity": identity.as_dict(),
+        }
+
+        class Repository:
+            async def checkpoint_identity(self, _job_id):
+                return identity
+
+            async def checkpoint_metadata_for(self, _job_id):
+                return checkpoint_commit
+
+            async def get_profile(self, *, phase, **_kwargs):
+                return probe_profile if phase == "probe" else training_profile
+
+            async def profile_measurement_for_job(self, _job_id):
+                return measurement
+
+            async def probe_runtime_evidence_for_job(self, _job_id):
+                return authority
+
+            async def result_artifacts_for(self, _job_id):
+                return [result_artifact]
+
+        class Queue:
+            repository = Repository()
+
+            async def get(self, _job_id):
+                return job
+
+        class Store:
+            def load_uri(self, uri, *, expected_identity, expected_sha256, expected_size_bytes):
+                self.request = (uri, expected_identity, expected_sha256, expected_size_bytes)
+                return SimpleNamespace(
+                    identity=expected_identity,
+                    sha256=expected_sha256,
+                    size_bytes=expected_size_bytes,
+                    payload=b"verified checkpoint",
+                )
+
+        store = Store()
+        verified = asyncio.run(_load_verified_evaluation_probe_checkpoint(Queue(), store, source))
+        self.assertEqual(verified.sha256, source.checkpoint_sha256)
+        self.assertEqual(store.request[1:], (identity, source.checkpoint_sha256, source.checkpoint_size_bytes))
+
     def test_evaluation_probe_weight_loader_applies_only_verified_model_state(self) -> None:
         from gods_mlops.training.worker import apply_verified_evaluation_probe_checkpoint_weights
 

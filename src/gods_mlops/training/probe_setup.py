@@ -282,7 +282,7 @@ async def load_evaluation_probe_checkpoint_source(
     training_probe_job_id: str | None,
     model_kind: str,
 ) -> EvaluationProbeCheckpointSource:
-    """Build the probe-only source from a completed Task 8 probe and its recorded evidence."""
+    """Build the probe-only source from a completed probe and its durable authority event."""
     from .checkpoints import S3CheckpointStore
 
     if not training_probe_job_id:
@@ -302,12 +302,22 @@ async def load_evaluation_probe_checkpoint_source(
             config_version=str(job.get("config_version", "")),
         )
         measurement = await repository.profile_measurement_for_job(training_probe_job_id)
-        runtime_evidence, evidence_sha256 = _recorded_training_probe_evidence(
-            training_probe_job_id, model_kind
-        )
+        runtime_evidence_record = await repository.probe_runtime_evidence_for_job(training_probe_job_id)
+        result_artifacts = await repository.result_artifacts_for(training_probe_job_id)
         model = locked_model(model_kind)
-        if checkpoint_commit is None:
-            raise ValueError("training-target probe has no current DB checkpoint commit marker")
+        if (
+            checkpoint_commit is None
+            or measurement is None
+            or probe_profile is None
+            or training_profile is None
+            or runtime_evidence_record is None
+            or len(result_artifacts) != 1
+        ):
+            raise ValueError("training-target probe has no complete durable runtime authority")
+        runtime_evidence = runtime_evidence_record.get("evidence")
+        evidence_sha256 = runtime_evidence_record.get("evidence_sha256")
+        if not isinstance(runtime_evidence, dict) or not isinstance(evidence_sha256, str):
+            raise ValueError("training-target probe runtime authority is malformed")
         source = EvaluationProbeCheckpointSource(
             training_probe_job_id=training_probe_job_id,
             model_kind=model_kind,
@@ -327,8 +337,8 @@ async def load_evaluation_probe_checkpoint_source(
             training_profile,
             measurement,
             checkpoint_commit,
-            runtime_evidence,
-            evidence_sha256,
+            runtime_evidence_record,
+            result_artifacts[0],
         )
         checkpoint_store = S3CheckpointStore(objects=objects, bucket=bucket)
         verified = await asyncio.to_thread(
@@ -345,17 +355,162 @@ async def load_evaluation_probe_checkpoint_source(
         raise ValueError("training-target probe checkpoint provenance could not be verified") from error
 
 
-def _recorded_training_probe_evidence(job_id: str, model_kind: str) -> tuple[dict[str, Any], str]:
-    root = Path(__file__).resolve().parents[3]
-    output_root = root / "output"
-    matches = sorted(output_root.rglob(f"{model_kind}-{job_id}.json")) if output_root.is_dir() else []
-    if len(matches) != 1:
-        raise ValueError("training-probe runtime evidence is missing or ambiguous")
-    payload = matches[0].read_bytes()
-    value = json.loads(payload)
-    if not isinstance(value, dict):
-        raise ValueError("training-probe runtime evidence is not an object")
-    return value, sha256(payload).hexdigest()
+_D4D_TRAINING_PROBE_JOB_ID = "d4d6e1a4-d788-4722-8de8-25b9ccfe87bd"
+_D4D_TRAINING_PROBE_EVIDENCE_SHA256 = "63380c621e1ae370cc77127948d3ee1e7b4f049113a1e163fe592f79b7d13c72"
+_D4D_TRAINING_PROBE_EVIDENCE_SIZE_BYTES = 4612
+_D4D_TRAINING_PROBE_EVIDENCE_IDENTITY = {
+    "event": "task8_real_model_probe_complete",
+    "job_id": _D4D_TRAINING_PROBE_JOB_ID,
+    "model_kind": "detr",
+    "target_phase": "training",
+    "config_version": "task8-detr-640-microbatch1-probe-v1",
+    "input_sha256": "360eaf37b568049b82504a38980c8ad6a929028a167b640256247ecc639de7d5",
+    "docker_image_id": "sha256:ae56b05de4393a9fb84fb266b662eb85311d10775110230f79cbfce58c122c28",
+    "image_source_commit": "fa092fe485a47932eff1ebcf66f31957ee34ad12",
+    "source_commit": "fa092fe485a47932eff1ebcf66f31957ee34ad12",
+}
+_D4D_TRAINING_PROBE_EVIDENCE_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "output"
+    / "task8-real-model-probes-fa092fe"
+    / f"detr-{_D4D_TRAINING_PROBE_JOB_ID}.json"
+)
+
+
+def _load_reviewed_d4d_runtime_evidence() -> tuple[bytes, dict[str, Any]]:
+    payload = _D4D_TRAINING_PROBE_EVIDENCE_PATH.read_bytes()
+    if (
+        len(payload) != _D4D_TRAINING_PROBE_EVIDENCE_SIZE_BYTES
+        or sha256(payload).hexdigest() != _D4D_TRAINING_PROBE_EVIDENCE_SHA256
+    ):
+        raise ValueError("reviewed d4d runtime evidence bytes differ from the pinned Task 8 record")
+    evidence = json.loads(payload)
+    if not isinstance(evidence, dict) or any(
+        evidence.get(key) != value for key, value in _D4D_TRAINING_PROBE_EVIDENCE_IDENTITY.items()
+    ):
+        raise ValueError("pinned d4d evidence identity differs from the completed Task 8 probe")
+    return payload, evidence
+
+
+async def backfill_d4d_probe_runtime_evidence(*, repository: Any, objects: Any, bucket: str) -> dict[str, Any]:
+    """Explicitly bind the reviewed d4d Task 8 evidence to its immutable DB job event."""
+    import tarfile
+    from io import BytesIO
+
+    from gods_mlops.jobs.queue import (
+        _probe_runtime_evidence_authority,
+        _probe_runtime_evidence_projection,
+        _require_runtime_evidence_matches_committed_rows,
+    )
+    from .artifacts import S3ResultArtifactStore
+
+    payload, evidence = _load_reviewed_d4d_runtime_evidence()
+
+    job = await repository.get_job(_D4D_TRAINING_PROBE_JOB_ID)
+    identity = await repository.checkpoint_identity(_D4D_TRAINING_PROBE_JOB_ID)
+    checkpoint_commit = await repository.checkpoint_metadata_for(_D4D_TRAINING_PROBE_JOB_ID)
+    probe_profile = await repository.get_profile(
+        phase="probe",
+        model_kind="detr",
+        config_version=_D4D_TRAINING_PROBE_EVIDENCE_IDENTITY["config_version"],
+    )
+    training_profile = await repository.get_profile(
+        phase="training",
+        model_kind="detr",
+        config_version=_D4D_TRAINING_PROBE_EVIDENCE_IDENTITY["config_version"],
+    )
+    measurement = await repository.profile_measurement_for_job(_D4D_TRAINING_PROBE_JOB_ID)
+    result_artifacts = await repository.result_artifacts_for(_D4D_TRAINING_PROBE_JOB_ID)
+    if (
+        checkpoint_commit is None
+        or probe_profile is None
+        or training_profile is None
+        or measurement is None
+        or len(result_artifacts) != 1
+    ):
+        raise ValueError("pinned d4d DB origin or committed result artifact is incomplete")
+    if (
+        job.get("job_id") != _D4D_TRAINING_PROBE_JOB_ID
+        or job.get("model_kind") != "detr"
+        or job.get("target_phase") != "training"
+        or job.get("input_id") != "task8-detr-synthetic-probe-v1"
+        or job.get("config_version") != _D4D_TRAINING_PROBE_EVIDENCE_IDENTITY["config_version"]
+        or str(job.get("input_sha256", "")).strip() != _D4D_TRAINING_PROBE_EVIDENCE_IDENTITY["input_sha256"]
+        or str(job.get("config_sha256", "")).strip()
+        != "7aee75e99a4f5b96ffc8c2373048f64dbf6d69ce4bd10949f0b42f12f5eb5a3b"
+        or identity.as_dict().get("job_id") != _D4D_TRAINING_PROBE_JOB_ID
+    ):
+        raise ValueError("pinned d4d job/config/input identity differs from the Task 8 record")
+    result_artifact = result_artifacts[0]
+    result_store = S3ResultArtifactStore(objects=objects, bucket=bucket)
+    verified_result = result_store.verify_committed(result_artifact, expected_identity=identity)
+    result_payload = objects.read_source(
+        object_key=verified_result.object_key,
+        sha256_digest=verified_result.sha256,
+        size_bytes=verified_result.size_bytes,
+    )
+    if len(result_payload) != verified_result.size_bytes or sha256(result_payload).hexdigest() != verified_result.sha256:
+        raise ValueError("pinned d4d result artifact failed S3 readback verification")
+    with tarfile.open(fileobj=BytesIO(result_payload), mode="r:") as archive:
+        metrics_file = archive.extractfile("metrics.json")
+        if metrics_file is None or json.load(metrics_file) != evidence.get("output"):
+            raise ValueError("pinned d4d result metrics differ from the reviewed runtime evidence")
+    _require_runtime_evidence_matches_committed_rows(
+        payload,
+        measurement=measurement,
+        result_artifact=result_artifact,
+    )
+
+    model = locked_model("detr")
+    source = EvaluationProbeCheckpointSource(
+        training_probe_job_id=_D4D_TRAINING_PROBE_JOB_ID,
+        model_kind="detr",
+        model_id=model.model_id,
+        model_revision=model.revision,
+        checkpoint_uri=str(checkpoint_commit["uri"]),
+        checkpoint_sha256=str(checkpoint_commit["sha256"]).strip(),
+        checkpoint_size_bytes=int(checkpoint_commit["size_bytes"]),
+        checkpoint_identity=identity.as_dict(),
+        worker_image_id=_D4D_TRAINING_PROBE_EVIDENCE_IDENTITY["docker_image_id"],
+        source_commit=_D4D_TRAINING_PROBE_EVIDENCE_IDENTITY["source_commit"],
+        runtime_evidence_sha256=_D4D_TRAINING_PROBE_EVIDENCE_SHA256,
+    )
+    from .checkpoints import S3CheckpointStore
+
+    checkpoint_store = S3CheckpointStore(objects=objects, bucket=bucket)
+    verified_checkpoint = await asyncio.to_thread(
+        checkpoint_store.load_uri,
+        source.checkpoint_uri,
+        expected_identity=identity,
+        expected_sha256=source.checkpoint_sha256,
+        expected_size_bytes=source.checkpoint_size_bytes,
+    )
+    if (
+        verified_checkpoint.identity.as_dict() != source.checkpoint_identity
+        or verified_checkpoint.sha256 != source.checkpoint_sha256
+        or verified_checkpoint.size_bytes != source.checkpoint_size_bytes
+    ):
+        raise ValueError("pinned d4d checkpoint S3 bytes differ from its DB commit marker")
+    projection, evidence_sha256, evidence_canonical_sha256 = _probe_runtime_evidence_projection(payload)
+    authority = _probe_runtime_evidence_authority(
+        projection,
+        evidence_sha256,
+        evidence_canonical_sha256,
+        job=job,
+        measurement=measurement,
+        checkpoint_commit=checkpoint_commit,
+        result_artifact=result_artifact,
+    )
+    source.validate_training_probe_origin(
+        job,
+        probe_profile,
+        training_profile,
+        measurement,
+        checkpoint_commit,
+        authority,
+        result_artifact,
+    )
+    return await repository._record_probe_runtime_evidence(payload)
 
 
 def _probe_media(model_kind: str) -> dict[str, bytes]:

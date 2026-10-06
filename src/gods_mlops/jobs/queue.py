@@ -23,6 +23,19 @@ from .models import (
 from .sources import DatasetSourceRegistry, DatasetSourceUnavailableError
 
 COMMUNICATION_RETRY_DELAYS_SECONDS = (10, 30, 90)
+_PROBE_RUNTIME_EVIDENCE_EVENT = "probe_runtime_evidence_committed"
+_PROBE_RUNTIME_EVIDENCE_SCHEMA = "gods-mlops-probe-runtime-evidence-v1"
+_PROBE_RUNTIME_EVIDENCE_FIELDS = (
+    "event",
+    "job_id",
+    "model_kind",
+    "target_phase",
+    "config_version",
+    "input_sha256",
+    "docker_image_id",
+    "image_source_commit",
+    "source_commit",
+)
 
 
 class DatasetNotReadyForTrainingError(ValueError):
@@ -2503,6 +2516,177 @@ class PostgresJobQueueRepository:
         result["measured_at"] = result["measured_at"].isoformat()
         return result
 
+    async def probe_runtime_evidence_for_job(self, job_id: str) -> dict[str, Any] | None:
+        """Read the unique immutable runtime provenance event for a completed training probe."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT details FROM gods_mlops_job_events
+                   WHERE job_id=$1::uuid AND event_type=$2 ORDER BY event_id""",
+                job_id,
+                _PROBE_RUNTIME_EVIDENCE_EVENT,
+            )
+        if len(rows) != 1:
+            return None
+        details = _json_value(rows[0]["details"])
+        if (
+            not isinstance(details, dict)
+            or details.get("schema") != _PROBE_RUNTIME_EVIDENCE_SCHEMA
+            or details.get("job_id") != str(job_id)
+        ):
+            return None
+        return details
+
+    async def _record_probe_runtime_evidence(self, evidence_payload: bytes) -> dict[str, Any]:
+        """Persist evidence produced by the trusted Docker probe controller, once per origin."""
+        from gods_mlops.jobs.checkpoints import CheckpointIdentityError
+        from gods_mlops.jobs.models import EvaluationProbeCheckpointSource
+
+        evidence, evidence_sha256, evidence_canonical_sha256 = _probe_runtime_evidence_projection(evidence_payload)
+        job_id = evidence["job_id"]
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                prior_row = await connection.fetchrow(
+                    "SELECT * FROM gods_mlops_jobs WHERE job_id=$1::uuid FOR UPDATE",
+                    job_id,
+                )
+                if prior_row is None:
+                    raise CheckpointIdentityError("runtime evidence has no completed probe origin")
+                job = _job_dict(prior_row)
+                job["checkpoint_identity"] = _json_value(job.get("checkpoint_identity"))
+                probe_profile_row = await connection.fetchrow(
+                    """SELECT phase,target_phase,model_kind,config_version,config_sha256,
+                              profile_state,config_json
+                       FROM gods_mlops_resource_profiles
+                       WHERE phase='probe' AND model_kind=$1 AND config_version=$2""",
+                    job.get("model_kind"),
+                    job.get("config_version"),
+                )
+                training_profile_row = await connection.fetchrow(
+                    """SELECT phase,target_phase,model_kind,config_version,config_sha256,
+                              profile_state,config_json
+                       FROM gods_mlops_resource_profiles
+                       WHERE phase='training' AND model_kind=$1 AND config_version=$2""",
+                    job.get("model_kind"),
+                    job.get("config_version"),
+                )
+                measurement_row = await connection.fetchrow(
+                    """SELECT measurement_id,input_sha256,config_sha256,model_kind,target_phase,
+                              result_state,peak_allocated_mib,peak_reserved_mib,optimizer_steps,
+                              inference_steps,checkpoint_resumed,verification_details,
+                              checkpoint_sha256,exit_code,measured_at
+                       FROM gods_mlops_profile_measurements WHERE job_id=$1::uuid""",
+                    job_id,
+                )
+                commit_row = await connection.fetchrow(
+                    """SELECT details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type='checkpoint_committed'
+                       ORDER BY event_id DESC LIMIT 1""",
+                    job_id,
+                )
+                result_rows = await connection.fetch(
+                    """SELECT details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type='result_artifact_committed'
+                       ORDER BY event_id""",
+                    job_id,
+                )
+                if any(
+                    item is None
+                    for item in (probe_profile_row, training_profile_row, measurement_row, commit_row)
+                ) or len(result_rows) != 1:
+                    raise CheckpointIdentityError("runtime evidence origin rows are incomplete or ambiguous")
+
+                probe_profile = dict(probe_profile_row)
+                training_profile = dict(training_profile_row)
+                probe_profile["config_json"] = _json_value(probe_profile["config_json"])
+                training_profile["config_json"] = _json_value(training_profile["config_json"])
+                measurement = dict(measurement_row)
+                measurement["measurement_id"] = str(measurement["measurement_id"])
+                measurement["input_sha256"] = measurement["input_sha256"].strip()
+                measurement["config_sha256"] = measurement["config_sha256"].strip()
+                measurement["checkpoint_sha256"] = (
+                    measurement["checkpoint_sha256"].strip() if measurement["checkpoint_sha256"] else None
+                )
+                measurement["verification_details"] = _json_value(measurement["verification_details"])
+                measured_at = measurement["measured_at"]
+                measurement["measured_at"] = (
+                    measured_at.isoformat() if hasattr(measured_at, "isoformat") else str(measured_at)
+                )
+                checkpoint_commit = _json_value(commit_row["details"])
+                result_artifact = _json_value(result_rows[0]["details"])
+
+                profile_config = probe_profile.get("config_json")
+                if not isinstance(profile_config, dict):
+                    raise CheckpointIdentityError("runtime evidence origin has no candidate profile config")
+                try:
+                    source = EvaluationProbeCheckpointSource(
+                        training_probe_job_id=job_id,
+                        model_kind=str(job["model_kind"]),
+                        model_id=str(profile_config["model_id"]),
+                        model_revision=str(profile_config["model_revision"]),
+                        checkpoint_uri=str(checkpoint_commit.get("uri", checkpoint_commit.get("checkpoint_uri"))),
+                        checkpoint_sha256=str(checkpoint_commit["sha256"]).strip(),
+                        checkpoint_size_bytes=int(checkpoint_commit["size_bytes"]),
+                        checkpoint_identity=job["checkpoint_identity"],
+                        worker_image_id=evidence["docker_image_id"],
+                        source_commit=evidence["source_commit"],
+                        runtime_evidence_sha256=evidence_sha256,
+                    )
+                    authority = _probe_runtime_evidence_authority(
+                        evidence,
+                        evidence_sha256,
+                        evidence_canonical_sha256,
+                        job=job,
+                        measurement=measurement,
+                        checkpoint_commit=checkpoint_commit,
+                        result_artifact=result_artifact,
+                    )
+                    _require_runtime_evidence_matches_committed_rows(
+                        evidence_payload,
+                        measurement=measurement,
+                        result_artifact=result_artifact,
+                    )
+                    source.validate_training_probe_origin(
+                        job,
+                        probe_profile,
+                        training_profile,
+                        measurement,
+                        checkpoint_commit,
+                        authority,
+                        result_artifact,
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise CheckpointIdentityError("runtime evidence differs from its terminal probe origin") from error
+
+                existing_rows = await connection.fetch(
+                    """SELECT details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type=$2 ORDER BY event_id""",
+                    job_id,
+                    _PROBE_RUNTIME_EVIDENCE_EVENT,
+                )
+                if existing_rows:
+                    existing = [_json_value(row["details"]) for row in existing_rows]
+                    if len(existing) == 1:
+                        prior = existing[0]
+                        prior_without_exact_bytes = {key: value for key, value in prior.items() if key != "evidence_sha256"}
+                        authority_without_exact_bytes = {
+                            key: value for key, value in authority.items() if key != "evidence_sha256"
+                        }
+                        if prior_without_exact_bytes == authority_without_exact_bytes:
+                            return prior
+                    raise CheckpointIdentityError("probe job already has different runtime evidence")
+                await connection.execute(
+                    """INSERT INTO gods_mlops_job_events(job_id,event_type,state,details)
+                       VALUES($1::uuid,$2,'completed',$3::jsonb)""",
+                    job_id,
+                    _PROBE_RUNTIME_EVIDENCE_EVENT,
+                    _canonical_json(authority),
+                )
+                return authority
+
     async def review_handoffs_for(self, job_id: str) -> list[dict[str, Any]]:
         """Return CPU-published Task 5 assignment links attached after GPU exit."""
         await self.ensure_schema()
@@ -4073,7 +4257,7 @@ async def _evaluation_probe_checkpoint_source_error(
     )
     if prior_row is None:
         return "evaluation_probe_checkpoint_source_invalid"
-    prior_job = dict(prior_row)
+    prior_job = _job_dict(prior_row)
     prior_job["checkpoint_identity"] = _json_value(prior_job.get("checkpoint_identity"))
     probe_profile_row = await connection.fetchrow(
         """SELECT phase,target_phase,model_kind,config_version,config_sha256,
@@ -4092,7 +4276,7 @@ async def _evaluation_probe_checkpoint_source_error(
         source.checkpoint_identity["config_version"],
     )
     measurement_row = await connection.fetchrow(
-        """SELECT result_state,target_phase,model_kind,input_sha256,config_sha256,
+        """SELECT measurement_id,result_state,target_phase,model_kind,input_sha256,config_sha256,
                   optimizer_steps,checkpoint_resumed,checkpoint_sha256,exit_code,
                   verification_details
            FROM gods_mlops_profile_measurements WHERE job_id=$1::uuid""",
@@ -4107,13 +4291,30 @@ async def _evaluation_probe_checkpoint_source_error(
         source.checkpoint_uri,
         source.checkpoint_sha256,
     )
-    if any(item is None for item in (probe_profile_row, training_profile_row, measurement_row, commit_row)):
+    runtime_evidence_rows = await connection.fetch(
+        """SELECT details FROM gods_mlops_job_events
+           WHERE job_id=$1::uuid AND event_type='probe_runtime_evidence_committed'
+           ORDER BY event_id""",
+        source.training_probe_job_id,
+    )
+    result_artifact_rows = await connection.fetch(
+        """SELECT details FROM gods_mlops_job_events
+           WHERE job_id=$1::uuid AND event_type='result_artifact_committed'
+           ORDER BY event_id""",
+        source.training_probe_job_id,
+    )
+    if (
+        any(item is None for item in (probe_profile_row, training_profile_row, measurement_row, commit_row))
+        or len(runtime_evidence_rows) != 1
+        or len(result_artifact_rows) != 1
+    ):
         return "evaluation_probe_checkpoint_source_invalid"
     probe_profile = dict(probe_profile_row)
     training_profile = dict(training_profile_row)
     probe_profile["config_json"] = _json_value(probe_profile["config_json"])
     training_profile["config_json"] = _json_value(training_profile["config_json"])
     measurement = dict(measurement_row)
+    measurement["measurement_id"] = str(measurement["measurement_id"])
     measurement["input_sha256"] = str(measurement["input_sha256"]).strip()
     measurement["config_sha256"] = str(measurement["config_sha256"]).strip()
     measurement["checkpoint_sha256"] = (
@@ -4121,6 +4322,8 @@ async def _evaluation_probe_checkpoint_source_error(
     )
     measurement["verification_details"] = _json_value(measurement["verification_details"])
     checkpoint_commit = _json_value(commit_row["details"])
+    runtime_evidence_record = _json_value(runtime_evidence_rows[0]["details"])
+    result_artifact = _json_value(result_artifact_rows[0]["details"])
     try:
         source.validate_training_probe_origin(
             prior_job,
@@ -4128,6 +4331,8 @@ async def _evaluation_probe_checkpoint_source_error(
             training_profile,
             measurement,
             checkpoint_commit,
+            runtime_evidence_record,
+            result_artifact,
         )
     except (TypeError, ValueError):
         return "evaluation_probe_checkpoint_source_invalid"
@@ -4338,6 +4543,95 @@ def _job_dict(row: asyncpg.Record) -> dict[str, Any]:
     if result.get("dedupe_key") is not None:
         result["dedupe_key"] = result["dedupe_key"].strip()
     return result
+
+
+def _probe_runtime_evidence_projection(payload: bytes) -> tuple[dict[str, str], str, str]:
+    """Hash finalized evidence bytes and extract only the non-secret origin identity."""
+    if not isinstance(payload, bytes) or not payload:
+        raise ValueError("probe runtime evidence payload must contain bytes")
+    try:
+        evidence = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("probe runtime evidence payload is invalid JSON") from error
+    if not isinstance(evidence, dict):
+        raise ValueError("probe runtime evidence payload must be an object")
+    projection = {key: evidence.get(key) for key in _PROBE_RUNTIME_EVIDENCE_FIELDS}
+    if (
+        projection["event"] != "task8_real_model_probe_complete"
+        or projection["target_phase"] != "training"
+        or projection["model_kind"] not in {"detr", "clip"}
+        or not isinstance(projection["job_id"], str)
+        or not projection["job_id"]
+        or not isinstance(projection["config_version"], str)
+        or not projection["config_version"]
+        or not isinstance(projection["input_sha256"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", projection["input_sha256"])
+        or not isinstance(projection["docker_image_id"], str)
+        or not re.fullmatch(r"sha256:[0-9a-f]{64}", projection["docker_image_id"])
+        or not isinstance(projection["source_commit"], str)
+        or not re.fullmatch(r"[0-9a-f]{40,64}", projection["source_commit"])
+        or projection["image_source_commit"] != projection["source_commit"]
+    ):
+        raise ValueError("probe runtime evidence identity is malformed")
+    return projection, sha256(payload).hexdigest(), sha256(_canonical_json(evidence).encode("utf-8")).hexdigest()
+
+
+def _probe_result_artifact_projection(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("probe runtime evidence has no committed result artifact")
+    fields = ("kind", "uri", "sha256", "size_bytes", "identity", "object_key")
+    projected = {key: value.get(key) for key in fields}
+    if (
+        not isinstance(projected["kind"], str)
+        or not isinstance(projected["uri"], str)
+        or not isinstance(projected["sha256"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", projected["sha256"])
+        or type(projected["size_bytes"]) is not int
+        or projected["size_bytes"] <= 0
+        or not isinstance(projected["identity"], dict)
+        or not isinstance(projected["object_key"], str)
+    ):
+        raise ValueError("probe runtime evidence committed result identity is invalid")
+    return projected
+
+
+def _probe_runtime_evidence_authority(
+    evidence: dict[str, str],
+    evidence_sha256: str,
+    evidence_canonical_sha256: str,
+    *,
+    job: dict[str, Any],
+    measurement: dict[str, Any],
+    checkpoint_commit: dict[str, Any],
+    result_artifact: dict[str, Any],
+) -> dict[str, Any]:
+    identity = _json_value(job.get("checkpoint_identity"))
+    checkpoint_sha256 = str(checkpoint_commit.get("sha256", "")).strip()
+    if not isinstance(identity, dict) or not checkpoint_sha256:
+        raise ValueError("probe runtime evidence checkpoint origin is unavailable")
+    return {
+        "schema": _PROBE_RUNTIME_EVIDENCE_SCHEMA,
+        "evidence_sha256": evidence_sha256,
+        "evidence_canonical_sha256": evidence_canonical_sha256,
+        "evidence_projection_sha256": sha256(_canonical_json(evidence).encode("utf-8")).hexdigest(),
+        "evidence": evidence,
+        "job_id": str(job.get("job_id", "")),
+        "measurement_id": str(measurement.get("measurement_id", "")),
+        "checkpoint_sha256": checkpoint_sha256,
+        "checkpoint_identity": identity,
+        "result_artifact": _probe_result_artifact_projection(result_artifact),
+    }
+
+
+def _require_runtime_evidence_matches_committed_rows(
+    payload: bytes,
+    *,
+    measurement: dict[str, Any],
+    result_artifact: dict[str, Any],
+) -> None:
+    value = json.loads(payload)
+    if value.get("measurement") != measurement or value.get("result_artifact") != result_artifact:
+        raise ValueError("finalized runtime evidence differs from durable measurement or result readback")
 
 
 def _observation_state_dict(row: asyncpg.Record) -> dict[str, Any]:
