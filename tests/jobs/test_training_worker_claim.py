@@ -1506,9 +1506,8 @@ def test_terminal_reservation_query_requires_release_evidence_after_a_worker_lea
     task7_database_url: str,
 ) -> None:
     async def exercise() -> None:
-        repository, queue, sources, admission, _version, _sample_id, job_id, now = await _training_run(
-            task7_database_url
-        )
+        repository, queue, sources, admission, job_id, now = await _probe_run(task7_database_url)
+        assert (await queue.get(job_id))["phase"] == "probe"
         base_time = now[0]
         for offset in range(0, 31, 5):
             now[0] = base_time + timedelta(seconds=offset)

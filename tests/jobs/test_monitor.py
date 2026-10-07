@@ -69,7 +69,8 @@ async def _running_probe(database_url: str, *, bind_owner: bool = True):
         model_kind="detr",
         config_version=profile.config_version,
     )
-    now = [BASE_TIME]
+    base_time = await repository.artifact_database_clock()
+    now = [base_time]
 
     class FreshObserver:
         async def observe(self) -> dict:
@@ -86,10 +87,13 @@ async def _running_probe(database_url: str, *, bind_owner: bool = True):
         clock=lambda: now[0],
     )
     for offset in range(0, 31, 5):
-        now[0] = BASE_TIME + timedelta(seconds=offset)
+        now[0] = base_time + timedelta(seconds=offset)
         result = await admission.admit(job_id, _observation(now[0]))
     assert result["state"] == "running"
     lease_token = result["lease_token"]
+    lease = await repository.get_active_lease(GPU_UUID)
+    assert lease is not None and lease["job_id"] == job_id
+    assert lease["expires_at"] > await repository.artifact_database_clock()
     if bind_owner:
         await queue.bind_process(job_id, lease_token, OWNER)
     monitor = GpuJobMonitor(repository=repository, queue=queue, admission=admission)
