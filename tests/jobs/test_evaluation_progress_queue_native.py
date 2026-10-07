@@ -161,6 +161,21 @@ def _safe_identity_error(code: str) -> None:
     pytest.fail(code)
 
 
+def _canonical_json_bytes(value: Any) -> bytes:
+    payload = canonical_json(value)
+    if not isinstance(payload, bytes):
+        raise TypeError("canonical_json must return UTF-8 bytes")
+    return payload
+
+
+def _canonical_json_text(value: Any) -> str:
+    return _canonical_json_bytes(value).decode("utf-8")
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
 def _assert_executed_source_identity() -> None:
     expected_commit = os.environ.get(EXPECTED_COMMIT_ENV, "")
     expected_tree = os.environ.get(EXPECTED_TREE_ENV, "")
@@ -279,9 +294,9 @@ async def _seed_synthetic_training_authority(
         measured_profile.artifact_reservation_bytes,
         measured_profile.checkpoint_reservation_bytes,
         measured_profile.result_reservation_bytes,
-        canonical_json(measured_profile.config),
+        _canonical_json_text(measured_profile.config),
         measurement_id,
-        canonical_json([]),
+        _canonical_json_text([]),
     )
 
     training_input_id = f"task11-native-training-{uuid4().hex}"
@@ -359,7 +374,7 @@ async def _seed_synthetic_training_authority(
         "image_source_commit": source_commit,
         "source_commit": source_commit,
     }
-    evidence_sha256 = hashlib.sha256(canonical_json(evidence).encode("utf-8")).hexdigest()
+    evidence_sha256 = _canonical_json_sha256(evidence)
     runtime_authority = {
         "schema": "gods-mlops-probe-runtime-evidence-v1",
         "evidence_sha256": runtime_evidence_sha256,
@@ -387,7 +402,7 @@ async def _seed_synthetic_training_authority(
         training_job_id,
         training_input.input_sha256,
         probe_profile.config_sha256,
-        canonical_json(verification),
+        _canonical_json_text(verification),
         checkpoint_sha256,
     )
     await connection.execute(
@@ -397,7 +412,7 @@ async def _seed_synthetic_training_authority(
         training_job_id,
         checkpoint_uri,
         checkpoint_sha256,
-        canonical_json(training_identity.as_dict()),
+        _canonical_json_text(training_identity.as_dict()),
     )
     for event_type, details in (
         ("checkpoint_committed", checkpoint_commit),
@@ -410,7 +425,7 @@ async def _seed_synthetic_training_authority(
                ) VALUES ($1::uuid,$2,'completed',1,$3::jsonb)""",
             training_job_id,
             event_type,
-            canonical_json(details),
+            _canonical_json_text(details),
         )
     return source
 
@@ -928,3 +943,12 @@ def test_native_fixture_uses_supported_queue_and_repository_apis() -> None:
     assert not queue_initializer
     assert repository_binding
     assert not invalid_repository_binding
+
+
+def test_canonical_json_bytes_are_text_for_jsonb_and_hashed_without_reencoding() -> None:
+    value = {"city": "서울", "counts": [1, 2]}
+    payload = canonical_json(value)
+
+    assert isinstance(payload, bytes)
+    assert _canonical_json_text(value) == payload.decode("utf-8")
+    assert _canonical_json_sha256(value) == hashlib.sha256(payload).hexdigest()
