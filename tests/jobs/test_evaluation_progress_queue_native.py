@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import json
@@ -572,7 +573,7 @@ def test_native_profile_lock_wait_expiry_rolls_back_progress(request) -> None:
             )
             if marker != expected_marker:
                 _safe_identity_error("native fixture database marker differs from the protected gate")
-            await queue.ensure_schema()
+            await repository.ensure_schema()
             schema_version = await connection.fetchval(
                 "SELECT max(version) FROM gods_mlops_schema_migrations"
             )
@@ -888,3 +889,27 @@ def test_native_diagnostic_wrapper_off_preserves_original_cleanup_exception_sema
 
     assert cleanup_order == ["first"]
     assert request.node.user_properties == []
+
+
+def test_native_schema_initializer_uses_repository_public_api() -> None:
+    tree = ast.parse(TEST_FILE.read_text(encoding="utf-8"))
+    awaited_calls = [
+        node.value.func
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and isinstance(node.value.func.value, ast.Name)
+    ]
+    repository_initializer = any(
+        call.value.id == "repository" and call.attr == "ensure_schema"
+        for call in awaited_calls
+    )
+    queue_initializer = any(
+        call.value.id == "queue" and call.attr == "ensure_schema"
+        for call in awaited_calls
+    )
+    assert callable(getattr(PostgresJobQueueRepository, "ensure_schema", None))
+    assert not hasattr(JobQueue, "ensure_schema")
+    assert repository_initializer
+    assert not queue_initializer
