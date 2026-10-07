@@ -199,16 +199,16 @@ def test_expired_unbound_lease_releases_only_after_a_fresh_complete_idle_window(
         lease = await repository.get_active_lease(GPU_UUID)
         assert lease["lease_token"] == token
         assert lease["owner_pid"] is None
+        lease_expires_at = _lease_expiry_datetime(lease["expires_at"])
 
-        # An unbound lease remains owned before expiration even with idle samples.
-        for offset in (40,):
-            now[0] = BASE_TIME + timedelta(seconds=offset)
-            await monitor.observe(_observation(now[0]))
+        # An unbound lease remains owned five seconds before its actual expiration.
+        now[0] = lease_expires_at - timedelta(seconds=5)
+        await monitor.observe(_observation(now[0]))
         assert (await repository.get_active_lease(GPU_UUID))["lease_token"] == token
 
         # At expiry, a fresh complete idle series is proof that no CUDA allocation remains.
-        for offset in range(45, 76, 5):
-            now[0] = BASE_TIME + timedelta(seconds=offset)
+        for offset in range(0, 31, 5):
+            now[0] = lease_expires_at + timedelta(seconds=offset)
             await monitor.observe(_observation(now[0]))
         assert await repository.get_active_lease(GPU_UUID) is None
         job = await queue.get(job_id)
