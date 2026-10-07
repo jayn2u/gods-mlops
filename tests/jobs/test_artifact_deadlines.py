@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha256
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -18,15 +19,19 @@ from gods_mlops.training.worker_adapter import KubernetesOwnedWorkerAdapter, bui
 class _BlockingObjects:
     def __init__(self) -> None:
         self.writer_started = threading.Event()
+        self.writer_returned = threading.Event()
         self.release_writer = threading.Event()
         self.writer_thread: int | None = None
 
     def write_immutable(self, *, object_key, content, sha256_digest, content_type) -> None:
         self.writer_thread = threading.get_ident()
         self.writer_started.set()
-        if not self.release_writer.wait(timeout=5):
-            raise TimeoutError("test writer was not released")
-        self.object = content
+        try:
+            if not self.release_writer.wait(timeout=5):
+                raise TimeoutError("test writer was not released")
+            self.object = content
+        finally:
+            self.writer_returned.set()
 
     def read_source(self, *, object_key, sha256_digest, size_bytes) -> bytes:
         return self.object
@@ -425,11 +430,60 @@ def test_worker_deadline_resolution_keeps_legacy_bound_and_anchors_explicit_auth
         )
     )
 
-    assert legacy_deadline == 40.0
+    assert legacy_deadline is None
     assert legacy_authority is None
     assert explicit_deadline == 13.0
     assert explicit_authority is authority_record
     assert len(calls) == 1
+
+
+def test_legacy_artifact_bound_starts_fresh_for_late_and_repeated_operations() -> None:
+    from gods_mlops.training.worker import _artifact_operation_deadline
+
+    first = _artifact_operation_deadline(None, monotonic_clock=lambda: 131.0)
+    second = _artifact_operation_deadline(None, monotonic_clock=lambda: 165.0)
+
+    assert first == 161.0
+    assert second == 195.0
+
+
+def test_legacy_artifact_operation_that_exceeds_30_seconds_times_out_per_call(monkeypatch) -> None:
+    from gods_mlops.training.worker import (
+        _artifact_operation_deadline,
+        await_worker_artifact_operation,
+    )
+
+    seen_timeouts = []
+    cancelled = asyncio.Event()
+
+    async def slow_operation():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def fake_wait_for(operation, *, timeout):
+        seen_timeouts.append(timeout)
+        task = asyncio.create_task(operation)
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(asyncio, "wait_for", fake_wait_for)
+
+    with pytest.raises(TimeoutError, match="exceeded its deadline"):
+        asyncio.run(
+            await_worker_artifact_operation(
+                slow_operation(),
+                local_deadline=_artifact_operation_deadline(None, monotonic_clock=lambda: 100.0),
+                monotonic_clock=lambda: 100.0,
+            )
+        )
+
+    assert seen_timeouts == [30.0]
+    assert cancelled.is_set()
 
 
 def test_worker_artifact_callback_rejects_expired_local_deadline_before_scheduling_io() -> None:
@@ -614,6 +668,531 @@ def test_cancelled_result_wait_keeps_writer_tracked_and_cannot_publish_late() ->
     asyncio.run(exercise())
 
 
+def test_cancelled_writer_watcher_never_records_quiescence_before_thread_return() -> None:
+    from gods_mlops.jobs import queue as queue_module
+
+    async def exercise() -> None:
+        identity = CheckpointIdentity(
+            job_id="a0320b59-663c-4cdc-b893-086bb970ea60",
+            input_kind="probe_input",
+            input_id="probe-v1",
+            input_sha256="1" * 64,
+            phase="probe",
+            model_kind="clip",
+            config_version="probe-v1",
+            config_sha256="2" * 64,
+            dataset_version=None,
+        )
+        repository = _Repository(identity)
+        queue = JobQueue(repository=repository, sources=object())
+        objects = _BlockingObjects()
+        store = SimpleNamespace(commit=lambda _prepared: _blocking_write(objects))
+        watchers_before = set(queue_module._ACTIVE_ARTIFACT_WRITER_WATCHERS)
+        writer_task = asyncio.create_task(
+            queue._tracked_s3_artifact_write(
+                job_id=identity.job_id,
+                lease_token="8ad96890-3434-4f07-85bb-8cde17a2b009",
+                operation_id="operation-cancelled-watcher",
+                store=store,
+                prepared=SimpleNamespace(),
+                artifact_deadline=None,
+            )
+        )
+        assert await asyncio.to_thread(objects.writer_started.wait, 1)
+        await asyncio.sleep(0)
+        watchers = queue_module._ACTIVE_ARTIFACT_WRITER_WATCHERS - watchers_before
+        assert len(watchers) == 1
+        next(iter(watchers)).cancel()
+        await asyncio.sleep(0.01)
+        was_active = not objects.writer_returned.is_set()
+        quiescent_before_release = any(event[0] == "quiescent" for event in repository.writer_events)
+        objects.release_writer.set()
+        with pytest.raises(asyncio.CancelledError):
+            await writer_task
+        assert objects.writer_returned.wait(timeout=1)
+
+        assert was_active
+        assert not quiescent_before_release
+        assert not any(event[0] == "quiescent" for event in repository.writer_events)
+
+    asyncio.run(exercise())
+
+
+def test_event_loop_shutdown_cannot_turn_running_writer_into_quiescent() -> None:
+    from gods_mlops.jobs import queue as queue_module
+
+    identity = CheckpointIdentity(
+        job_id="a0320b59-663c-4cdc-b893-086bb970ea60",
+        input_kind="probe_input",
+        input_id="probe-v1",
+        input_sha256="1" * 64,
+        phase="probe",
+        model_kind="clip",
+        config_version="probe-v1",
+        config_sha256="2" * 64,
+        dataset_version=None,
+    )
+    repository = _Repository(identity)
+    queue = JobQueue(repository=repository, sources=object())
+    objects = _BlockingObjects()
+    release_snapshot = {}
+
+    def release_after_shutdown_cancellation() -> None:
+        time.sleep(0.05)
+        release_snapshot["thread_returned"] = objects.writer_returned.is_set()
+        release_snapshot["quiescent"] = any(
+            event[0] == "quiescent" for event in repository.writer_events
+        )
+        objects.release_writer.set()
+
+    async def abandon_pending_writer() -> None:
+        asyncio.create_task(
+            queue._tracked_s3_artifact_write(
+                job_id=identity.job_id,
+                lease_token="8ad96890-3434-4f07-85bb-8cde17a2b009",
+                operation_id="operation-loop-shutdown",
+                store=SimpleNamespace(commit=lambda _prepared: _blocking_write(objects)),
+                prepared=SimpleNamespace(),
+                artifact_deadline=None,
+            )
+        )
+        assert await asyncio.to_thread(objects.writer_started.wait, 1)
+        threading.Thread(target=release_after_shutdown_cancellation).start()
+
+    asyncio.run(abandon_pending_writer())
+
+    assert release_snapshot["thread_returned"] is False
+    assert release_snapshot["quiescent"] is False
+
+
+def test_checkpoint_prune_waits_for_writer_quiescence_before_object_delete() -> None:
+    from gods_mlops.training.checkpoints import S3CheckpointStore
+
+    identity = CheckpointIdentity(
+        job_id="a0320b59-663c-4cdc-b893-086bb970ea60",
+        input_kind="probe_input",
+        input_id="probe-v1",
+        input_sha256="1" * 64,
+        phase="probe",
+        model_kind="clip",
+        config_version="probe-v1",
+        config_sha256="2" * 64,
+        dataset_version=None,
+    )
+
+    class MemoryObjects:
+        def __init__(self):
+            self.objects = {}
+
+        def write_immutable(self, *, object_key, content, sha256_digest, content_type):
+            self.objects[object_key] = content
+
+        def read_source(self, *, object_key, sha256_digest, size_bytes):
+            if object_key not in self.objects:
+                raise FileNotFoundError(object_key)
+            return self.objects[object_key]
+
+        def delete_object(self, *, object_key):
+            self.objects.pop(object_key, None)
+
+    objects = MemoryObjects()
+    store = S3CheckpointStore(objects=objects, bucket="gods-test")
+    prepared = store.prepare(identity=identity, payload=b"checkpoint A", reservation_bytes=1024)
+    verified = store.commit(prepared)
+    previous = {
+        "uri": verified.uri,
+        "sha256": verified.sha256,
+        "size_bytes": verified.size_bytes,
+        "metadata_size_bytes": 0,
+        "identity": identity.as_dict(),
+        "operation_id": "operation-A",
+        "write_lifetime_id": "operation-A",
+    }
+    expected_previous = previous
+
+    class Repository:
+        def __init__(self):
+            self.gate_calls = 0
+            self.completed = []
+
+        async def pending_checkpoint_prunes_for(self, _job_id):
+            return [previous]
+
+        async def checkpoint_prune_writer_gate(self, *, job_id, previous):
+            self.gate_calls += 1
+            assert job_id == identity.job_id
+            assert previous == expected_previous
+            return False
+
+        async def complete_checkpoint_prune(self, *, job_id, previous):
+            self.completed.append(previous)
+            return True
+
+    repository = Repository()
+    queue = JobQueue(repository=repository, sources=object())
+
+    deleted = asyncio.run(queue.retry_pending_checkpoint_prunes(store=store, job_id=identity.job_id))
+
+    assert deleted == []
+    assert repository.gate_calls == 1
+    assert repository.completed == []
+    assert prepared.object_key in objects.objects
+
+
+def test_writer_start_is_rejected_while_its_checkpoint_lifetime_is_pruning() -> None:
+    from gods_mlops.jobs.checkpoints import StaleCheckpointOwnerError
+    from gods_mlops.jobs.queue import PostgresJobQueueRepository
+
+    job_id = "a0320b59-663c-4cdc-b893-086bb970ea60"
+    lease_token = "8ad96890-3434-4f07-85bb-8cde17a2b009"
+    database_now = datetime(2026, 10, 7, 0, 0, tzinfo=UTC)
+    identity = {"job_id": job_id}
+    prune = {
+        "operation_id": "operation-A",
+        "write_lifetime_id": "operation-A",
+        "uri": "s3://gods-test/jobs/a0320b59/checkpoints/checkpoint-A",
+        "sha256": "a" * 64,
+    }
+    pending = {
+        "operation_id": "operation-B",
+        "operation": "checkpoint",
+        "uri": prune["uri"],
+        "sha256": prune["sha256"],
+        "identity": identity,
+        "writer_quiescence_required": True,
+    }
+    job = {
+        "job_id": job_id,
+        "state": "running",
+        "lease_token": lease_token,
+        "lease_generation": 2,
+    }
+    lease = {
+        "job_id": job_id,
+        "lease_token": lease_token,
+        "fencing_token": 2,
+        "expires_at": database_now + timedelta(minutes=1),
+    }
+    rows = [
+        {"event_type": "checkpoint_prune_pending", "details": prune},
+        {"event_type": "artifact_write_pending", "details": pending},
+    ]
+    writes = []
+
+    class Connection:
+        def transaction(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def fetchrow(self, query, *_args):
+            if "gods_mlops_worker_artifact_deadlines" in query:
+                return None
+            return None
+
+        async def fetch(self, query, *_args):
+            if "checkpoint_prune_pending" in query:
+                return rows
+            return [row for row in rows if row["event_type"] != "checkpoint_prune_pending"]
+
+        async def fetchval(self, query, *_args):
+            return database_now if "clock_timestamp" in query else False
+
+        async def execute(self, query, *_args):
+            writes.append(query)
+
+    connection = Connection()
+
+    class Pool:
+        def acquire(self):
+            return connection
+
+    class Repository(PostgresJobQueueRepository):
+        async def ensure_schema(self):
+            return None
+
+        async def _get_pool(self):
+            return Pool()
+
+        async def _lock_job_then_lease(self, *_args, **_kwargs):
+            return job, lease
+
+    with pytest.raises(StaleCheckpointOwnerError, match="prun"):
+        asyncio.run(
+            Repository(database_url="postgresql://unused").record_artifact_writer_started(
+                job_id=job_id,
+                lease_token=lease_token,
+                operation_id="operation-B",
+                writer_attempt_id=str(uuid4()),
+            )
+        )
+    assert writes == []
+    rows.append({"event_type": "checkpoint_pruned", "details": prune})
+    asyncio.run(
+        Repository(database_url="postgresql://unused").record_artifact_writer_started(
+            job_id=job_id,
+            lease_token=lease_token,
+            operation_id="operation-B",
+            writer_attempt_id=str(uuid4()),
+        )
+    )
+    assert len(writes) == 1
+
+
+def test_checkpoint_prune_gate_waits_for_durable_writer_quiescence() -> None:
+    from gods_mlops.jobs.queue import PostgresJobQueueRepository
+
+    job_id = "a0320b59-663c-4cdc-b893-086bb970ea60"
+    previous = {
+        "uri": "s3://gods-test/jobs/a0320b59/checkpoints/checkpoint-A",
+        "sha256": "a" * 64,
+        "size_bytes": 12,
+        "metadata_size_bytes": 0,
+        "identity": {"job_id": job_id},
+        "operation_id": "operation-A",
+        "write_lifetime_id": "operation-A",
+    }
+    job = {"job_id": job_id, "state": "running", "checkpoint_uri": "s3://gods-test/checkpoint-B"}
+    events = [
+        {"event_type": "checkpoint_prune_pending", "details": previous},
+        {
+            "event_type": "artifact_write_started",
+            "details": {"operation_id": "operation-A", "writer_attempt_id": "attempt-A"},
+        },
+    ]
+
+    class Connection:
+        def transaction(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def fetchrow(self, query, *_args):
+            return job if "gods_mlops_jobs" in query else None
+
+        async def fetch(self, query, *_args):
+            return events
+
+    connection = Connection()
+
+    class Pool:
+        def acquire(self):
+            return connection
+
+    class Repository(PostgresJobQueueRepository):
+        async def ensure_schema(self):
+            return None
+
+        async def _get_pool(self):
+            return Pool()
+
+    ready = asyncio.run(
+        Repository(database_url="postgresql://unused").checkpoint_prune_writer_gate(
+            job_id=job_id,
+            previous=previous,
+        )
+    )
+
+    assert ready is False
+
+
+def test_checkpoint_prune_refund_rechecks_writer_quiescence() -> None:
+    from gods_mlops.jobs.queue import PostgresJobQueueRepository
+
+    job_id = "a0320b59-663c-4cdc-b893-086bb970ea60"
+    previous = {
+        "uri": "s3://gods-test/jobs/a0320b59/checkpoints/checkpoint-A",
+        "sha256": "a" * 64,
+        "size_bytes": 12,
+        "metadata_size_bytes": 0,
+        "identity": {"job_id": job_id},
+        "operation_id": "operation-A",
+        "write_lifetime_id": "operation-A",
+    }
+    job = {"job_id": job_id, "state": "running", "checkpoint_uri": "s3://gods-test/checkpoint-B"}
+    rows = [
+        {
+            "event_id": 1,
+            "event_type": "artifact_write_started",
+            "details": {"operation_id": "operation-A", "writer_attempt_id": "attempt-A"},
+        },
+        {"event_id": 2, "event_type": "checkpoint_prune_pending", "details": previous},
+    ]
+    writes = []
+
+    class Connection:
+        def transaction(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def fetchrow(self, query, *_args):
+            if "ingestion_storage_usage" in query:
+                return {"used_bytes": 100}
+            if "gods_mlops_jobs" in query:
+                return job
+            if "gods_mlops_artifact_reservations" in query:
+                return {"state": "reserved", "reserved_bytes": 100, "consumed_bytes": 20}
+            return None
+
+        async def fetch(self, _query, *_args):
+            return rows
+
+        async def execute(self, query, *_args):
+            writes.append(query)
+
+    connection = Connection()
+
+    class Pool:
+        def acquire(self):
+            return connection
+
+    class Repository(PostgresJobQueueRepository):
+        async def ensure_schema(self):
+            return None
+
+        async def _get_pool(self):
+            return Pool()
+
+    with pytest.raises(ValueError, match="active or unknown writer"):
+        asyncio.run(
+            Repository(database_url="postgresql://unused").complete_checkpoint_prune(
+                job_id=job_id,
+                previous=previous,
+            )
+        )
+    assert writes == []
+
+
+def test_checkpoint_replacement_uses_prune_gate_instead_of_direct_adapter_delete() -> None:
+    identity = CheckpointIdentity(
+        job_id="a0320b59-663c-4cdc-b893-086bb970ea60",
+        input_kind="probe_input",
+        input_id="probe-v1",
+        input_sha256="1" * 64,
+        phase="probe",
+        model_kind="clip",
+        config_version="probe-v1",
+        config_sha256="2" * 64,
+        dataset_version=None,
+    )
+    previous = {
+        "uri": "file:///tmp/checkpoint-A",
+        "sha256": "a" * 64,
+        "size_bytes": 12,
+        "metadata_size_bytes": 0,
+        "identity": identity.as_dict(),
+        "operation_id": "operation-A",
+        "write_lifetime_id": "operation-A",
+    }
+    verified = SimpleNamespace(
+        identity=identity,
+        sha256="b" * 64,
+        size_bytes=12,
+        uri="file:///tmp/checkpoint-B",
+        path=None,
+    )
+
+    class Repository:
+        def __init__(self):
+            self.gate_calls = 0
+
+        async def get_job(self, _job_id):
+            return {"phase": "probe", "model_kind": "clip", "config_version": "probe-v1"}
+
+        async def checkpoint_identity(self, _job_id):
+            return identity
+
+        async def lease_is_current(self, *_args):
+            return True
+
+        async def get_profile(self, **_kwargs):
+            return {"checkpoint_reservation_bytes": 1024}
+
+        async def checkpoint_metadata_for(self, _job_id):
+            return previous
+
+        async def pending_checkpoint_prunes_for(self, _job_id):
+            return [previous]
+
+        async def checkpoint_prune_writer_gate(self, **_kwargs):
+            self.gate_calls += 1
+            return False
+
+        async def commit_checkpoint(self, **_kwargs):
+            return verified
+
+        async def complete_checkpoint_prune(self, **_kwargs):
+            return True
+
+    class Store:
+        def __init__(self):
+            self.direct_prunes = 0
+            self.uri_prunes = 0
+
+        def prepare(self, **_kwargs):
+            return SimpleNamespace(
+                identity=identity,
+                sha256="b" * 64,
+                size_bytes=12,
+                metadata_size_bytes=0,
+                object_key=None,
+                uri="file:///tmp/checkpoint-B",
+                previous_uri=previous["uri"],
+                previous_sha256=previous["sha256"],
+                previous_size_bytes=previous["size_bytes"],
+                previous_metadata_size_bytes=0,
+            )
+
+        def prune_previous(self, _prepared):
+            self.direct_prunes += 1
+
+        def prune_uri(self, *_args, **_kwargs):
+            self.uri_prunes += 1
+
+    repository = Repository()
+    store = Store()
+    queue = JobQueue(repository=repository, sources=object())
+
+    result = asyncio.run(
+        queue.save_checkpoint(
+            store=store,
+            job_id=identity.job_id,
+            lease_token="8ad96890-3434-4f07-85bb-8cde17a2b009",
+            identity=identity,
+            payload=b"checkpoint B",
+        )
+    )
+
+    assert result is verified
+    assert repository.gate_calls == 2
+    assert store.direct_prunes == 0
+    assert store.uri_prunes == 0
+
+
+def _blocking_write(objects: _BlockingObjects):
+    objects.writer_thread = threading.get_ident()
+    objects.writer_started.set()
+    try:
+        if not objects.release_writer.wait(timeout=5):
+            raise TimeoutError("test writer was not released")
+        return "writer-complete"
+    finally:
+        objects.writer_returned.set()
+
+
 def test_cleanup_detects_unmatched_artifact_writer_attempts() -> None:
     from gods_mlops.jobs.queue import _unmatched_artifact_writers
 
@@ -642,3 +1221,251 @@ def test_cleanup_detects_unmatched_artifact_writer_attempts() -> None:
     assert _unmatched_artifact_writers([("artifact_write_pending", pending_without_start)]) == {
         ("operation-2", "<missing-start>")
     }
+
+
+def test_checkpoint_and_result_finalizers_recheck_lease_after_reservation_wait() -> None:
+    from gods_mlops.jobs.checkpoints import StaleCheckpointOwnerError
+    from gods_mlops.jobs.queue import PostgresJobQueueRepository
+
+    async def exercise(operation: str, *, expired_deadline: bool = False) -> None:
+        start = datetime(2026, 10, 7, 0, 0, tzinfo=UTC)
+        identity = CheckpointIdentity(
+            job_id="a0320b59-663c-4cdc-b893-086bb970ea60",
+            input_kind="probe_input",
+            input_id="probe-v1",
+            input_sha256="1" * 64,
+            phase="probe",
+            model_kind="clip",
+            config_version="probe-v1",
+            config_sha256="2" * 64,
+            dataset_version=None,
+        )
+        job = {
+            **identity.as_dict(),
+            "state": "running",
+            "lease_token": "8ad96890-3434-4f07-85bb-8cde17a2b009",
+            "lease_generation": 2,
+            "target_phase": "training",
+            "checkpoint_uri": None,
+            "checkpoint_sha256": None,
+            "checkpoint_identity": None,
+        }
+        lease = {
+            "job_id": identity.job_id,
+            "lease_token": job["lease_token"],
+            "fencing_token": 2,
+            "expires_at": start + timedelta(seconds=60 if expired_deadline else 15),
+        }
+        invocation_id = str(uuid4()) if expired_deadline else None
+        artifact_deadline_at = start + timedelta(seconds=15) if expired_deadline else None
+        deadline_row = (
+            {
+                "job_id": identity.job_id,
+                "fencing_token": 2,
+                "lease_token": job["lease_token"],
+                "controller_invocation_id": invocation_id,
+                "artifact_deadline_at": artifact_deadline_at,
+            }
+            if expired_deadline
+            else None
+        )
+        profile = {"checkpoint_reservation_bytes": 1024, "result_reservation_bytes": 1024}
+        reservation = {"state": "reserved", "reserved_bytes": 4096, "consumed_bytes": 0}
+        state = {"now": start, "clock_samples": [], "writes": []}
+
+        class Connection:
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def fetchrow(self, query, *_args):
+                if "ingestion_storage_usage" in query:
+                    return {"used_bytes": 0}
+                if "gods_mlops_worker_artifact_deadlines" in query:
+                    return deadline_row
+                if "gods_mlops_resource_profiles" in query:
+                    return profile
+                if "gods_mlops_artifact_reservations" in query:
+                    state["now"] = start + timedelta(seconds=20)
+                    return reservation
+                return None
+
+            async def fetchval(self, query, *_args):
+                if "clock_timestamp" in query:
+                    state["clock_samples"].append(state["now"])
+                    return state["now"]
+                return False
+
+            async def fetch(self, _query, *_args):
+                return []
+
+            async def execute(self, query, *_args):
+                state["writes"].append(query)
+                return "UPDATE 1"
+
+        connection = Connection()
+
+        class Pool:
+            def acquire(self):
+                return connection
+
+        class Repository(PostgresJobQueueRepository):
+            async def ensure_schema(self):
+                return None
+
+            async def _get_pool(self):
+                return Pool()
+
+            async def _lock_job_then_lease(self, *_args, **_kwargs):
+                return job, lease
+
+        repository = Repository(database_url="postgresql://unused")
+        payload = b"artifact"
+        digest = sha256(payload).hexdigest()
+        prepared = SimpleNamespace(
+            identity=identity,
+            kind="model",
+            uri=f"s3://gods-test/jobs/{identity.job_id}/{digest}.artifact",
+            object_key=f"jobs/{identity.job_id}/{digest}.artifact",
+            sha256=digest,
+            size_bytes=len(payload),
+            metadata_size_bytes=0,
+            previous_uri=None,
+            previous_sha256=None,
+            previous_size_bytes=None,
+        )
+        store = SimpleNamespace(_bucket="gods-test", _prefix="jobs")
+        verified = SimpleNamespace(
+            identity=identity,
+            kind="model",
+            uri=prepared.uri,
+            object_key=prepared.object_key,
+            sha256=digest,
+            size_bytes=len(payload),
+            path=None,
+        )
+
+        with pytest.raises(
+            TimeoutError if expired_deadline else StaleCheckpointOwnerError,
+            match="expired" if expired_deadline else "unexpired fence",
+        ):
+            if operation == "checkpoint":
+                await repository.commit_checkpoint(
+                    job_id=identity.job_id,
+                    lease_token=job["lease_token"],
+                    identity=identity,
+                    prepared=prepared,
+                    store=store,
+                    verified_artifact=verified,
+                    artifact_invocation_id=invocation_id,
+                    artifact_deadline_at=artifact_deadline_at,
+                )
+            else:
+                await repository.commit_result_artifact(
+                    job_id=identity.job_id,
+                    lease_token=job["lease_token"],
+                    identity=identity,
+                    prepared=prepared,
+                    store=store,
+                    source_registry=object(),
+                    verified_artifact=verified,
+                    artifact_invocation_id=invocation_id,
+                    artifact_deadline_at=artifact_deadline_at,
+                )
+
+        assert state["clock_samples"][-1] == start + timedelta(seconds=20)
+        assert not any("checkpoint_uri =" in query for query in state["writes"])
+        assert not any("checkpoint_committed" in query for query in state["writes"])
+        assert not any("result_artifact_committed" in query for query in state["writes"])
+
+    asyncio.run(exercise("checkpoint"))
+    asyncio.run(exercise("result"))
+    asyncio.run(exercise("checkpoint", expired_deadline=True))
+    asyncio.run(exercise("result", expired_deadline=True))
+
+
+
+
+def test_terminal_reservation_settlement_defers_while_worker_lease_is_retained() -> None:
+    from gods_mlops.jobs.queue import JobQueue, PostgresJobQueueRepository
+
+    async def exercise() -> None:
+        job_id = "a0320b59-663c-4cdc-b893-086bb970ea60"
+        writes = []
+
+        class Connection:
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def fetchrow(self, query, *_args):
+                if "ingestion_storage_usage" in query:
+                    return {"used_bytes": 100}
+                if "gods_mlops_jobs" in query:
+                    return {"job_id": job_id, "state": "failed"}
+                if "gods_mlops_artifact_reservations" in query:
+                    return {
+                        "job_id": job_id,
+                        "state": "reserved",
+                        "reserved_bytes": 100,
+                        "consumed_bytes": 10,
+                    }
+                return None
+
+            async def fetchval(self, query, *_args):
+                if "gods_mlops_gpu_leases" in query:
+                    return True
+                return False
+
+            async def fetch(self, *_args):
+                return []
+
+            async def execute(self, query, *_args):
+                writes.append(query)
+
+        connection = Connection()
+
+        class Pool:
+            def acquire(self):
+                return connection
+
+        class Repository(PostgresJobQueueRepository):
+            async def ensure_schema(self):
+                return None
+
+            async def _get_pool(self):
+                return Pool()
+
+            async def record_probe_measurement(self, **_kwargs):
+                return {"result_state": "succeeded"}
+
+        queue = JobQueue(
+            repository=Repository(database_url="postgresql://unused"),
+            sources=object(),
+        )
+        result = await queue.record_probe_measurement(
+            job_id=job_id,
+            lease_token="8ad96890-3434-4f07-85bb-8cde17a2b009",
+            exit_code=0,
+            peak_allocated_mib=100,
+            peak_reserved_mib=100,
+            optimizer_steps=3,
+            checkpoint_resumed=True,
+            checkpoint_sha256="a" * 64,
+        )
+
+        assert result["result_state"] == "succeeded"
+        assert not any("SET used_bytes" in query for query in writes)
+        assert not any("state='settled'" in query for query in writes)
+
+    asyncio.run(exercise())

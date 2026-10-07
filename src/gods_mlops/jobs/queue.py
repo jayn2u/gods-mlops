@@ -2111,7 +2111,7 @@ class PostgresJobQueueRepository:
                     """SELECT event_type,details FROM gods_mlops_job_events
                        WHERE job_id=$1::uuid AND event_type IN
                          ('artifact_write_pending','result_artifact_committed','checkpoint_committed',
-                          'artifact_write_deleted','checkpoint_pruned')
+                          'artifact_write_deleted','checkpoint_pruned','checkpoint_prune_pending')
                        ORDER BY event_id""",
                     job_id,
                 )
@@ -2120,9 +2120,16 @@ class PostgresJobQueueRepository:
                 deleted_intents: set[str] = set()
                 pruned_checkpoint_lifetimes: set[str] = set()
                 legacy_pruned_checkpoint_objects: set[tuple[str, str]] = set()
+                pruning_checkpoint_objects: dict[str, tuple[str, str]] = {}
                 for row in events:
                     details = _json_value(row["details"])
                     event_type = row["event_type"]
+                    if event_type == "checkpoint_prune_pending":
+                        pruning_checkpoint_objects[_checkpoint_lifetime_id(details)] = (
+                                str(details.get("uri") or details.get("checkpoint_uri") or ""),
+                                str(details.get("sha256", "")),
+                            )
+                        continue
                     if event_type == "artifact_write_deleted":
                         deleted_intents.add(str(details.get("operation_id", "")))
                         continue
@@ -2159,6 +2166,14 @@ class PostgresJobQueueRepository:
                             active_pending.append(details)
                         elif operation == "checkpoint" and event_uri == uri:
                             active_pending.append(details)
+
+                active_pruning_objects = {
+                    object_identity
+                    for lifetime, object_identity in pruning_checkpoint_objects.items()
+                    if lifetime not in pruned_checkpoint_lifetimes
+                }
+                if operation == "checkpoint" and (uri, digest) in active_pruning_objects:
+                    raise StaleCheckpointOwnerError("checkpoint object lifetime is being pruned")
 
                 if operation == "result":
                     for existing_uri, details in same_kind_commits:
@@ -2296,29 +2311,65 @@ class PostgresJobQueueRepository:
                 events = await connection.fetch(
                     """SELECT event_type, details FROM gods_mlops_job_events
                        WHERE job_id=$1::uuid AND event_type IN
-                         ('artifact_write_pending','artifact_write_deleted','checkpoint_committed',
-                          'result_artifact_committed','artifact_write_started','artifact_write_quiescent')
+                          ('artifact_write_pending','artifact_write_deleted','checkpoint_committed',
+                          'result_artifact_committed','artifact_write_started','artifact_write_quiescent',
+                          'checkpoint_prune_pending','checkpoint_pruned')
                        ORDER BY event_id""",
                     job_id,
                 )
                 pending = None
                 committed = False
+                committed_details = None
                 deleted = False
+                already_started = False
+                prune_pending_by_lifetime: dict[str, dict[str, Any]] = {}
+                pruned_lifetimes: set[str] = set()
                 for row in events:
                     details = _json_value(row["details"])
+                    if row["event_type"] == "checkpoint_prune_pending":
+                        prune_pending_by_lifetime[_checkpoint_lifetime_id(details)] = details
+                        continue
+                    if row["event_type"] == "checkpoint_pruned":
+                        pruned_lifetimes.add(_checkpoint_lifetime_id(details))
+                        continue
                     if str(details.get("operation_id", "")) != operation_id:
                         continue
                     if row["event_type"] == "artifact_write_pending":
                         pending = details
                     elif row["event_type"] in {"checkpoint_committed", "result_artifact_committed"}:
                         committed = True
+                        committed_details = details
                     elif row["event_type"] == "artifact_write_deleted":
                         deleted = True
                     elif (
                         row["event_type"] == "artifact_write_started"
                         and str(details.get("writer_attempt_id")) == attempt_id
                     ):
-                        return
+                        already_started = True
+                if pending is not None and pending.get("operation") == "checkpoint":
+                    writer_identity = pending
+                else:
+                    writer_identity = committed_details
+                prune_pending = [
+                    details
+                    for lifetime, details in prune_pending_by_lifetime.items()
+                    if lifetime not in pruned_lifetimes
+                ]
+                if writer_identity is not None and writer_identity.get("operation", "checkpoint") == "checkpoint":
+                    writer_uri = str(writer_identity.get("uri") or writer_identity.get("checkpoint_uri") or "")
+                    writer_sha = str(writer_identity.get("sha256", ""))
+                    if any(
+                        str(prune.get("operation_id", "")) == operation_id
+                        or str(prune.get("write_lifetime_id", "")) == operation_id
+                        or (
+                            str(prune.get("uri", "")) == writer_uri
+                            and str(prune.get("sha256", "")) == writer_sha
+                        )
+                        for prune in prune_pending
+                    ):
+                        raise StaleCheckpointOwnerError("checkpoint writer is blocked by a pending prune")
+                if already_started:
+                    return
                 if deleted or (pending is None and not committed):
                     raise CheckpointIdentityError("artifact writer start has no pending or committed exact operation")
                 if pending is not None:
@@ -2697,18 +2748,54 @@ class PostgresJobQueueRepository:
                 checkpoint_uri = _verified_checkpoint_uri(verified)
                 if checkpoint_uri != checkpoint_uri_expected:
                     raise CheckpointIdentityError("verified checkpoint URI differs from its pending object identity")
-                await connection.execute(
-                    """
-                    UPDATE gods_mlops_jobs SET checkpoint_uri = $3, checkpoint_sha256 = $4,
-                        checkpoint_identity = $5::jsonb, updated_at = now()
-                    WHERE job_id = $1::uuid AND lease_token = $2::uuid
-                    """,
+                publication_now = await connection.fetchval("SELECT clock_timestamp()")
+                await self._assert_artifact_write_deadline(
+                    connection,
+                    job=job,
+                    lease=lease,
+                    database_now=publication_now,
+                    expected_invocation_id=artifact_invocation_id,
+                    expected_deadline_at=artifact_deadline_at,
+                )
+                fence = int(lease["fencing_token"])
+                updated = await connection.execute(
+                    """UPDATE gods_mlops_jobs AS j
+                       SET checkpoint_uri=$3, checkpoint_sha256=$4,
+                           checkpoint_identity=$5::jsonb, updated_at=now()
+                       WHERE j.job_id=$1::uuid AND j.lease_token=$2::uuid
+                         AND j.lease_generation=$6 AND j.state IN ('running','yield_requested')
+                         AND EXISTS (
+                           SELECT 1 FROM gods_mlops_gpu_leases AS l
+                           WHERE l.job_id=j.job_id AND l.lease_token=$2::uuid
+                             AND l.fencing_token=$6 AND l.expires_at>clock_timestamp()
+                         )
+                         AND (
+                           ($7::uuid IS NULL AND NOT EXISTS (
+                             SELECT 1 FROM gods_mlops_worker_artifact_deadlines AS d
+                             WHERE d.job_id=j.job_id AND d.fencing_token=$6
+                           ))
+                           OR EXISTS (
+                             SELECT 1 FROM gods_mlops_worker_artifact_deadlines AS d
+                             WHERE d.job_id=j.job_id AND d.fencing_token=$6
+                               AND d.lease_token=$2::uuid
+                               AND d.artifact_deadline_at>clock_timestamp()
+                               AND ($7::uuid IS NULL OR (
+                                 d.controller_invocation_id=$7::uuid
+                                 AND d.artifact_deadline_at=$8
+                               ))
+                           )
+                         )""",
                     job_id,
                     lease_token,
                     checkpoint_uri,
                     verified.sha256,
                     _canonical_json(identity.as_dict()),
+                    fence,
+                    artifact_invocation_id,
+                    artifact_deadline_at,
                 )
+                if updated != "UPDATE 1":
+                    raise StaleCheckpointOwnerError("checkpoint publication lost its current lease or deadline")
                 if not precharged:
                     if reservation["consumed_bytes"] + verified.size_bytes + prepared.metadata_size_bytes > reservation["reserved_bytes"]:
                         raise ValueError("checkpoint exceeds its remaining shared storage reservation")
@@ -2718,16 +2805,17 @@ class PostgresJobQueueRepository:
                         job_id,
                         verified.size_bytes + prepared.metadata_size_bytes,
                     )
-                await connection.execute(
-                    """
-                    INSERT INTO gods_mlops_job_events (
-                        job_id, event_type, state, fencing_token, details
-                    ) VALUES ($1::uuid, 'checkpoint_committed', $2, $3, $4::jsonb)
-                    """,
-                    job_id,
-                    job["state"],
-                    lease["fencing_token"],
-                    _canonical_json({
+                publication_now = await connection.fetchval("SELECT clock_timestamp()")
+                await self._assert_artifact_write_deadline(
+                    connection,
+                    job=job,
+                    lease=lease,
+                    database_now=publication_now,
+                    expected_invocation_id=artifact_invocation_id,
+                    expected_deadline_at=artifact_deadline_at,
+                )
+                event_details = _canonical_json(
+                    {
                         "checkpoint_uri": checkpoint_uri,
                         "sha256": verified.sha256,
                         "size_bytes": verified.size_bytes,
@@ -2736,8 +2824,48 @@ class PostgresJobQueueRepository:
                         "operation_id": operation_id,
                         "write_lifetime_id": write_lifetime_id,
                         "identity": identity.as_dict(),
-                    }),
+                    }
                 )
+                event_id = await connection.fetchval(
+                    """INSERT INTO gods_mlops_job_events (
+                           job_id,event_type,state,fencing_token,details
+                       )
+                       SELECT $1::uuid,'checkpoint_committed',$2,$3,$4::jsonb
+                       WHERE EXISTS (
+                           SELECT 1 FROM gods_mlops_jobs AS j
+                           JOIN gods_mlops_gpu_leases AS l ON l.job_id=j.job_id
+                           WHERE j.job_id=$1::uuid AND j.lease_token=$5::uuid
+                             AND j.lease_generation=$3 AND j.state IN ('running','yield_requested')
+                             AND l.lease_token=$5::uuid AND l.fencing_token=$3
+                             AND l.expires_at>clock_timestamp()
+                             AND (
+                               ($6::uuid IS NULL AND NOT EXISTS (
+                                 SELECT 1 FROM gods_mlops_worker_artifact_deadlines AS d
+                                 WHERE d.job_id=j.job_id AND d.fencing_token=$3
+                               ))
+                               OR EXISTS (
+                                 SELECT 1 FROM gods_mlops_worker_artifact_deadlines AS d
+                                 WHERE d.job_id=j.job_id AND d.fencing_token=$3
+                                   AND d.lease_token=$5::uuid
+                                   AND d.artifact_deadline_at>clock_timestamp()
+                                   AND ($6::uuid IS NULL OR (
+                                     d.controller_invocation_id=$6::uuid
+                                     AND d.artifact_deadline_at=$7
+                                   ))
+                               )
+                             )
+                       )
+                       RETURNING event_id""",
+                    job_id,
+                    job["state"],
+                    fence,
+                    event_details,
+                    lease_token,
+                    artifact_invocation_id,
+                    artifact_deadline_at,
+                )
+                if event_id is None:
+                    raise StaleCheckpointOwnerError("checkpoint event publication lost its current lease or deadline")
                 if prior_checkpoint is not None and prior_checkpoint["uri"] != checkpoint_uri:
                     prior_uri = getattr(prepared, "previous_uri", None)
                     if prior_uri != prior_checkpoint["uri"]:
@@ -2798,6 +2926,77 @@ class PostgresJobQueueRepository:
             else:
                 resolved.add(key)
         return [details for key, details in pending.items() if key not in resolved]
+
+    async def checkpoint_prune_writer_gate(
+        self, *, job_id: str, previous: dict[str, Any]
+    ) -> bool:
+        """Exclusively check the old checkpoint lifetime before unlocked deletion I/O."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        operation_id = str(previous.get("operation_id", ""))
+        lifetime_id = _checkpoint_lifetime_id(previous)
+        uri = str(previous.get("uri", ""))
+        digest = str(previous.get("sha256", ""))
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                job = await connection.fetchrow(
+                    "SELECT * FROM gods_mlops_jobs WHERE job_id=$1::uuid FOR UPDATE", job_id
+                )
+                if job is None:
+                    raise KeyError(f"GPU job {job_id} does not exist")
+                if (
+                    str(job["checkpoint_uri"] or "") == uri
+                    and str(job["checkpoint_sha256"] or "").strip() == digest
+                ):
+                    return False
+                rows = await connection.fetch(
+                    """SELECT event_id,event_type,details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type IN
+                         ('checkpoint_prune_pending','checkpoint_pruned',
+                          'artifact_write_pending','artifact_write_started','artifact_write_quiescent')
+                       ORDER BY event_id""",
+                    job_id,
+                )
+                prune_pending_id = None
+                resolved = False
+                for row in rows:
+                    if row["event_type"] not in {"checkpoint_prune_pending", "checkpoint_pruned"}:
+                        continue
+                    details = _json_value(row["details"])
+                    if _checkpoint_lifetime_id(details) != lifetime_id:
+                        continue
+                    if row["event_type"] == "checkpoint_pruned":
+                        resolved = True
+                    else:
+                        prune_pending_id = int(row.get("event_id", 0))
+                if resolved or prune_pending_id is None:
+                    return False
+                related_writer_events = []
+                for row in rows:
+                    event_type = row["event_type"]
+                    if event_type not in {
+                        "artifact_write_pending",
+                        "artifact_write_started",
+                        "artifact_write_quiescent",
+                    }:
+                        continue
+                    details = _json_value(row["details"])
+                    same_operation = (
+                        str(details.get("operation_id", "")) in {operation_id, lifetime_id}
+                    )
+                    same_object = (
+                        str(details.get("uri", "")) == uri
+                        and str(details.get("sha256", "")) == digest
+                    )
+                    if not (same_operation or same_object):
+                        continue
+                    if (
+                        event_type == "artifact_write_started"
+                        and int(row.get("event_id", 0)) > prune_pending_id
+                    ):
+                        return False
+                    related_writer_events.append((event_type, details))
+                return not _unmatched_artifact_writers(related_writer_events)
 
     async def pending_artifact_writes_for_cleanup(self, job_id: str) -> list[dict[str, Any]]:
         """Return only uncommitted S3 writes after the terminal owner has released its lease."""
@@ -2987,9 +3186,10 @@ class PostgresJobQueueRepository:
                 if reservation is None:
                     raise RuntimeError("checkpoint prune has no artifact reservation")
                 rows = await connection.fetch(
-                    """SELECT event_type,details FROM gods_mlops_job_events
-                       WHERE job_id=$1::uuid
-                         AND event_type IN ('checkpoint_prune_pending','checkpoint_pruned')
+                    """SELECT event_id,event_type,details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type IN (
+                         'checkpoint_prune_pending','checkpoint_pruned','artifact_write_pending',
+                         'artifact_write_started','artifact_write_quiescent')
                        ORDER BY event_id""",
                     job_id,
                 )
@@ -2998,13 +3198,45 @@ class PostgresJobQueueRepository:
                 lifetime_id = _checkpoint_lifetime_id(previous)
                 has_pending = False
                 already_pruned = False
+                prune_pending_id = None
                 for row in rows:
                     details = _json_value(row["details"])
                     if _checkpoint_lifetime_id(details) == lifetime_id:
-                        has_pending |= row["event_type"] == "checkpoint_prune_pending"
-                        already_pruned |= row["event_type"] == "checkpoint_pruned"
+                        if row["event_type"] == "checkpoint_prune_pending":
+                            has_pending = True
+                            prune_pending_id = int(row["event_id"])
+                        elif row["event_type"] == "checkpoint_pruned":
+                            already_pruned = True
                 if not has_pending or already_pruned:
                     return False
+                writer_events = []
+                for row in rows:
+                    event_type = row["event_type"]
+                    if event_type not in {
+                        "artifact_write_pending",
+                        "artifact_write_started",
+                        "artifact_write_quiescent",
+                    }:
+                        continue
+                    writer_details = _json_value(row["details"])
+                    same_operation = str(writer_details.get("operation_id", "")) in {
+                        str(previous.get("operation_id", "")),
+                        lifetime_id,
+                    }
+                    same_object = (
+                        str(writer_details.get("uri", "")) == uri
+                        and str(writer_details.get("sha256", "")) == digest
+                    )
+                    if not (same_operation or same_object):
+                        continue
+                    if (
+                        event_type == "artifact_write_started"
+                        and int(row["event_id"]) > int(prune_pending_id)
+                    ):
+                        raise ValueError("checkpoint writer started after its prune exclusion")
+                    writer_events.append((event_type, writer_details))
+                if _unmatched_artifact_writers(writer_events):
+                    raise ValueError("checkpoint prune refund is blocked by an active or unknown writer")
                 charge_bytes = int(previous.get("size_bytes", 0)) + int(
                     previous.get("metadata_size_bytes", 0)
                 )
@@ -3362,14 +3594,54 @@ class PostgresJobQueueRepository:
                         job_id,
                         verified.size_bytes,
                     )
-                await connection.execute(
+                publication_now = await connection.fetchval("SELECT clock_timestamp()")
+                await self._assert_artifact_write_deadline(
+                    connection,
+                    job=job,
+                    lease=lease,
+                    database_now=publication_now,
+                    expected_invocation_id=artifact_invocation_id,
+                    expected_deadline_at=artifact_deadline_at,
+                )
+                event_id = await connection.fetchval(
                     """INSERT INTO gods_mlops_job_events(
                            job_id,event_type,state,fencing_token,details
-                       ) VALUES($1::uuid,'result_artifact_committed','running',$2,$3::jsonb)""",
+                       )
+                       SELECT $1::uuid,'result_artifact_committed','running',$2,$3::jsonb
+                       WHERE EXISTS (
+                           SELECT 1 FROM gods_mlops_jobs AS j
+                           JOIN gods_mlops_gpu_leases AS l ON l.job_id=j.job_id
+                           WHERE j.job_id=$1::uuid AND j.lease_token=$4::uuid
+                             AND j.lease_generation=$2 AND j.state='running'
+                             AND l.lease_token=$4::uuid AND l.fencing_token=$2
+                             AND l.expires_at>clock_timestamp()
+                             AND (
+                               ($5::uuid IS NULL AND NOT EXISTS (
+                                 SELECT 1 FROM gods_mlops_worker_artifact_deadlines AS d
+                                 WHERE d.job_id=j.job_id AND d.fencing_token=$2
+                               ))
+                               OR EXISTS (
+                                 SELECT 1 FROM gods_mlops_worker_artifact_deadlines AS d
+                                 WHERE d.job_id=j.job_id AND d.fencing_token=$2
+                                   AND d.lease_token=$4::uuid
+                                   AND d.artifact_deadline_at>clock_timestamp()
+                                   AND ($5::uuid IS NULL OR (
+                                     d.controller_invocation_id=$5::uuid
+                                     AND d.artifact_deadline_at=$6
+                                   ))
+                               )
+                             )
+                       )
+                       RETURNING event_id""",
                     job_id,
                     lease["fencing_token"],
                     _canonical_json(details),
+                    lease_token,
+                    artifact_invocation_id,
+                    artifact_deadline_at,
                 )
+                if event_id is None:
+                    raise StaleCheckpointOwnerError("result event publication lost its current lease or deadline")
                 return verified
 
     async def complete_owned_job(
@@ -3894,14 +4166,22 @@ class PostgresJobQueueRepository:
                 )
                 if job is None:
                     raise KeyError(f"GPU job {job_id} does not exist")
+                if job["state"] not in {"completed", "failed", "cancelled"}:
+                    raise ValueError("only terminal jobs can settle their artifact reservation")
+                lease_exists = await connection.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM gods_mlops_gpu_leases WHERE job_id=$1::uuid)",
+                    job_id,
+                )
+                if lease_exists:
+                    # Terminal probe/failure results can be recorded before the monitor
+                    # observes process exit. Keep the reservation intact until that release.
+                    return _job_dict(job)
                 reservation = await connection.fetchrow(
                     "SELECT * FROM gods_mlops_artifact_reservations WHERE job_id=$1::uuid FOR UPDATE",
                     job_id,
                 )
                 if reservation is None or reservation["state"] == "settled":
                     return _job_dict(job)
-                if job["state"] not in {"completed", "failed", "cancelled"}:
-                    raise ValueError("only terminal jobs can settle their artifact reservation")
                 writer_rows = await connection.fetch(
                     """SELECT event_type,details FROM gods_mlops_job_events
                        WHERE job_id=$1::uuid
@@ -4897,7 +5177,11 @@ class JobQueue:
 
         async def record_quiescence() -> None:
             try:
-                await writer_future
+                await asyncio.shield(writer_future)
+            except asyncio.CancelledError:
+                # A cancelled observer cannot prove that the executor thread stopped.
+                # Leave the durable start unmatched so cleanup remains blocked.
+                raise
             except BaseException:
                 pass
             await self._repository.record_artifact_writer_quiescent(
@@ -5011,8 +5295,7 @@ class JobQueue:
             **_artifact_deadline_kwargs(artifact_deadline),
         )
         if previous is not None and previous["uri"] != _verified_checkpoint_uri(verified):
-            await asyncio.to_thread(store.prune_previous, prepared)
-            await self._repository.complete_checkpoint_prune(job_id=job_id, previous=previous)
+            await self.retry_pending_checkpoint_prunes(store=store, job_id=job_id)
         return verified
 
     async def save_result_artifact(
@@ -5162,8 +5445,13 @@ class JobQueue:
         prune_uri = getattr(store, "prune_uri", None)
         if not callable(prune_uri):
             return []
+        writer_gate = getattr(self._repository, "checkpoint_prune_writer_gate", None)
+        if not callable(writer_gate):
+            raise RuntimeError("checkpoint pruning requires the durable writer lifecycle gate")
         completed = []
         for previous in await self._repository.pending_checkpoint_prunes_for(job_id):
+            if not await writer_gate(job_id=job_id, previous=previous):
+                continue
             await asyncio.to_thread(
                 prune_uri,
                 previous["uri"],

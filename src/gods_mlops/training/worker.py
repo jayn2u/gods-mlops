@@ -43,9 +43,9 @@ async def resolve_worker_artifact_deadline(
     fencing_token: int,
     environment_value: tuple[str, Any] | None,
     monotonic_clock=time.monotonic,
-) -> tuple[float, dict[str, Any] | None]:
+) -> tuple[float | None, dict[str, Any] | None]:
     if environment_value is None:
-        return monotonic_clock() + LEGACY_ARTIFACT_TIMEOUT_SECONDS, None
+        return None, None
     monotonic_before_read = monotonic_clock()
     authority_record = await repository.read_worker_artifact_deadline(
         job_id=job_id,
@@ -60,6 +60,16 @@ async def resolve_worker_artifact_deadline(
         monotonic_after_read=monotonic_after_read,
     )
     return local_deadline, authority_record
+
+
+def _artifact_operation_deadline(
+    explicit_deadline: float | None,
+    *,
+    monotonic_clock=time.monotonic,
+) -> float:
+    if explicit_deadline is not None:
+        return explicit_deadline
+    return monotonic_clock() + LEGACY_ARTIFACT_TIMEOUT_SECONDS
 
 
 async def await_worker_artifact_operation(
@@ -235,7 +245,8 @@ async def run_worker() -> int:
 
         def from_runner(coroutine, *, artifact: bool = False):
             if artifact:
-                remaining = artifact_deadline_monotonic - time.monotonic()
+                operation_deadline = _artifact_operation_deadline(artifact_deadline_monotonic)
+                remaining = operation_deadline - time.monotonic()
                 if remaining <= 0:
                     close = getattr(coroutine, "close", None)
                     if callable(close):
@@ -243,7 +254,7 @@ async def run_worker() -> int:
                     raise TimeoutError("worker artifact deadline has expired")
                 submitted = await_worker_artifact_operation(
                     coroutine,
-                    local_deadline=artifact_deadline_monotonic,
+                    local_deadline=operation_deadline,
                 )
                 future = asyncio.run_coroutine_threadsafe(submitted, event_loop)
                 try:
@@ -351,7 +362,7 @@ async def run_worker() -> int:
                         payload=payload,
                         artifact_deadline=artifact_deadline_authority,
                     ),
-                    local_deadline=artifact_deadline_monotonic,
+                    local_deadline=_artifact_operation_deadline(artifact_deadline_monotonic),
                 )
             return 0
         if result.get("status") != "succeeded":
@@ -423,7 +434,7 @@ async def run_worker() -> int:
                     payload=checkpoint_payload,
                     artifact_deadline=artifact_deadline_authority,
                 ),
-                local_deadline=artifact_deadline_monotonic,
+                local_deadline=_artifact_operation_deadline(artifact_deadline_monotonic),
             )
             checkpoint_digest = verified.sha256
         result_payload = result.get("result_artifact_payload")
@@ -449,7 +460,7 @@ async def run_worker() -> int:
                     runtime_measurements=measurements_snapshot,
                     artifact_deadline=artifact_deadline_authority,
                 ),
-                local_deadline=artifact_deadline_monotonic,
+                local_deadline=_artifact_operation_deadline(artifact_deadline_monotonic),
             )
             result["result_uri"] = artifact.uri
 
