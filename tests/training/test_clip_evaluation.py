@@ -331,6 +331,7 @@ class ClipEvaluationInferenceTests(unittest.TestCase):
             {
                 "phase": "probe",
                 "target_phase": "evaluation",
+                "model_kind": "clip",
                 "stage": "queries",
                 "next_index": 2,
                 "total_items": 2,
@@ -410,6 +411,7 @@ class ClipEvaluationInferenceTests(unittest.TestCase):
             EvaluationProbeCheckpointSource,
             ExecutionProfile,
         )
+        from gods_mlops.jobs.queue import _normalize_evaluation_progress
         from gods_mlops.training.claims import (
             WorkerAuthorizationError,
             WorkerClaim,
@@ -666,7 +668,7 @@ class ClipEvaluationInferenceTests(unittest.TestCase):
                     return guard_calls == 1
 
                 def armed_callback(**event):
-                    progress_events.append(event)
+                    progress_events.append(_normalize_evaluation_progress(event))
 
                 armed_result = run_with(
                     armed_callback,
@@ -684,6 +686,7 @@ class ClipEvaluationInferenceTests(unittest.TestCase):
                 self.assertEqual(cursor["predictions"]["stage"], "gallery")
                 self.assertEqual(cursor["next_index"], 0)
                 self.assertEqual(cursor["predictions"]["crop_embeddings"], {})
+                self.assertEqual(progress_events[0]["model_kind"], "clip")
                 self.assertEqual(set(cursor["predictions"]["query_embeddings"]), {"task8-crop-red", "task8-crop-blue"})
                 self.assertEqual(progress_events[0]["config_sha256"], profile.config_sha256)
 

@@ -211,7 +211,7 @@ class _FakeConnection:
 
     async def fetchval(self, query: str, *args):
         normalized = " ".join(query.split()).lower()
-        if "clock_timestamp()" in normalized:
+        if "clock_timestamp()" in normalized and "insert into gods_mlops_job_events" not in normalized:
             return self.state["now"]
         if "insert into gods_mlops_job_events" in normalized:
             if "evaluation_yield_armed" in normalized:
@@ -221,8 +221,22 @@ class _FakeConnection:
                 job_id, fence, details = args
                 event_type, event_state, reason = "evaluation_batch_completed", "running", None
             elif "yield_requested" in normalized:
-                job_id, reason, fence, details = args
+                job_id, reason, fence, details, token, invocation_id, deadline_at, pid, start_ticks, uid = args
                 event_type, event_state = "yield_requested", "yield_requested"
+                lease = self.state["lease"]
+                deadline = self.state["deadline"]
+                if (
+                    lease is None
+                    or deadline is None
+                    or self.state["now"] >= lease["expires_at"]
+                    or self.state["now"] >= deadline_at
+                    or str(lease["lease_token"]) != str(token)
+                    or deadline["controller_invocation_id"] != invocation_id
+                    or deadline["artifact_deadline_at"] != deadline_at
+                    or (lease["owner_pid"], lease["owner_start_ticks"], lease["owner_uid"])
+                    != (pid, start_ticks, uid)
+                ):
+                    return None
             else:
                 raise AssertionError(f"unexpected event insert: {normalized}")
             event_id = self.state["next_event_id"]
@@ -244,12 +258,28 @@ class _FakeConnection:
     async def execute(self, query: str, *args):
         normalized = " ".join(query.split()).lower()
         if "update gods_mlops_jobs" in normalized:
-            job_id, reason, details, lease_token, fence = args
+            job_id, reason, details, lease_token, fence, deadline_at, invocation_id, pid, start_ticks, uid = args
+            lease = self.state["lease"]
+            deadline = self.state["deadline"]
             if (
                 str(self.state["job"]["job_id"]) != str(job_id)
                 or str(self.state["job"]["lease_token"]) != str(lease_token)
                 or int(self.state["job"]["lease_generation"]) != int(fence)
                 or self.state["job"]["state"] != "running"
+                or self.state["now"] >= self.state["job"]["lease_expires_at"]
+                or self.state["now"] >= deadline_at
+                or lease is None
+                or deadline is None
+                or str(lease["lease_token"]) != str(lease_token)
+                or self.state["now"] >= lease["expires_at"]
+                or deadline["controller_invocation_id"] != invocation_id
+                or deadline["artifact_deadline_at"] != deadline_at
+                or (
+                    self.state["job"]["owner_pid"],
+                    self.state["job"]["owner_start_ticks"],
+                    self.state["job"]["owner_uid"],
+                )
+                != (pid, start_ticks, uid)
             ):
                 return "UPDATE 0"
             self.state["job"].update(
@@ -260,12 +290,20 @@ class _FakeConnection:
             )
             return "UPDATE 1"
         if "update gods_mlops_gpu_leases" in normalized:
-            _, reason, lease_token, fence = args
+            _, reason, lease_token, fence, deadline_at, invocation_id, pid, start_ticks, uid = args
             lease = self.state["lease"]
+            deadline = self.state["deadline"]
             if (
                 lease is None
                 or str(lease["lease_token"]) != str(lease_token)
                 or int(lease["fencing_token"]) != int(fence)
+                or self.state["now"] >= lease["expires_at"]
+                or self.state["now"] >= deadline_at
+                or deadline is None
+                or deadline["controller_invocation_id"] != invocation_id
+                or deadline["artifact_deadline_at"] != deadline_at
+                or (lease["owner_pid"], lease["owner_start_ticks"], lease["owner_uid"])
+                != (pid, start_ticks, uid)
             ):
                 return "UPDATE 0"
             lease["yield_reason"] = reason
@@ -534,6 +572,51 @@ def test_progress_event_and_yield_transition_are_atomic_and_replayable(monkeypat
     assert state["events"][0]["details"]["training_source_checkpoint_sha256"] == _SOURCE_CHECKPOINT_SHA
     assert state["job"]["checkpoint_sha256"] == "e" * 64
     assert connection.lock_order[-2:] == ["job", "lease"]
+
+
+def test_profile_lock_wait_rechecks_lease_and_artifact_deadline_before_publish(monkeypatch) -> None:
+    request_yield = _require(PostgresJobQueueRepository.request_yield, "request_yield(after_progress=...)")
+    record = _require(
+        getattr(PostgresJobQueueRepository, "record_evaluation_progress", None),
+        "record_evaluation_progress",
+    )
+    state = _database_state()
+    repository, connection = _repository(state, monkeypatch)
+    target = _target(state["probe_input"], state["profile_object"])
+    armed = asyncio.run(request_yield(repository, _JOB_ID, _REASON, after_progress=target))
+    owner, deadline = _activate_generation_one(state)
+    expires_at = _NOW + timedelta(seconds=1)
+    state["job"]["lease_expires_at"] = expires_at
+    state["lease"]["expires_at"] = expires_at
+    deadline["artifact_deadline_at"] = expires_at
+    progress = _progress(state)
+    original_fetchrow = connection.fetchrow
+
+    async def profile_lock_wait(query: str, *args):
+        result = await original_fetchrow(query, *args)
+        if "from gods_mlops_resource_profiles" in " ".join(query.split()).lower():
+            # Model the later FOR SHARE wait finishing after both authorities expire.
+            state["now"] = expires_at + timedelta(seconds=1)
+        return result
+
+    connection.fetchrow = profile_lock_wait
+
+    with pytest.raises((RuntimeError, TimeoutError)):
+        asyncio.run(
+            record(
+                repository,
+                job_id=_JOB_ID,
+                lease_token=_LEASE_TOKEN,
+                fencing_token=1,
+                arm_event_id=armed["arm_event_id"],
+                progress=progress,
+                owner=owner,
+                artifact_deadline=deadline,
+            )
+        )
+
+    assert [event["event_type"] for event in state["events"]] == ["evaluation_yield_armed"]
+    assert state["job"]["state"] == "running"
 
 
 @pytest.mark.parametrize(

@@ -1762,6 +1762,33 @@ class PostgresJobQueueRepository:
                 "training_probe_job_id": source.training_probe_job_id,
                 "training_source_checkpoint_sha256": source.checkpoint_sha256,
             }
+            publication_now = await connection.fetchval("SELECT clock_timestamp()")
+            current_lease_owner = (
+                lease["owner_pid"],
+                lease["owner_start_ticks"],
+                lease["owner_uid"],
+            )
+            current_job_owner = (
+                job["owner_pid"],
+                job["owner_start_ticks"],
+                job["owner_uid"],
+            )
+            if (
+                lease["expires_at"] <= publication_now
+                or job["lease_expires_at"] != lease["expires_at"]
+                or job["lease_expires_at"] <= publication_now
+                or current_lease_owner != bound_owner
+                or current_job_owner != bound_owner
+            ):
+                raise RuntimeError("evaluation progress lease or process owner expired before publication")
+            await self._assert_artifact_write_deadline(
+                connection,
+                job=job,
+                lease=lease,
+                database_now=publication_now,
+                expected_invocation_id=invocation_id,
+                expected_deadline_at=deadline_at,
+            )
             if progress_events or consumed_events:
                 if (
                     len(progress_events) != 1
@@ -1812,22 +1839,58 @@ class PostgresJobQueueRepository:
                 """UPDATE gods_mlops_jobs SET state='yield_requested',reason_code=$2,
                        reason_detail=$3::jsonb,retryable=TRUE,updated_at=now()
                    WHERE job_id=$1::uuid AND lease_token=$4::uuid
-                     AND lease_generation=$5 AND state='running'""",
+                     AND lease_generation=$5 AND state='running'
+                     AND lease_expires_at > clock_timestamp()
+                     AND $6::timestamptz > clock_timestamp()
+                     AND owner_pid=$8 AND owner_start_ticks=$9 AND owner_uid=$10
+                     AND EXISTS (
+                       SELECT 1 FROM gods_mlops_gpu_leases AS l
+                       WHERE l.job_id=$1::uuid AND l.lease_token=$4::uuid
+                         AND l.fencing_token=$5 AND l.expires_at > clock_timestamp()
+                         AND l.owner_pid=$8 AND l.owner_start_ticks=$9 AND l.owner_uid=$10
+                     )
+                     AND EXISTS (
+                       SELECT 1 FROM gods_mlops_worker_artifact_deadlines AS d
+                       WHERE d.job_id=$1::uuid AND d.fencing_token=$5
+                         AND d.lease_token=$4::uuid AND d.controller_invocation_id=$7::uuid
+                         AND d.artifact_deadline_at=$6::timestamptz
+                         AND d.artifact_deadline_at > clock_timestamp()
+                     )""",
                 job_id,
                 reason,
                 _canonical_json(reason_detail),
                 lease_token,
                 fencing_token,
+                deadline_at,
+                invocation_id,
+                owner.pid,
+                owner.start_ticks,
+                owner.uid,
             )
             if updated != "UPDATE 1":
                 raise RuntimeError("evaluation progress lost its running job fence")
             updated_lease = await connection.execute(
                 """UPDATE gods_mlops_gpu_leases SET yield_reason=$2
-                   WHERE job_id=$1::uuid AND lease_token=$3::uuid AND fencing_token=$4""",
+                   WHERE job_id=$1::uuid AND lease_token=$3::uuid AND fencing_token=$4
+                     AND expires_at > clock_timestamp()
+                     AND $5::timestamptz > clock_timestamp()
+                     AND owner_pid=$7 AND owner_start_ticks=$8 AND owner_uid=$9
+                     AND EXISTS (
+                       SELECT 1 FROM gods_mlops_worker_artifact_deadlines AS d
+                       WHERE d.job_id=$1::uuid AND d.fencing_token=$4
+                         AND d.lease_token=$3::uuid AND d.controller_invocation_id=$6::uuid
+                         AND d.artifact_deadline_at=$5::timestamptz
+                         AND d.artifact_deadline_at > clock_timestamp()
+                     )""",
                 job_id,
                 reason,
                 lease_token,
                 fencing_token,
+                deadline_at,
+                invocation_id,
+                owner.pid,
+                owner.start_ticks,
+                owner.uid,
             )
             if updated_lease != "UPDATE 1":
                 raise RuntimeError("evaluation progress lost its active lease fence")
@@ -1844,13 +1907,38 @@ class PostgresJobQueueRepository:
             yield_event_id = await connection.fetchval(
                 """INSERT INTO gods_mlops_job_events (
                        job_id,event_type,state,reason_code,fencing_token,details
-                   ) VALUES ($1::uuid,'yield_requested','yield_requested',$2,$3,$4::jsonb)
+                   ) SELECT $1::uuid,'yield_requested','yield_requested',$2,$3,$4::jsonb
+                   WHERE EXISTS (
+                       SELECT 1
+                       FROM gods_mlops_jobs AS j
+                       JOIN gods_mlops_gpu_leases AS l ON l.job_id=j.job_id
+                       JOIN gods_mlops_worker_artifact_deadlines AS d
+                         ON d.job_id=j.job_id AND d.fencing_token=$3
+                       WHERE j.job_id=$1::uuid AND j.state='yield_requested'
+                         AND j.lease_token=$5::uuid AND l.lease_token=$5::uuid
+                         AND j.lease_generation=$3 AND l.fencing_token=$3
+                         AND j.owner_pid=$8 AND j.owner_start_ticks=$9 AND j.owner_uid=$10
+                         AND l.owner_pid=$8 AND l.owner_start_ticks=$9 AND l.owner_uid=$10
+                         AND j.lease_expires_at > clock_timestamp()
+                         AND l.expires_at > clock_timestamp()
+                         AND d.lease_token=$5::uuid AND d.controller_invocation_id=$6::uuid
+                         AND d.artifact_deadline_at=$7::timestamptz
+                         AND d.artifact_deadline_at > clock_timestamp()
+                   )
                    RETURNING event_id""",
                 job_id,
                 reason,
                 fencing_token,
                 _canonical_json(yield_event_details),
+                lease_token,
+                invocation_id,
+                deadline_at,
+                owner.pid,
+                owner.start_ticks,
+                owner.uid,
             )
+            if yield_event_id is None:
+                raise RuntimeError("evaluation progress authority expired before yield publication")
             return {
                 "status": "yield_requested",
                 "arm_event_id": arm_event_id,

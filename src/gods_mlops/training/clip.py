@@ -693,6 +693,7 @@ def _run_clip_evaluation(
                 progress_callback(
                     phase=phase,
                     target_phase="evaluation",
+                    model_kind="clip",
                     stage=stage,
                     next_index=position,
                     total_items=size,
