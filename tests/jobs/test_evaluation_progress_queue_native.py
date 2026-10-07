@@ -497,7 +497,9 @@ async def _grant_first_fence(
             token,
             expires_at,
         )
-    await repository.bind_process(job_id, token, owner)
+    process_bound = await repository.bind_lease_process(job_id, token, owner)
+    if not process_bound:
+        _safe_identity_error("native fixture process binding failed")
     deadline = await repository.bind_worker_artifact_deadline(
         job_id=job_id,
         lease_token=token,
@@ -891,7 +893,7 @@ def test_native_diagnostic_wrapper_off_preserves_original_cleanup_exception_sema
     assert request.node.user_properties == []
 
 
-def test_native_schema_initializer_uses_repository_public_api() -> None:
+def test_native_fixture_uses_supported_queue_and_repository_apis() -> None:
     tree = ast.parse(TEST_FILE.read_text(encoding="utf-8"))
     awaited_calls = [
         node.value.func
@@ -909,7 +911,20 @@ def test_native_schema_initializer_uses_repository_public_api() -> None:
         call.value.id == "queue" and call.attr == "ensure_schema"
         for call in awaited_calls
     )
+    repository_binding = any(
+        call.value.id == "repository" and call.attr == "bind_lease_process"
+        for call in awaited_calls
+    )
+    invalid_repository_binding = any(
+        call.value.id == "repository" and call.attr == "bind_process"
+        for call in awaited_calls
+    )
     assert callable(getattr(PostgresJobQueueRepository, "ensure_schema", None))
+    assert callable(getattr(PostgresJobQueueRepository, "bind_lease_process", None))
+    assert not hasattr(PostgresJobQueueRepository, "bind_process")
     assert not hasattr(JobQueue, "ensure_schema")
+    assert callable(getattr(JobQueue, "bind_process", None))
     assert repository_initializer
     assert not queue_initializer
+    assert repository_binding
+    assert not invalid_repository_binding
