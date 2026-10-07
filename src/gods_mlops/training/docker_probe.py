@@ -931,6 +931,7 @@ async def _monitor_docker_worker(
         if current.get("state") in {"completed", "failed", "cancelled"} and (
             active is None or active.get("job_id") != job_id
         ):
+            await queue.settle_released_terminal_artifact_reservations()
             if current.get("state") != "completed":
                 raise DockerProbeError(f"real-model probe ended in state {current.get('state')}")
             if any((owner.pid, owner.start_ticks) == (proc.pid, proc.start_ticks)

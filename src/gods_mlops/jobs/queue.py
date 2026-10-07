@@ -46,6 +46,12 @@ _OPERATOR_QUEUE_STATES = (
 )
 _MAX_OPERATOR_RETRY_INTENT_GENERATIONS = 4096
 _ACTIVE_ARTIFACT_WRITER_WATCHERS: set[asyncio.Task] = set()
+_TRANSIENT_RESERVATION_ERRORS = (
+    asyncpg.PostgresConnectionError,
+    ConnectionError,
+    OSError,
+    TimeoutError,
+)
 
 
 class DatasetNotReadyForTrainingError(ValueError):
@@ -4150,6 +4156,40 @@ class PostgresJobQueueRepository:
                 )
                 return details
 
+    async def list_released_terminal_artifact_reservations(self) -> list[str]:
+        """Find only terminal, unleased reservations with durable release proof."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            rows = await connection.fetch(
+                """SELECT job.job_id
+                   FROM gods_mlops_jobs AS job
+                   JOIN gods_mlops_artifact_reservations AS reservation USING (job_id)
+                   WHERE job.state = ANY($1::text[])
+                     AND reservation.state = 'reserved'
+                     AND job.lease_token IS NULL
+                     AND job.lease_expires_at IS NULL
+                     AND job.owner_pid IS NULL
+                     AND job.owner_start_ticks IS NULL
+                     AND job.owner_uid IS NULL
+                     AND NOT EXISTS (
+                       SELECT 1 FROM gods_mlops_gpu_leases AS lease
+                       WHERE lease.job_id = job.job_id
+                     )
+                     AND (
+                       COALESCE(job.lease_generation, 0) = 0
+                       OR EXISTS (
+                         SELECT 1 FROM gods_mlops_job_events AS event
+                         WHERE event.job_id = job.job_id
+                           AND event.event_type = 'lease_owner_released'
+                           AND event.fencing_token = job.lease_generation
+                       )
+                     )
+                   ORDER BY job.updated_at ASC, job.job_id ASC""",
+                ["completed", "failed", "cancelled"],
+            )
+        return [str(row["job_id"]) for row in rows]
+
     async def settle_artifact_reservation(self, job_id: str) -> dict[str, Any] | None:
         """Settle a terminal probe/failure reservation once and release unused global quota."""
         await self.ensure_schema()
@@ -4193,7 +4233,9 @@ class PostgresJobQueueRepository:
                 if _unmatched_artifact_writers(
                     [(row["event_type"], _json_value(row["details"])) for row in writer_rows]
                 ):
-                    raise ValueError("artifact reservation cannot settle while an object writer is active or unknown")
+                    # Keep the quota charged until a later monitor pass can prove
+                    # that every durable writer attempt has become quiescent.
+                    return _job_dict(job)
                 if usage["used_bytes"] < reservation["reserved_bytes"]:
                     raise RuntimeError("shared object-storage ledger is below the active reservation")
                 used_after = usage["used_bytes"] - reservation["reserved_bytes"] + reservation["consumed_bytes"]
@@ -5483,6 +5525,29 @@ class JobQueue:
 
     async def settle_artifact_reservation(self, job_id: str) -> dict[str, Any] | None:
         return await self._repository.settle_artifact_reservation(job_id)
+
+    async def settle_released_terminal_artifact_reservations(self) -> dict[str, int]:
+        """Retry only terminal reservations whose GPU lease release is durable."""
+        try:
+            job_ids = await self._repository.list_released_terminal_artifact_reservations()
+        except _TRANSIENT_RESERVATION_ERRORS:
+            return {"examined": 0, "settled": 0, "deferred": 1}
+
+        settled = 0
+        deferred = 0
+        for job_id in job_ids:
+            try:
+                await self._repository.settle_artifact_reservation(job_id)
+                reservation = await self._repository.artifact_reservation_for(job_id)
+            except _TRANSIENT_RESERVATION_ERRORS:
+                deferred += 1
+                continue
+            if reservation is not None and reservation.get("state") == "settled":
+                settled += 1
+            else:
+                # Missing or active-writer rows remain charged and discoverable.
+                deferred += 1
+        return {"examined": len(job_ids), "settled": settled, "deferred": deferred}
 
     async def load_checkpoint(self, *, store, job_id: str):
         """Load only the current DB-committed checkpoint for this immutable job identity."""

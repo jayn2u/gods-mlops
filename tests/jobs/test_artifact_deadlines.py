@@ -1469,3 +1469,151 @@ def test_terminal_reservation_settlement_defers_while_worker_lease_is_retained()
         assert not any("state='settled'" in query for query in writes)
 
     asyncio.run(exercise())
+
+
+def test_terminal_reservation_settlement_defers_without_refund_while_writer_is_unmatched() -> None:
+    import json
+
+    from gods_mlops.jobs.queue import PostgresJobQueueRepository
+
+    async def exercise() -> None:
+        job_id = "bbbbbbbb-2222-4333-8444-555555555555"
+        writes: list[str] = []
+
+        class Connection:
+            def transaction(self):
+                return self
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def fetchrow(self, query, *_args):
+                if "ingestion_storage_usage" in query:
+                    return {"used_bytes": 100}
+                if "gods_mlops_jobs" in query:
+                    return {"job_id": job_id, "state": "failed"}
+                if "gods_mlops_artifact_reservations" in query:
+                    return {
+                        "job_id": job_id,
+                        "state": "reserved",
+                        "reserved_bytes": 100,
+                        "consumed_bytes": 10,
+                    }
+                return None
+
+            async def fetchval(self, query, *_args):
+                if "gods_mlops_gpu_leases" in query:
+                    return False
+                return False
+
+            async def fetch(self, query, *_args):
+                if "artifact_write_started" in query:
+                    return [{
+                        "event_type": "artifact_write_started",
+                        "details": json.dumps({
+                            "operation_id": "checkpoint-operation",
+                            "writer_attempt_id": "cccccccc-3333-4444-8555-666666666666",
+                        }),
+                    }]
+                return []
+
+            async def execute(self, query, *_args):
+                writes.append(query)
+
+        connection = Connection()
+
+        class Pool:
+            def acquire(self):
+                return connection
+
+        class Repository(PostgresJobQueueRepository):
+            async def ensure_schema(self):
+                return None
+
+            async def _get_pool(self):
+                return Pool()
+
+        repository = Repository(database_url="postgresql://unused")
+
+        result = await repository.settle_artifact_reservation(job_id)
+
+        assert result["state"] == "failed"
+        assert writes == []
+
+    asyncio.run(exercise())
+
+
+def test_released_terminal_reservation_sweep_retries_transient_and_writer_deferrals() -> None:
+    from gods_mlops.jobs.queue import JobQueue
+
+    async def exercise() -> None:
+        job_id = "dddddddd-4444-4555-8666-777777777777"
+
+        class Repository:
+            def __init__(self) -> None:
+                self.state = "reserved"
+                self.writer_unmatched = True
+                self.fail_next_settlement = True
+
+            async def list_released_terminal_artifact_reservations(self, **_kwargs):
+                return [job_id] if self.state == "reserved" else []
+
+            async def settle_artifact_reservation(self, requested_job_id):
+                assert requested_job_id == job_id
+                if self.fail_next_settlement:
+                    self.fail_next_settlement = False
+                    raise ConnectionError("temporary database disconnect")
+                if not self.writer_unmatched:
+                    self.state = "settled"
+                return {"job_id": job_id, "state": "failed"}
+
+            async def artifact_reservation_for(self, requested_job_id):
+                assert requested_job_id == job_id
+                return {"job_id": job_id, "state": self.state}
+
+        repository = Repository()
+        queue = JobQueue(repository=repository, sources=object())
+        reconcile = getattr(queue, "settle_released_terminal_artifact_reservations", None)
+        assert callable(reconcile), "queue must expose a durable terminal-reservation reconciliation seam"
+
+        failed_attempt = await reconcile()
+        assert failed_attempt == {"examined": 1, "settled": 0, "deferred": 1}
+        assert repository.state == "reserved"
+
+        writer_deferred = await reconcile()
+        assert writer_deferred == {"examined": 1, "settled": 0, "deferred": 1}
+        assert repository.state == "reserved"
+
+        repository.writer_unmatched = False
+        quiescent = await reconcile()
+        assert quiescent == {"examined": 1, "settled": 1, "deferred": 0}
+        assert repository.state == "settled"
+
+        repeated = await reconcile()
+        assert repeated == {"examined": 0, "settled": 0, "deferred": 0}
+
+    asyncio.run(exercise())
+
+
+def test_released_terminal_reservation_sweep_surfaces_source_invariant_errors() -> None:
+    from gods_mlops.jobs.queue import JobQueue
+
+    async def exercise() -> None:
+        class Repository:
+            async def list_released_terminal_artifact_reservations(self, **_kwargs):
+                return ["eeeeeeee-5555-4666-8777-888888888888"]
+
+            async def settle_artifact_reservation(self, _job_id):
+                raise ValueError("only terminal jobs can settle their artifact reservation")
+
+        queue = JobQueue(repository=Repository(), sources=object())
+        reconcile = getattr(queue, "settle_released_terminal_artifact_reservations", None)
+        assert callable(reconcile), "queue must expose a durable terminal-reservation reconciliation seam"
+
+        with pytest.raises(ValueError, match="only terminal jobs"):
+            await reconcile()
+
+    asyncio.run(exercise())

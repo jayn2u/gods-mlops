@@ -434,6 +434,7 @@ def test_delayed_worker_with_old_database_fence_cannot_start_after_recovery(
         released = await monitor.observe(_observation(now[0]))
         assert released["state"] == "waiting_gpu"
         assert await repository.get_active_lease(GPU_UUID) is None
+        assert job_id not in await repository.list_released_terminal_artifact_reservations()
 
         for offset in range(40, 71, 5):
             now[0] = base_time + timedelta(seconds=offset)
@@ -1294,7 +1295,7 @@ def test_s3_round1_pending_prune_recreation_gets_a_fresh_charge(task7_database_u
 
 
 def test_file_checkpoint_replacements_account_only_retained_bytes_and_keep_replacing(
-    task7_database_url: str, tmp_path: Path
+    task7_database_url: str, tmp_path: Path, monkeypatch
 ) -> None:
     async def exercise() -> None:
         from gods_mlops.jobs.checkpoints import FileCheckpointStore
@@ -1349,6 +1350,7 @@ def test_file_checkpoint_replacements_account_only_retained_bytes_and_keep_repla
         await _admit_probe(queue, admission, job_id, now)
         lease = await repository.get_active_lease(GPU_UUID)
         assert await queue.bind_process(job_id, lease["lease_token"], OWNER)
+        assert await repository.list_released_terminal_artifact_reservations() == []
         identity = await repository.checkpoint_identity(job_id)
         store = FileCheckpointStore(root=tmp_path)
         checkpoint_directory = tmp_path / job_id
@@ -1370,46 +1372,187 @@ def test_file_checkpoint_replacements_account_only_retained_bytes_and_keep_repla
             assert len(list(checkpoint_directory.glob("*.json"))) == 1
         assert latest is not None
 
-        measured = await queue.record_probe_measurement(
+        writer_operation_id = str(uuid4())
+        writer_attempt_id = str(uuid4())
+        async with repository._pool.acquire() as connection:
+            await connection.execute(
+                """INSERT INTO gods_mlops_job_events(
+                       job_id,event_type,state,fencing_token,details
+                   ) VALUES($1::uuid,'artifact_write_started','running',$2,$3::jsonb)""",
+                job_id,
+                lease["fencing_token"],
+                json.dumps({
+                    "operation_id": writer_operation_id,
+                    "writer_attempt_id": writer_attempt_id,
+                    "lease_token": lease["lease_token"],
+                    "fencing_token": lease["fencing_token"],
+                }),
+            )
+
+        failed = await queue.record_probe_measurement(
             job_id=job_id,
             lease_token=lease["lease_token"],
-            exit_code=0,
-            peak_allocated_mib=2_000,
-            peak_reserved_mib=4_000,
-            optimizer_steps=3,
-            checkpoint_resumed=True,
-            checkpoint_sha256=latest.sha256,
+            exit_code=1,
+            peak_allocated_mib=None,
+            peak_reserved_mib=None,
+            optimizer_steps=0,
+            checkpoint_resumed=False,
+            checkpoint_sha256=None,
             inference_steps=0,
-            verification_details={"passed": True},
+            verification_details={"passed": False, "failure": "test_file_checkpoint_quota"},
         )
-        assert measured["result_state"] == "succeeded"
+        assert failed["result_state"] == "failed"
         retained_bytes = sum(path.stat().st_size for path in checkpoint_directory.iterdir())
         reservation = await repository.artifact_reservation_for(job_id)
         assert reservation["state"] == "reserved"
         assert reservation["consumed_bytes"] == retained_bytes
+        assert await repository.list_released_terminal_artifact_reservations() == []
+        async with repository._pool.acquire() as connection:
+            failure_event_before = await connection.fetchrow(
+                """SELECT event_id,reason_code,details FROM gods_mlops_job_events
+                   WHERE job_id=$1::uuid AND event_type='probe_measurement_failed'
+                   ORDER BY event_id DESC LIMIT 1""",
+                job_id,
+            )
+        original_settle = repository.settle_artifact_reservation
+        fail_next_settlement = True
+
+        async def fail_once(requested_job_id):
+            nonlocal fail_next_settlement
+            if fail_next_settlement:
+                fail_next_settlement = False
+                raise ConnectionError("temporary settlement connection failure")
+            return await original_settle(requested_job_id)
+
+        monkeypatch.setattr(repository, "settle_artifact_reservation", fail_once)
 
         monitor = GpuJobMonitor(repository=repository, queue=queue, admission=admission)
         now[0] += timedelta(seconds=5)
         still_owned = await monitor.observe(
             _observation(now[0], gpu=(OWNER,), processes=(OWNER,))
         )
-        assert still_owned["state"] == "completed"
+        assert still_owned["state"] == "failed"
         assert (await repository.get_active_lease(GPU_UUID))["lease_token"] == lease["lease_token"]
         assert (await repository.artifact_reservation_for(job_id))["state"] == "reserved"
 
         now[0] += timedelta(seconds=5)
         released = await monitor.observe(_observation(now[0]))
-        assert released["state"] == "completed"
+        assert released["state"] == "failed"
         assert await repository.get_active_lease(GPU_UUID) is None
+        assert fail_next_settlement is False
+        assert job_id in await repository.list_released_terminal_artifact_reservations()
+        reservation = await repository.artifact_reservation_for(job_id)
+        assert reservation["state"] == "reserved"
+
+        # A restarted monitor sees the durable released terminal reservation even
+        # though the live lease row is gone; the active writer still defers refund.
+        monitor_after_restart = GpuJobMonitor(
+            repository=repository,
+            queue=queue,
+            admission=admission,
+        )
+        now[0] += timedelta(seconds=5)
+        assert await monitor_after_restart.observe(_observation(now[0])) is None
+        assert (await repository.artifact_reservation_for(job_id))["state"] == "reserved"
+
+        await repository.record_artifact_writer_quiescent(
+            job_id=job_id,
+            operation_id=writer_operation_id,
+            writer_attempt_id=writer_attempt_id,
+        )
+        now[0] += timedelta(seconds=5)
+        assert await monitor_after_restart.observe(_observation(now[0])) is None
         reservation = await repository.artifact_reservation_for(job_id)
         assert reservation["state"] == "settled"
         assert reservation["consumed_bytes"] == retained_bytes
         assert await _storage_bytes(task7_database_url) == baseline + retained_bytes
+        assert await repository.list_released_terminal_artifact_reservations() == []
+        job_after_settlement = await queue.get(job_id)
+        assert job_after_settlement["state"] == "failed"
+        assert job_after_settlement["reason_code"] == failure_event_before["reason_code"]
+        async with repository._pool.acquire() as connection:
+            failure_event_after = await connection.fetchrow(
+                """SELECT event_id,reason_code,details FROM gods_mlops_job_events
+                   WHERE job_id=$1::uuid AND event_type='probe_measurement_failed'
+                   ORDER BY event_id DESC LIMIT 1""",
+                job_id,
+            )
+            release_count = await connection.fetchval(
+                """SELECT count(*) FROM gods_mlops_job_events
+                   WHERE job_id=$1::uuid AND event_type='lease_owner_released'""",
+                job_id,
+            )
+            settled_count = await connection.fetchval(
+                """SELECT count(*) FROM gods_mlops_job_events
+                   WHERE job_id=$1::uuid AND event_type='artifact_reservation_settled'""",
+                job_id,
+            )
+        assert failure_event_after == failure_event_before
+        assert release_count == 1
+        assert settled_count == 1
 
         settled_bytes = await _storage_bytes(task7_database_url)
         await queue.settle_artifact_reservation(job_id)
         assert (await repository.artifact_reservation_for(job_id))["state"] == "settled"
         assert await _storage_bytes(task7_database_url) == settled_bytes
+        await queue.close()
+        await repository.close()
+        await sources.close()
+
+    asyncio.run(exercise())
+
+
+def test_terminal_reservation_query_requires_release_evidence_after_a_worker_lease(
+    task7_database_url: str,
+) -> None:
+    async def exercise() -> None:
+        repository, queue, sources, admission, _version, _sample_id, job_id, now = await _training_run(
+            task7_database_url
+        )
+        base_time = now[0]
+        for offset in range(0, 31, 5):
+            now[0] = base_time + timedelta(seconds=offset)
+            await admission.admit(job_id, _observation(now[0]))
+
+        lease = await repository.get_active_lease(GPU_UUID)
+        assert lease is not None
+        assert lease["fencing_token"] > 0
+        assert await repository.list_released_terminal_artifact_reservations() == []
+
+        result = await queue.record_probe_measurement(
+            job_id=job_id,
+            lease_token=lease["lease_token"],
+            exit_code=1,
+            peak_allocated_mib=None,
+            peak_reserved_mib=None,
+            optimizer_steps=0,
+            checkpoint_resumed=False,
+            checkpoint_sha256=None,
+            inference_steps=0,
+            verification_details={"passed": False, "failure": "test_no_release_proof"},
+        )
+        assert result["result_state"] == "failed"
+        assert await repository.list_released_terminal_artifact_reservations() == []
+
+        async with repository._pool.acquire() as connection:
+            await connection.execute(
+                "DELETE FROM gods_mlops_gpu_leases WHERE job_id=$1::uuid",
+                job_id,
+            )
+            await connection.execute(
+                """UPDATE gods_mlops_jobs
+                   SET lease_token=NULL,lease_expires_at=NULL,owner_pid=NULL,
+                       owner_start_ticks=NULL,owner_uid=NULL
+                   WHERE job_id=$1::uuid""",
+                job_id,
+            )
+
+        failed_job = await queue.get(job_id)
+        assert failed_job["state"] == "failed"
+        assert failed_job["lease_generation"] == lease["fencing_token"]
+        assert await repository.get_active_lease(GPU_UUID) is None
+        assert await repository.list_released_terminal_artifact_reservations() == []
+        assert (await repository.artifact_reservation_for(job_id))["state"] == "reserved"
         await queue.close()
         await repository.close()
         await sources.close()

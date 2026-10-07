@@ -35,6 +35,7 @@ class GpuJobMonitor:
         except ValueError as error:
             lease = await self._repository.get_active_lease(self._admission.expected_gpu_uuid)
             if lease is None:
+                await self._queue.settle_released_terminal_artifact_reservations()
                 return None
             job = await self._queue.get(lease["job_id"])
             if job["state"] == "running":
@@ -47,6 +48,7 @@ class GpuJobMonitor:
 
         lease = await self._repository.get_active_lease(observation.gpu_uuid)
         if lease is None:
+            await self._queue.settle_released_terminal_artifact_reservations()
             return None
         job_id = lease["job_id"]
         source_reasons = await self._queue.training_source_block_reasons(job_id)
@@ -70,12 +72,14 @@ class GpuJobMonitor:
                     )
                 return await self._queue.get(job_id)
             if self._lease_expired(lease, observation) and await self._idle_window_ready(observation):
-                await self._repository.release_unbound_expired_lease(
+                released = await self._repository.release_unbound_expired_lease(
                     job_id=job_id,
                     lease_token=lease["lease_token"],
                     observation=observation,
                     terminal_reason=source_reason,
                 )
+                if released:
+                    await self._queue.settle_released_terminal_artifact_reservations()
             return await self._queue.get(job_id)
 
         owner_is_live = any(
@@ -126,7 +130,7 @@ class GpuJobMonitor:
         )
         job = await self._queue.get(job_id)
         if released and job["state"] in {"completed", "failed", "cancelled"}:
-            await self._queue.settle_artifact_reservation(job_id)
+            await self._queue.settle_released_terminal_artifact_reservations()
         return job
 
     async def run_once(self) -> dict | None:
@@ -141,6 +145,7 @@ class GpuJobMonitor:
     async def observe_failure(self) -> dict | None:
         lease = await self._repository.get_active_lease(self._admission.expected_gpu_uuid)
         if lease is None:
+            await self._queue.settle_released_terminal_artifact_reservations()
             return None
         job = await self._queue.get(lease["job_id"])
         if job["state"] == "running":

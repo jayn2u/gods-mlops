@@ -352,7 +352,9 @@ def test_terminal_probe_reservation_settles_only_after_monitor_proves_owner_exit
         class FakeQueue:
             def __init__(self, repository: FakeRepository) -> None:
                 self.repository = repository
-                self.settlement_calls = 0
+                self.reconciliation_calls = 0
+                self.direct_settlement_calls = 0
+                self.settlement_count = 0
                 self.reservation_state = "reserved"
 
             async def training_source_block_reasons(self, _job_id):
@@ -365,9 +367,16 @@ def test_terminal_probe_reservation_settles_only_after_monitor_proves_owner_exit
             async def settle_artifact_reservation(self, requested_job_id):
                 assert requested_job_id == job_id
                 assert self.repository.lease is None
-                self.settlement_calls += 1
+                self.direct_settlement_calls += 1
                 self.reservation_state = "settled"
                 return {"job_id": job_id, "state": "failed"}
+
+            async def settle_released_terminal_artifact_reservations(self):
+                self.reconciliation_calls += 1
+                if self.repository.lease is None and self.reservation_state == "reserved":
+                    self.settlement_count += 1
+                    self.reservation_state = "settled"
+                return {"examined": 1, "settled": self.settlement_count, "deferred": 0}
 
         repository = FakeRepository()
         queue = FakeQueue(repository)
@@ -376,23 +385,90 @@ def test_terminal_probe_reservation_settles_only_after_monitor_proves_owner_exit
         live = _observation(BASE_TIME, gpu=(OWNER,), processes=(OWNER,))
         assert (await monitor.observe(live))["state"] == "failed"
         assert repository.release_calls == 0
-        assert queue.settlement_calls == 0
+        assert queue.reconciliation_calls == 0
+        assert queue.direct_settlement_calls == 0
+        assert queue.settlement_count == 0
         assert queue.reservation_state == "reserved"
 
         exited = _observation(BASE_TIME + timedelta(seconds=5))
         assert (await monitor.observe(exited))["state"] == "failed"
         assert repository.release_calls == 1
-        assert queue.settlement_calls == 0
+        assert queue.direct_settlement_calls == 0
+        assert queue.settlement_count == 0
         assert queue.reservation_state == "reserved"
 
         repository.release_allowed = True
         assert (await monitor.observe(exited))["state"] == "failed"
         assert repository.release_calls == 2
-        assert queue.settlement_calls == 1
+        assert queue.reconciliation_calls == 1
+        assert queue.direct_settlement_calls == 0
+        assert queue.settlement_count == 1
         assert queue.reservation_state == "settled"
 
         assert await monitor.observe(exited) is None
-        assert queue.settlement_calls == 1
+        assert queue.reconciliation_calls == 2
+        assert queue.settlement_count == 1
+
+    asyncio.run(exercise())
+
+
+def test_monitor_reconciles_released_terminal_reservations_without_an_active_lease() -> None:
+    async def exercise() -> None:
+        class Admission:
+            expected_gpu_uuid = GPU_UUID
+
+            async def record_observation(self, value):
+                observation = value if isinstance(value, ResourceObservation) else ResourceObservation.from_dict(value)
+                return observation, {}
+
+        class Repository:
+            async def get_active_lease(self, gpu_uuid):
+                assert gpu_uuid == GPU_UUID
+                return None
+
+        class Queue:
+            def __init__(self) -> None:
+                self.reconciliation_calls = 0
+
+            async def settle_released_terminal_artifact_reservations(self):
+                self.reconciliation_calls += 1
+                return {"examined": 1, "settled": 1, "deferred": 0}
+
+        queue = Queue()
+        monitor = GpuJobMonitor(repository=Repository(), queue=queue, admission=Admission())
+
+        assert await monitor.observe(_observation(BASE_TIME)) is None
+        assert queue.reconciliation_calls == 1
+
+    asyncio.run(exercise())
+
+
+def test_monitor_reconciles_released_terminal_reservations_after_observer_failure() -> None:
+    async def exercise() -> None:
+        class Admission:
+            expected_gpu_uuid = GPU_UUID
+
+            async def observe_once(self):
+                raise ValueError("observer unavailable")
+
+        class Repository:
+            async def get_active_lease(self, gpu_uuid):
+                assert gpu_uuid == GPU_UUID
+                return None
+
+        class Queue:
+            def __init__(self) -> None:
+                self.reconciliation_calls = 0
+
+            async def settle_released_terminal_artifact_reservations(self):
+                self.reconciliation_calls += 1
+                return {"examined": 1, "settled": 1, "deferred": 0}
+
+        queue = Queue()
+        monitor = GpuJobMonitor(repository=Repository(), queue=queue, admission=Admission())
+
+        assert await monitor.run_once() is None
+        assert queue.reconciliation_calls == 1
 
     asyncio.run(exercise())
 
