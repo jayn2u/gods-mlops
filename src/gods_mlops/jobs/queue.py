@@ -6,6 +6,7 @@ import asyncio
 import json
 import posixpath
 import re
+from copy import deepcopy
 from datetime import UTC, datetime
 from hashlib import sha256
 from typing import Any
@@ -1351,9 +1352,21 @@ class PostgresJobQueueRepository:
                 )
                 return True
 
-    async def request_yield(self, job_id: str, reason: str) -> dict[str, Any]:
+    async def request_yield(
+        self,
+        job_id: str,
+        reason: str,
+        *,
+        after_progress: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if not reason.strip() or len(reason) > 128:
             raise ValueError("yield reason must contain 1 to 128 characters")
+        if after_progress is not None:
+            return await self._arm_evaluation_progress_yield(
+                job_id,
+                reason,
+                after_progress=after_progress,
+            )
         await self.ensure_schema()
         pool = await self._get_pool()
         async with pool.acquire() as connection:
@@ -1400,6 +1413,479 @@ class PostgresJobQueueRepository:
                     _canonical_json({"action": "checkpoint_and_exit_own_process"}),
                 )
         return await self.get_job(job_id)
+
+    async def _arm_evaluation_progress_yield(
+        self,
+        job_id: str,
+        reason: str,
+        *,
+        after_progress: dict[str, Any],
+    ) -> dict[str, Any]:
+        target = _normalize_evaluation_progress_target(after_progress)
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection, connection.transaction():
+            job = await connection.fetchrow(
+                "SELECT * FROM gods_mlops_jobs WHERE job_id=$1::uuid FOR UPDATE",
+                job_id,
+            )
+            if job is None:
+                raise KeyError(f"GPU job {job_id} does not exist")
+            # Preserve the queue-wide job-before-lease order. For a queued
+            # first attempt this proves that no lease was already created.
+            lease = await connection.fetchrow(
+                "SELECT * FROM gods_mlops_gpu_leases WHERE job_id=$1::uuid FOR UPDATE",
+                job_id,
+            )
+            database_now = await connection.fetchval("SELECT clock_timestamp()")
+            profile = await self._evaluation_progress_profile(connection, job)
+            details = await _evaluation_progress_arm_details(
+                connection,
+                job,
+                profile,
+                reason=reason,
+                target=target,
+            )
+            events = await connection.fetch(
+                """SELECT event_id,event_type,state,fencing_token,details
+                   FROM gods_mlops_job_events WHERE job_id=$1::uuid ORDER BY event_id""",
+                job_id,
+            )
+            arms = [row for row in events if row["event_type"] == "evaluation_yield_armed"]
+            request_id = details["request_id"]
+            matching_arm = next(
+                (
+                    row
+                    for row in arms
+                    if _json_value(row["details"]).get("request_id") == request_id
+                ),
+                None,
+            )
+            if matching_arm is not None:
+                if _canonical_json(_json_value(matching_arm["details"])) != _canonical_json(details):
+                    raise RuntimeError("evaluation yield request identity conflicts with its retained arm")
+                arm_event_id = int(matching_arm["event_id"])
+                consumed = any(
+                    row["event_type"] == "yield_requested"
+                    and _json_value(row["details"]).get("arm_event_id") == arm_event_id
+                    and int(row["fencing_token"] or 0) == int(details["expected_lease_generation"])
+                    for row in events
+                )
+                return _evaluation_progress_arm_result(
+                    arm_event_id=arm_event_id,
+                    details=details,
+                    job=job,
+                    lease=lease,
+                    consumed=consumed,
+                )
+            if arms:
+                raise RuntimeError("evaluation progress yield request conflicts with a retained arm")
+            submitted_after = datetime.fromisoformat(target["submitted_after"])
+            if (
+                job["state"] != "queued"
+                or int(job["lease_generation"]) != 0
+                or job["lease_token"] is not None
+                or job["lease_expires_at"] is not None
+                or lease is not None
+                or job["created_at"] <= submitted_after
+                or submitted_after >= database_now
+            ):
+                raise RuntimeError("evaluation yield arm requires this new unleased generation-zero job")
+            arm_event_id = await connection.fetchval(
+                """INSERT INTO gods_mlops_job_events (
+                       job_id,event_type,state,reason_code,fencing_token,details
+                   ) VALUES ($1::uuid,'evaluation_yield_armed','queued',$2,NULL,$3::jsonb)
+                   RETURNING event_id""",
+                job_id,
+                reason,
+                _canonical_json(details),
+            )
+            return _evaluation_progress_arm_result(
+                arm_event_id=int(arm_event_id),
+                details=details,
+                job=job,
+                lease=None,
+                consumed=False,
+            )
+
+    async def pending_evaluation_progress_yield(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        fencing_token: int,
+        input_sha256: str,
+        config_sha256: str,
+        training_source_checkpoint_sha256: str,
+    ) -> dict[str, Any] | None:
+        """Read a matching first-generation arm without reading checkpoint payloads."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection, connection.transaction(readonly=True):
+            job = await connection.fetchrow(
+                "SELECT * FROM gods_mlops_jobs WHERE job_id=$1::uuid",
+                job_id,
+            )
+            if (
+                job is None
+                or job["state"] != "running"
+                or str(job["lease_token"]) != str(lease_token)
+                or int(job["lease_generation"]) != fencing_token
+                or int(fencing_token) != 1
+                or str(job["input_sha256"]).strip() != input_sha256
+                or str(job["config_sha256"]).strip() != config_sha256
+            ):
+                return None
+            lease = await connection.fetchrow(
+                """SELECT * FROM gods_mlops_gpu_leases
+                   WHERE job_id=$1::uuid AND lease_token=$2::uuid""",
+                job_id,
+                lease_token,
+            )
+            database_now = await connection.fetchval("SELECT clock_timestamp()")
+            if (
+                lease is None
+                or int(lease["fencing_token"]) != fencing_token
+                or lease["expires_at"] <= database_now
+                or job["lease_expires_at"] != lease["expires_at"]
+            ):
+                return None
+            profile = await self._evaluation_progress_profile(connection, job)
+            source = _evaluation_progress_probe_input(job, profile)
+            if source.evaluation_checkpoint_source is None or (
+                source.evaluation_checkpoint_source.checkpoint_sha256
+                != training_source_checkpoint_sha256
+            ):
+                raise RuntimeError("evaluation progress arm training checkpoint source changed")
+            events = await connection.fetch(
+                """SELECT event_id,event_type,state,fencing_token,details
+                   FROM gods_mlops_job_events WHERE job_id=$1::uuid ORDER BY event_id""",
+                job_id,
+            )
+            arms = [row for row in events if row["event_type"] == "evaluation_yield_armed"]
+            matching = []
+            for arm in arms:
+                details = _json_value(arm["details"])
+                if (
+                    int(details.get("expected_lease_generation", 0)) == fencing_token
+                    and details.get("input_sha256") == input_sha256
+                    and details.get("config_sha256") == config_sha256
+                    and details.get("training_source_checkpoint_sha256")
+                    == training_source_checkpoint_sha256
+                ):
+                    matching.append((arm, details))
+            if len(matching) > 1:
+                raise RuntimeError("multiple evaluation progress arms target the same first lease")
+            if not matching:
+                return None
+            arm, details = matching[0]
+            arm_event_id = int(arm["event_id"])
+            if _evaluation_progress_arm_consumed(events, arm_event_id, fencing_token):
+                return None
+            identity = await _evaluation_progress_arm_details(
+                connection,
+                job,
+                profile,
+                reason=str(details.get("reason", "")),
+                target=details.get("target", {}),
+            )
+            if _canonical_json(identity) != _canonical_json(details):
+                raise RuntimeError("evaluation progress arm no longer matches immutable job identity")
+            return {
+                "arm_event_id": arm_event_id,
+                "request_id": str(details["request_id"]),
+                "expected_lease_generation": fencing_token,
+                "target": deepcopy(details["target"]),
+                "training_probe_job_id": source.evaluation_checkpoint_source.training_probe_job_id,
+                "training_source_checkpoint_sha256": source.evaluation_checkpoint_source.checkpoint_sha256,
+            }
+
+    async def record_evaluation_progress(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        fencing_token: int,
+        arm_event_id: int,
+        progress: dict[str, Any],
+        owner: ProcessIdentity,
+        artifact_deadline: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Atomically publish a fenced batch boundary and consume its exact arm."""
+        if not isinstance(owner, ProcessIdentity):
+            raise TypeError("evaluation progress requires the bound worker process identity")
+        if artifact_deadline is None:
+            raise ValueError("evaluation progress requires the existing worker artifact deadline authority")
+        progress_value = _normalize_evaluation_progress(progress)
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection, connection.transaction():
+            job, lease = await self._lock_job_then_lease(
+                connection,
+                job_id=job_id,
+                lease_token=lease_token,
+            )
+            database_now = await connection.fetchval("SELECT clock_timestamp()")
+            if (
+                job is None
+                or lease is None
+                or str(job["lease_token"]) != str(lease_token)
+                or str(lease["lease_token"]) != str(lease_token)
+                or int(job["lease_generation"]) != fencing_token
+                or int(lease["fencing_token"]) != fencing_token
+                or fencing_token != 1
+                or job["state"] not in {"running", "yield_requested"}
+                or lease["expires_at"] <= database_now
+                or job["lease_expires_at"] != lease["expires_at"]
+                or job["lease_expires_at"] <= database_now
+            ):
+                raise RuntimeError("evaluation progress does not own the current unexpired job-then-lease fence")
+            bound_owner = (
+                owner.pid,
+                owner.start_ticks,
+                owner.uid,
+            )
+            lease_owner = (
+                lease["owner_pid"],
+                lease["owner_start_ticks"],
+                lease["owner_uid"],
+            )
+            job_owner = (
+                job["owner_pid"],
+                job["owner_start_ticks"],
+                job["owner_uid"],
+            )
+            if (
+                owner.pid <= 0
+                or owner.start_ticks <= 0
+                or owner.uid != 10001
+                or lease_owner != bound_owner
+                or job_owner != bound_owner
+            ):
+                raise RuntimeError("evaluation progress worker does not match the bound host owner")
+            invocation_id = artifact_deadline.get("controller_invocation_id")
+            deadline_at = artifact_deadline.get("artifact_deadline_at")
+            if (
+                str(artifact_deadline.get("job_id")) != job_id
+                or str(artifact_deadline.get("lease_token")) != lease_token
+                or int(artifact_deadline.get("fencing_token", -1)) != fencing_token
+                or not isinstance(invocation_id, str)
+                or not isinstance(deadline_at, datetime)
+            ):
+                raise ValueError("evaluation progress artifact deadline identity is incomplete")
+            await self._assert_artifact_write_deadline(
+                connection,
+                job=job,
+                lease=lease,
+                database_now=database_now,
+                expected_invocation_id=invocation_id,
+                expected_deadline_at=deadline_at,
+            )
+            profile = await self._evaluation_progress_profile(connection, job)
+            probe_input = _evaluation_progress_probe_input(job, profile)
+            source = probe_input.evaluation_checkpoint_source
+            if source is None:
+                raise RuntimeError("evaluation progress has no typed training checkpoint source")
+            events = await connection.fetch(
+                """SELECT event_id,event_type,state,fencing_token,details
+                   FROM gods_mlops_job_events WHERE job_id=$1::uuid ORDER BY event_id""",
+                job_id,
+            )
+            arm = next(
+                (
+                    row
+                    for row in events
+                    if row["event_type"] == "evaluation_yield_armed"
+                    and int(row["event_id"]) == arm_event_id
+                ),
+                None,
+            )
+            if arm is None:
+                raise RuntimeError("evaluation progress arm event is missing")
+            arm_details = _json_value(arm["details"])
+            expected_arm_details = await _evaluation_progress_arm_details(
+                connection,
+                job,
+                profile,
+                reason=str(arm_details.get("reason", "")),
+                target=arm_details.get("target", {}),
+            )
+            if (
+                _canonical_json(expected_arm_details) != _canonical_json(arm_details)
+                or int(arm_details.get("expected_lease_generation", 0)) != fencing_token
+                or _canonical_json(arm_details.get("source_identity"))
+                != _canonical_json(probe_input.as_dict())
+                or arm_details.get("input_sha256") != str(job["input_sha256"]).strip()
+                or arm_details.get("config_sha256") != str(job["config_sha256"]).strip()
+                or arm_details.get("training_source_checkpoint_sha256") != source.checkpoint_sha256
+                or arm_details.get("training_probe_job_id") != source.training_probe_job_id
+                or _canonical_json(progress_value)
+                != _canonical_json(
+                    {
+                        key: value
+                        for key, value in arm_details.get("target", {}).items()
+                        if key != "submitted_after"
+                    }
+                )
+            ):
+                raise RuntimeError("evaluation progress does not match its immutable armed boundary")
+            progress_identity = {
+                "request_id": arm_details["request_id"],
+                "arm_event_id": arm_event_id,
+                "job_id": job_id,
+                "expected_lease_generation": fencing_token,
+                "progress": progress_value,
+                "owner": owner.as_dict(),
+                "artifact_deadline": {
+                    "controller_invocation_id": invocation_id,
+                    "artifact_deadline_at": deadline_at.isoformat(),
+                },
+            }
+            progress_id = sha256(_canonical_json(progress_identity).encode("utf-8")).hexdigest()
+            progress_events = [
+                row
+                for row in events
+                if row["event_type"] == "evaluation_batch_completed"
+                and _json_value(row["details"]).get("progress_id") == progress_id
+            ]
+            consumed_events = [
+                row
+                for row in events
+                if row["event_type"] == "yield_requested"
+                and _json_value(row["details"]).get("arm_event_id") == arm_event_id
+            ]
+            expected_progress_details = progress_identity | {
+                "progress_id": progress_id,
+                "phase": "probe",
+                "target_phase": "evaluation",
+                "model_kind": "clip",
+                "training_probe_job_id": source.training_probe_job_id,
+                "training_source_checkpoint_sha256": source.checkpoint_sha256,
+            }
+            if progress_events or consumed_events:
+                if (
+                    len(progress_events) != 1
+                    or len(consumed_events) != 1
+                    or _canonical_json(_json_value(progress_events[0]["details"]))
+                    != _canonical_json(expected_progress_details)
+                    or int(progress_events[0]["fencing_token"] or 0) != fencing_token
+                    or _json_value(consumed_events[0]["details"]).get("progress_event_id")
+                    != int(progress_events[0]["event_id"])
+                    or _json_value(consumed_events[0]["details"]).get("progress_id") != progress_id
+                    or _json_value(consumed_events[0]["details"]).get("request_id")
+                    != arm_details["request_id"]
+                    or int(consumed_events[0]["fencing_token"] or 0) != fencing_token
+                    or job["state"] != "yield_requested"
+                ):
+                    raise RuntimeError("evaluation progress replay conflicts with its consumed yield marker")
+                return {
+                    "status": "yield_requested",
+                    "arm_event_id": arm_event_id,
+                    "progress_event_id": int(progress_events[0]["event_id"]),
+                    "yield_event_id": int(consumed_events[0]["event_id"]),
+                    "progress_id": progress_id,
+                    "idempotent_replay": True,
+                }
+            if job["state"] != "running":
+                raise RuntimeError("evaluation progress may only consume an armed running job")
+            progress_event_id = await connection.fetchval(
+                """INSERT INTO gods_mlops_job_events (
+                       job_id,event_type,state,reason_code,fencing_token,details
+                   ) VALUES ($1::uuid,'evaluation_batch_completed','running',NULL,$2,$3::jsonb)
+                   RETURNING event_id""",
+                job_id,
+                fencing_token,
+                _canonical_json(expected_progress_details),
+            )
+            reason = str(arm_details["reason"])
+            reason_detail = {
+                "reason": reason,
+                "action": "checkpoint_after_evaluation_batch",
+                "arm_event_id": arm_event_id,
+                "progress_event_id": int(progress_event_id),
+                "request_id": arm_details["request_id"],
+                "progress_id": progress_id,
+                "expected_lease_generation": fencing_token,
+                "progress": progress_value,
+            }
+            updated = await connection.execute(
+                """UPDATE gods_mlops_jobs SET state='yield_requested',reason_code=$2,
+                       reason_detail=$3::jsonb,retryable=TRUE,updated_at=now()
+                   WHERE job_id=$1::uuid AND lease_token=$4::uuid
+                     AND lease_generation=$5 AND state='running'""",
+                job_id,
+                reason,
+                _canonical_json(reason_detail),
+                lease_token,
+                fencing_token,
+            )
+            if updated != "UPDATE 1":
+                raise RuntimeError("evaluation progress lost its running job fence")
+            updated_lease = await connection.execute(
+                """UPDATE gods_mlops_gpu_leases SET yield_reason=$2
+                   WHERE job_id=$1::uuid AND lease_token=$3::uuid AND fencing_token=$4""",
+                job_id,
+                reason,
+                lease_token,
+                fencing_token,
+            )
+            if updated_lease != "UPDATE 1":
+                raise RuntimeError("evaluation progress lost its active lease fence")
+            yield_event_details = reason_detail | {
+                "action": "checkpoint_and_exit_own_process",
+                "phase": "probe",
+                "target_phase": "evaluation",
+                "model_kind": "clip",
+                "input_sha256": str(job["input_sha256"]).strip(),
+                "config_sha256": str(job["config_sha256"]).strip(),
+                "training_probe_job_id": source.training_probe_job_id,
+                "training_source_checkpoint_sha256": source.checkpoint_sha256,
+            }
+            yield_event_id = await connection.fetchval(
+                """INSERT INTO gods_mlops_job_events (
+                       job_id,event_type,state,reason_code,fencing_token,details
+                   ) VALUES ($1::uuid,'yield_requested','yield_requested',$2,$3,$4::jsonb)
+                   RETURNING event_id""",
+                job_id,
+                reason,
+                fencing_token,
+                _canonical_json(yield_event_details),
+            )
+            return {
+                "status": "yield_requested",
+                "arm_event_id": arm_event_id,
+                "progress_event_id": int(progress_event_id),
+                "yield_event_id": int(yield_event_id),
+                "progress_id": progress_id,
+                "idempotent_replay": False,
+            }
+
+    async def _evaluation_progress_profile(self, connection, job):
+        profile = await connection.fetchrow(
+            """SELECT phase,target_phase,model_kind,config_version,config_sha256,
+                      profile_state,config_json
+               FROM gods_mlops_resource_profiles
+               WHERE phase='probe' AND model_kind=$1 AND config_version=$2 FOR SHARE""",
+            job["model_kind"],
+            job["config_version"],
+        )
+        if profile is None:
+            raise RuntimeError("evaluation progress profile is unavailable")
+        config = _json_value(profile["config_json"])
+        if (
+            profile["phase"] != "probe"
+            or profile["target_phase"] != "evaluation"
+            or profile["model_kind"] != "clip"
+            or profile["config_version"] != job["config_version"]
+            or str(profile["config_sha256"]).strip() != str(job["config_sha256"]).strip()
+            or profile["profile_state"] != "candidate"
+            or not isinstance(config, dict)
+            or config.get("micro_batch") != 2
+            or config.get("evaluation_batch_size") != 2
+            or config.get("resolution") != 224
+        ):
+            raise RuntimeError("evaluation progress profile differs from the frozen CLIP fixture batch")
+        return {**dict(profile), "config_json": config}
 
     async def renew_lease(self, job_id: str, lease_token: str, *, now=None, lease_seconds: int = 15) -> bool:
         await self.ensure_schema()
@@ -5181,9 +5667,63 @@ class JobQueue:
     ) -> bool:
         return await self._repository.bind_lease_process(job_id, lease_token, owner)
 
-    async def request_yield(self, job_id: str, reason: str) -> None:
-        """Ask this job's own worker to checkpoint and exit; no process is signalled here."""
-        await self._repository.request_yield(job_id, reason)
+    async def request_yield(
+        self,
+        job_id: str,
+        reason: str,
+        *,
+        after_progress: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Ask the worker to yield now, or arm one exact CLIP evaluation boundary."""
+        if after_progress is None:
+            await self._repository.request_yield(job_id, reason)
+            return None
+        result = await self._repository.request_yield(
+            job_id,
+            reason,
+            after_progress=after_progress,
+        )
+        return result
+
+    async def pending_evaluation_progress_yield(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        fencing_token: int,
+        input_sha256: str,
+        config_sha256: str,
+        training_source_checkpoint_sha256: str,
+    ) -> dict[str, Any] | None:
+        return await self._repository.pending_evaluation_progress_yield(
+            job_id=job_id,
+            lease_token=lease_token,
+            fencing_token=fencing_token,
+            input_sha256=input_sha256,
+            config_sha256=config_sha256,
+            training_source_checkpoint_sha256=training_source_checkpoint_sha256,
+        )
+
+    async def record_evaluation_progress(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        fencing_token: int,
+        arm_event_id: int,
+        progress: dict[str, Any],
+        owner: ProcessIdentity,
+        artifact_deadline: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return await self._repository.record_evaluation_progress(
+            job_id=job_id,
+            lease_token=lease_token,
+            fencing_token=fencing_token,
+            arm_event_id=arm_event_id,
+            progress=progress,
+            owner=owner,
+            artifact_deadline=artifact_deadline,
+        )
 
     async def renew_lease(self, job_id: str, lease_token: str, *, now=None) -> bool:
         from gods_mlops.jobs.admission import GPU_LEASE_SECONDS
@@ -6339,6 +6879,219 @@ def _validate_digest(value: str, name: str) -> None:
 
 def _json_value(value: Any) -> Any:
     return json.loads(value) if isinstance(value, str) else value
+
+
+def _normalize_evaluation_progress_target(value: dict[str, Any]) -> dict[str, Any]:
+    expected = {
+        "phase",
+        "target_phase",
+        "model_kind",
+        "stage",
+        "next_index",
+        "total_items",
+        "completed_batch_count",
+        "input_sha256",
+        "config_sha256",
+        "training_probe_job_id",
+        "training_source_checkpoint_sha256",
+        "submitted_after",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("evaluation progress yield target fields are unsupported")
+    if (
+        value.get("phase") != "probe"
+        or value.get("target_phase") != "evaluation"
+        or value.get("model_kind") != "clip"
+        or value.get("stage") != "queries"
+        or type(value.get("next_index")) is not int
+        or value["next_index"] != 2
+        or type(value.get("total_items")) is not int
+        or value["total_items"] != 2
+        or type(value.get("completed_batch_count")) is not int
+        or value["completed_batch_count"] != 1
+    ):
+        raise ValueError("evaluation progress yield target must be the first complete CLIP query batch")
+    _validate_digest(str(value["input_sha256"]), "input_sha256")
+    _validate_digest(str(value["config_sha256"]), "config_sha256")
+    _validate_digest(str(value["training_source_checkpoint_sha256"]), "training source checkpoint SHA-256")
+    try:
+        training_job_id = str(UUID(value["training_probe_job_id"]))
+    except (TypeError, ValueError, AttributeError) as error:
+        raise ValueError("evaluation progress training-probe job ID is invalid") from error
+    if training_job_id != value["training_probe_job_id"]:
+        raise ValueError("evaluation progress training-probe job ID must be canonical")
+    submitted_after = value["submitted_after"]
+    if isinstance(submitted_after, str):
+        try:
+            submitted_after = datetime.fromisoformat(submitted_after)
+        except ValueError as error:
+            raise ValueError("evaluation progress submission time is invalid") from error
+    if (
+        not isinstance(submitted_after, datetime)
+        or submitted_after.tzinfo is None
+        or submitted_after.utcoffset() != UTC.utcoffset(None)
+    ):
+        raise ValueError("evaluation progress submission time must be timezone-aware UTC")
+    normalized = dict(value)
+    normalized["training_probe_job_id"] = training_job_id
+    normalized["submitted_after"] = submitted_after.astimezone(UTC).isoformat()
+    return normalized
+
+
+def _normalize_evaluation_progress(value: dict[str, Any]) -> dict[str, Any]:
+    expected = {
+        "phase",
+        "target_phase",
+        "model_kind",
+        "stage",
+        "next_index",
+        "total_items",
+        "completed_batch_count",
+        "input_sha256",
+        "config_sha256",
+        "training_probe_job_id",
+        "training_source_checkpoint_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("evaluation batch progress fields are unsupported")
+    if (
+        value.get("phase") != "probe"
+        or value.get("target_phase") != "evaluation"
+        or value.get("model_kind") != "clip"
+        or value.get("stage") != "queries"
+        or type(value.get("next_index")) is not int
+        or type(value.get("total_items")) is not int
+        or type(value.get("completed_batch_count")) is not int
+    ):
+        raise ValueError("evaluation batch progress identity is invalid")
+    normalized = _normalize_evaluation_progress_target(
+        {
+            **value,
+            "submitted_after": datetime(2000, 1, 1, tzinfo=UTC),
+        }
+    )
+    normalized.pop("submitted_after")
+    return normalized
+
+
+def _evaluation_progress_probe_input(job: Any, profile: Any) -> ProbeInput:
+    row = dict(job)
+    source_refs = _json_value(row.get("source_refs", {}))
+    if not isinstance(source_refs, dict):
+        raise TypeError("evaluation probe source references are unavailable")
+    try:
+        probe_input = ProbeInput.from_dict(source_refs)
+    except (TypeError, ValueError) as error:
+        raise ValueError("evaluation probe source references are invalid") from error
+    source = probe_input.evaluation_checkpoint_source
+    config = _json_value(profile.get("config_json"))
+    if (
+        row.get("phase") != "probe"
+        or row.get("target_phase") != "evaluation"
+        or row.get("model_kind") != "clip"
+        or row.get("input_kind") != "probe_input"
+        or row.get("dataset_version") is not None
+        or row.get("profile_state_snapshot") != "candidate"
+        or probe_input.target_phase != "evaluation"
+        or probe_input.model_kind != "clip"
+        or probe_input.probe_input_id != row.get("input_id")
+        or probe_input.config_version != row.get("config_version")
+        or probe_input.input_sha256 != str(row.get("input_sha256", "")).strip()
+        or source is None
+        or not isinstance(config, dict)
+        or source.model_kind != "clip"
+        or source.model_id != config.get("model_id")
+        or source.model_revision != config.get("model_revision")
+    ):
+        raise ValueError("evaluation probe typed source differs from its immutable job/profile identity")
+    from gods_mlops.training.contracts import locked_model
+
+    locked = locked_model("clip")
+    if source.model_id != locked.model_id or source.model_revision != locked.revision:
+        raise ValueError("evaluation probe typed source differs from the locked CLIP model")
+    return probe_input
+
+
+async def _evaluation_progress_arm_details(
+    connection: asyncpg.Connection,
+    job: Any,
+    profile: Any,
+    *,
+    reason: str,
+    target: dict[str, Any],
+) -> dict[str, Any]:
+    row = dict(job)
+    normalized_target = _normalize_evaluation_progress_target(target)
+    if (
+        normalized_target["input_sha256"] != str(row.get("input_sha256", "")).strip()
+        or normalized_target["config_sha256"] != str(row.get("config_sha256", "")).strip()
+    ):
+        raise ValueError("evaluation progress target differs from its job input/config")
+    probe_input = _evaluation_progress_probe_input(row, profile)
+    source = probe_input.evaluation_checkpoint_source
+    if source is None or (
+        normalized_target["training_probe_job_id"] != source.training_probe_job_id
+        or normalized_target["training_source_checkpoint_sha256"] != source.checkpoint_sha256
+    ):
+        raise ValueError("evaluation progress target differs from its typed training checkpoint source")
+    source_error = await _evaluation_probe_checkpoint_source_error(connection, row)
+    if source_error:
+        raise ValueError(source_error)
+    identity = {
+        "schema_version": 1,
+        "reason": reason,
+        "expected_lease_generation": 1,
+        "phase": "probe",
+        "target_phase": "evaluation",
+        "model_kind": "clip",
+        "job_id": str(row["job_id"]),
+        "input_id": str(row["input_id"]),
+        "input_sha256": str(row["input_sha256"]).strip(),
+        "config_version": str(row["config_version"]),
+        "config_sha256": str(row["config_sha256"]).strip(),
+        "source_identity": probe_input.as_dict(),
+        "training_probe_job_id": source.training_probe_job_id,
+        "training_source_checkpoint_sha256": source.checkpoint_sha256,
+        "target": normalized_target,
+    }
+    identity["request_id"] = sha256(_canonical_json(identity).encode("utf-8")).hexdigest()
+    return identity
+
+
+def _evaluation_progress_arm_consumed(events: list[Any], arm_event_id: int, fencing_token: int) -> bool:
+    return any(
+        row["event_type"] == "yield_requested"
+        and _json_value(row["details"]).get("arm_event_id") == arm_event_id
+        and int(row["fencing_token"] or 0) == fencing_token
+        for row in events
+    )
+
+
+def _evaluation_progress_arm_result(
+    *,
+    arm_event_id: int,
+    details: dict[str, Any],
+    job: Any,
+    lease: Any,
+    consumed: bool,
+) -> dict[str, Any]:
+    return {
+        "arm_event_id": arm_event_id,
+        "request_id": str(details["request_id"]),
+        "expected_lease_generation": int(details["expected_lease_generation"]),
+        "job_state": str(job["state"]),
+        "lease_generation": int(job["lease_generation"]),
+        "active_lease": lease is not None,
+        "consumed": consumed,
+        "pending_first_attempt": (
+            job["state"] == "queued"
+            and int(job["lease_generation"]) == 0
+            and job["lease_token"] is None
+            and lease is None
+            and not consumed
+        ),
+        "target": deepcopy(details["target"]),
+    }
 
 
 def _profile_dict(row: asyncpg.Record) -> dict[str, Any]:

@@ -14,7 +14,12 @@ from typing import Any
 
 from gods_mlops.datasets.manifest import canonical_json
 from gods_mlops.datasets.publish import DatasetPublisher
-from gods_mlops.jobs.models import EvaluationCheckpointSource, EvaluationProbeCheckpointSource, ProbeInput
+from gods_mlops.jobs.models import (
+    EvaluationCheckpointSource,
+    EvaluationProbeCheckpointSource,
+    ProbeInput,
+    ProcessIdentity,
+)
 from gods_mlops.jobs.queue import JobQueue, PostgresJobQueueRepository
 from gods_mlops.jobs.sources import DatasetSourceRegistry
 
@@ -72,6 +77,62 @@ def _artifact_operation_deadline(
     return monotonic_clock() + LEGACY_ARTIFACT_TIMEOUT_SECONDS
 
 
+def _current_worker_process_identity() -> ProcessIdentity:
+    """Read this host-PID-namespace worker's PID, start ticks, and effective UID."""
+    try:
+        stat_record = Path("/proc/self/stat").read_text(encoding="ascii")
+        end_name = stat_record.rfind(")")
+        fields = stat_record[end_name + 2 :].split() if end_name >= 0 else []
+        if len(fields) <= 19:
+            raise ValueError("process stat lacks a start time")
+        start_ticks = int(fields[19])
+    except (OSError, UnicodeError, ValueError) as error:
+        raise WorkerAuthorizationError("worker process identity is unavailable for evaluation progress") from error
+    if start_ticks <= 0 or os.getuid() != 10001:
+        raise WorkerAuthorizationError("worker process identity differs from the bound host owner")
+    return ProcessIdentity(pid=os.getpid(), start_ticks=start_ticks, uid=os.getuid())
+
+
+def _evaluation_progress_callback(
+    *,
+    queue: JobQueue,
+    claim: WorkerClaim,
+    armed_request: dict[str, Any] | None,
+    owner: ProcessIdentity | None,
+    artifact_deadline: dict[str, Any] | None,
+    from_runner,
+):
+    """Create a synchronous runner callback only for an exact armed first lease."""
+    if armed_request is None:
+        return None
+    if (
+        claim.phase != "probe"
+        or claim.target_phase != "evaluation"
+        or claim.model_kind != "clip"
+        or claim.fence != 1
+        or int(armed_request.get("expected_lease_generation", 0)) != claim.fence
+        or owner is None
+        or artifact_deadline is None
+    ):
+        raise WorkerAuthorizationError("evaluation progress arm does not match the active first lease")
+    arm_event_id = int(armed_request["arm_event_id"])
+
+    def report(**progress: Any):
+        return from_runner(
+            queue.record_evaluation_progress(
+                job_id=claim.job_id,
+                lease_token=claim.lease_token,
+                fencing_token=claim.fence,
+                arm_event_id=arm_event_id,
+                progress=progress,
+                owner=owner,
+                artifact_deadline=artifact_deadline,
+            )
+        )
+
+    return report
+
+
 async def await_worker_artifact_operation(
     operation,
     *,
@@ -112,6 +173,7 @@ async def run_worker() -> int:
     objects = None
     evaluation_publisher = None
     evaluation_model_id = None
+    evaluation_probe_checkpoint_source = None
     try:
         job = await queue.get(job_id)
         lease = await repository.get_active_lease(gpu_uuid)
@@ -223,6 +285,7 @@ async def run_worker() -> int:
                 raise WorkerAuthorizationError("evaluation probe checkpoint source is invalid") from error
             if checkpoint_source is None or checkpoint_source.model_revision != model.revision:
                 raise WorkerAuthorizationError("evaluation probe has no matching locked prior checkpoint")
+            evaluation_probe_checkpoint_source = checkpoint_source
             prior_checkpoint = await _load_verified_evaluation_probe_checkpoint(
                 queue,
                 checkpoint_store,
@@ -271,6 +334,32 @@ async def run_worker() -> int:
 
         def assert_current() -> bool:
             return bool(from_runner(still_current()))
+
+        if (
+            claim.phase == "probe"
+            and claim.target_phase == "evaluation"
+            and claim.model_kind == "clip"
+            and evaluation_probe_checkpoint_source is not None
+        ):
+            armed_request = await repository.pending_evaluation_progress_yield(
+                job_id=claim.job_id,
+                lease_token=claim.lease_token,
+                fencing_token=claim.fence,
+                input_sha256=claim.input_sha256,
+                config_sha256=claim.config_sha256,
+                training_source_checkpoint_sha256=(
+                    evaluation_probe_checkpoint_source.checkpoint_sha256
+                ),
+            )
+            if armed_request is not None:
+                config["_evaluation_batch_completed"] = _evaluation_progress_callback(
+                    queue=queue,
+                    claim=claim,
+                    armed_request=armed_request,
+                    owner=_current_worker_process_identity(),
+                    artifact_deadline=artifact_deadline_authority,
+                    from_runner=from_runner,
+                )
 
         def commit_checkpoint(payload: bytes):
             return from_runner(

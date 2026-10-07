@@ -685,6 +685,23 @@ def _run_clip_evaluation(
                 )
             position = stop
             inference_steps += 1
+            progress_callback = config.get("_evaluation_batch_completed")
+            if evaluation_probe and callable(progress_callback):
+                checkpoint_source = config.get("_evaluation_probe_checkpoint_source")
+                if not isinstance(checkpoint_source, dict):
+                    raise ValueError("evaluation probe progress requires its typed training checkpoint source")
+                progress_callback(
+                    phase=phase,
+                    target_phase="evaluation",
+                    stage=stage,
+                    next_index=position,
+                    total_items=size,
+                    completed_batch_count=(position + batch_size - 1) // batch_size,
+                    input_sha256=str(config["input_sha256"]),
+                    config_sha256=str(config["config_sha256"]),
+                    training_probe_job_id=str(checkpoint_source["training_probe_job_id"]),
+                    training_source_checkpoint_sha256=str(checkpoint_source["checkpoint_sha256"]),
+                )
         state["stage"] = "gallery" if stage == "queries" else "complete"
         start_index = 0
 

@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from gods_mlops.jobs.checkpoints import CheckpointIdentity
-from gods_mlops.jobs.models import EvaluationCheckpointSource, ProbeInput
+from gods_mlops.jobs.models import EvaluationCheckpointSource, ProbeInput, ProcessIdentity
 from gods_mlops.training.claims import WorkerAuthorizationError, WorkerClaim, validate_current_worker_claim, validate_worker_claim
 
 
@@ -1096,6 +1096,91 @@ class EvaluationWorkerTests(unittest.TestCase):
         metadata["sha256"] = "0" * 64
         with self.assertRaisesRegex(WorkerAuthorizationError, "metadata"):
             asyncio.run(load_checkpoint(Queue(), store, source))
+
+    def test_evaluation_progress_callback_is_absent_unless_first_lease_is_armed(self) -> None:
+        build_callback = _require(
+            "gods_mlops.training.worker",
+            "_evaluation_progress_callback",
+        )
+        claim = WorkerClaim(
+            job_id="e4d82c26-8f0a-4f45-8b88-5fe84302d948",
+            lease_token="8ad96890-3434-4f07-85bb-8cde17a2b009",
+            fence=1,
+            gpu_uuid="GPU-e5fd41ed-1688-8aca-3cd4-7904d53d764e",
+            phase="probe",
+            target_phase="evaluation",
+            input_kind="probe_input",
+            input_id="task9-clip-evaluation-probe-" + "b" * 64,
+            input_sha256="a" * 64,
+            dataset_version=None,
+            model_kind="clip",
+            config_version="task9-clip-retrieval-evaluation-probe-v1",
+            config_sha256="c" * 64,
+            image_id="sha256:" + "d" * 64,
+        )
+        owner = ProcessIdentity(pid=12345, start_ticks=67890, uid=10001)
+        deadline = {
+            "job_id": claim.job_id,
+            "lease_token": claim.lease_token,
+            "fencing_token": claim.fence,
+            "controller_invocation_id": "8f8cfb84-98a4-46b8-aabc-778da1d58aa6",
+        }
+
+        class Queue:
+            def __init__(self):
+                self.calls = []
+
+            async def record_evaluation_progress(self, **values):
+                self.calls.append(values)
+                return {"status": "yield_requested"}
+
+        queue = Queue()
+
+        def bridge(coroutine):
+            return asyncio.run(coroutine)
+
+        unarmed = build_callback(
+            queue=queue,
+            claim=claim,
+            armed_request=None,
+            owner=owner,
+            artifact_deadline=deadline,
+            from_runner=bridge,
+        )
+        self.assertIsNone(unarmed)
+        self.assertEqual(queue.calls, [])
+
+        callback = build_callback(
+            queue=queue,
+            claim=claim,
+            armed_request={"arm_event_id": 7, "expected_lease_generation": 1},
+            owner=owner,
+            artifact_deadline=deadline,
+            from_runner=bridge,
+        )
+        self.assertTrue(callable(callback))
+        progress = {
+            "phase": "probe",
+            "target_phase": "evaluation",
+            "stage": "queries",
+            "next_index": 2,
+            "total_items": 2,
+            "completed_batch_count": 1,
+            "input_sha256": claim.input_sha256,
+            "config_sha256": claim.config_sha256,
+            "training_probe_job_id": "a0320b59-663c-4cdc-b893-086bb970ea60",
+            "training_source_checkpoint_sha256": "b" * 64,
+        }
+        result = callback(**progress)
+        self.assertEqual(result["status"], "yield_requested")
+        self.assertEqual(len(queue.calls), 1)
+        self.assertEqual(queue.calls[0]["job_id"], claim.job_id)
+        self.assertEqual(queue.calls[0]["lease_token"], claim.lease_token)
+        self.assertEqual(queue.calls[0]["fencing_token"], claim.fence)
+        self.assertEqual(queue.calls[0]["arm_event_id"], 7)
+        self.assertEqual(queue.calls[0]["progress"], progress)
+        self.assertIs(queue.calls[0]["owner"], owner)
+        self.assertIs(queue.calls[0]["artifact_deadline"], deadline)
 
 
 if __name__ == "__main__":
