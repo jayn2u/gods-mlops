@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from io import BytesIO
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import zlib
 
 import pytest
 import yaml
+from PIL import Image
 
 from gods_mlops.lifecycle.inventory import (
     load_inventory,
@@ -45,6 +47,8 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _COMMIT = re.compile(r"^[0-9a-f]{40}$")
 _ARTIFACT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
+_MAX_SCREENSHOT_BYTES = 32 * 1024 * 1024
+_MAX_SCREENSHOT_PIXELS = 16_777_216
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -421,6 +425,26 @@ def _native_receipt_binding_errors(
     return errors
 
 
+def _declares_offline_fixture(value: Any) -> bool:
+    if isinstance(value, dict):
+        mode = value.get("execution_mode")
+        origin = value.get("origin")
+        normalized_origin = origin.casefold() if isinstance(origin, str) else ""
+        if (
+            value.get("fixture_only") is True
+            or value.get("offline_fixture") is True
+            or value.get("kind") == "synthetic_offline"
+            or (isinstance(mode, str) and mode in {"fixture_only", "synthetic_offline", "offline_fixture"})
+            or "source test fixture" in normalized_origin
+            or "offline fixture" in normalized_origin
+        ):
+            return True
+        return any(_declares_offline_fixture(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_declares_offline_fixture(item) for item in value)
+    return False
+
+
 def _native_provenance_errors(
     provenance: Any,
     receipts: list[dict[str, Any]],
@@ -429,31 +453,31 @@ def _native_provenance_errors(
     if not isinstance(provenance, dict) or provenance.get("kind") != "native":
         return []
     errors: list[str] = []
-    origin = provenance.get("origin")
-    normalized_origin = origin.casefold() if isinstance(origin, str) else ""
     if (
         provenance.get("execution_mode") != "recorded_native"
-        or provenance.get("offline_fixture") is True
-        or provenance.get("fixture_only") is True
-        or "source test fixture" in normalized_origin
-        or "offline fixture" in normalized_origin
+        or _declares_offline_fixture(provenance)
     ):
         errors.append("native_provenance_contradicts_offline_fixture")
     for receipt in receipts:
         recipe = _artifact_value(artifacts, receipt.get("recipe_artifact_id"))
         native_receipt = _artifact_value(artifacts, receipt.get("native_receipt_artifact_id"))
-        if isinstance(recipe, dict) and recipe.get("fixture_only") is True:
+        if _declares_offline_fixture(recipe):
             errors.append("native_recipe_marked_fixture_only")
             break
-        if isinstance(native_receipt, dict) and native_receipt.get("fixture_only") is True:
+        if _declares_offline_fixture(native_receipt):
             errors.append("native_receipt_marked_fixture_only")
             break
         output_ids = receipt.get("native_output_artifact_ids")
-        if isinstance(output_ids, list) and any(
-            isinstance(_artifact_value(artifacts, identifier), bytes)
-            and b"synthetic native output for " in _artifact_value(artifacts, identifier)
-            for identifier in output_ids
-        ):
+        output_marked = False
+        if isinstance(output_ids, list):
+            for identifier in output_ids:
+                output = _artifact_value(artifacts, identifier)
+                if _declares_offline_fixture(output) or (
+                    isinstance(output, bytes) and b"synthetic native output for " in output
+                ):
+                    output_marked = True
+                    break
+        if output_marked:
             errors.append("native_output_marked_fixture_only")
             break
     return errors
@@ -988,13 +1012,28 @@ def _check_rtsp_snapshots(
 
 
 def _valid_png(payload: Any) -> bool:
-    if not isinstance(payload, bytes) or len(payload) < 33 or not payload.startswith(b"\x89PNG\r\n\x1a\n"):
+    if (
+        not isinstance(payload, bytes)
+        or len(payload) < 33
+        or len(payload) > _MAX_SCREENSHOT_BYTES
+        or not payload.startswith(b"\x89PNG\r\n\x1a\n")
+    ):
         return False
-    if payload[12:16] != b"IHDR" or int.from_bytes(payload[8:12], "big") != 13:
+    try:
+        with Image.open(BytesIO(payload)) as image:
+            if image.format != "PNG":
+                return False
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > _MAX_SCREENSHOT_PIXELS:
+                return False
+            image.verify()
+        with Image.open(BytesIO(payload)) as image:
+            if image.format != "PNG" or image.size != (width, height):
+                return False
+            image.load()
+        return True
+    except Exception:
         return False
-    width = int.from_bytes(payload[16:20], "big")
-    height = int.from_bytes(payload[20:24], "big")
-    return width > 0 and height > 0 and payload.endswith(b"IEND\xaeB`\x82")
 
 
 def _valid_row_count(value: Any) -> bool:
@@ -1056,10 +1095,16 @@ def _check_logical_readback(
         metadata.get("backup_validation_database_id"),
         metadata.get("restore_validation_database_id"),
     ]
-    if any(not isinstance(value, str) or not value for value in database_ids) or len(set(database_ids)) != len(database_ids):
+    if (
+        any(not isinstance(value, str) or not value for value in database_ids)
+        or metadata.get("source_database_id") == metadata.get("restore_database_id")
+        or metadata.get("backup_validation_database_id") != metadata.get("source_database_id")
+        or metadata.get("restore_validation_database_id") != metadata.get("restore_database_id")
+    ):
         return False
-    row_counts = (metadata.get("source_row_count"), metadata.get("restored_row_count"), metadata.get("readback_row_count"))
-    if not all(_valid_row_count(value) for value in row_counts):
+    row_count_fields = ("source_row_count", "restored_row_count", "readback_row_count")
+    row_counts = tuple(metadata.get(key) for key in row_count_fields)
+    if not all(_valid_row_count(value) for value in row_counts) or len(set(row_counts)) != 1:
         return False
     hashes = (
         metadata.get("source_query_sha256"),
@@ -1091,6 +1136,8 @@ def _check_logical_readback(
         "readback_row_count",
     )
     if any(report.get(key) != metadata.get(key) for key in bound_fields):
+        return False
+    if not all(_valid_row_count(report.get(key)) for key in row_count_fields):
         return False
     if report.get("status") != "verified" or report.get("readback_status") != "verified":
         return False
@@ -1991,8 +2038,8 @@ def _make_evidence_fixture(root: Path, *, provenance_kind: str = "synthetic_offl
         "database_restore_manifest_id": database_restore["id"],
         "source_database_id": "source-db",
         "restore_database_id": "restored-db",
-        "backup_validation_database_id": "backup-validation-db",
-        "restore_validation_database_id": "restore-validation-db",
+        "backup_validation_database_id": "source-db",
+        "restore_validation_database_id": "restored-db",
         "backup_dump_path": database_restore["backup_dump_path"],
         "restored_dump_path": database_restore["restored_dump_path"],
         "source_query_sha256": query_sha256,
@@ -2356,11 +2403,60 @@ def _resign_artifact(root: Path, config: dict[str, Any], bundle: dict[str, Any],
     config["bundle_sha256"] = _sha256(bundle_payload)
 
 
+def _resign_stage_output_bindings(
+    root: Path,
+    config: dict[str, Any],
+    bundle: dict[str, Any],
+    stage_name: str,
+) -> None:
+    stage = next(item for item in bundle["stages"] if item["stage"] == stage_name)
+    loaded = _load_bound_artifacts(config)
+    native_receipt = _artifact_value(loaded, stage["native_receipt_artifact_id"])
+    hashes = loaded["artifact_hashes"]
+    native_receipt["output_sha256"] = {
+        identifier: hashes[identifier] for identifier in native_receipt["output_artifact_ids"]
+    }
+    _resign_artifact(root, config, bundle, stage["native_receipt_artifact_id"], native_receipt)
+
+
 def _loaded_fixture(tmp_path: Path) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
     root = tmp_path / "evidence"
     config, _ = _make_evidence_fixture(root)
     artifacts = _load_bound_artifacts(config)
     return root, config, artifacts["bundle"], artifacts
+
+
+def _native_shaped_fixture(tmp_path: Path) -> tuple[Path, dict[str, Any], dict[str, Any]]:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    bundle["provenance"].update(
+        {
+            "kind": "native",
+            "execution_mode": "recorded_native",
+            "origin": "operator-recorded Ansible execution",
+            "fixture_only": False,
+            "data_origin": "synthetic",
+        }
+    )
+    for stage in bundle["stages"]:
+        recipe_id = stage["recipe_artifact_id"]
+        recipe = _artifact_value(_load_bound_artifacts(config), recipe_id)
+        recipe.update({"fixture_only": False, "execution_mode": "recorded_native"})
+        _resign_artifact(root, config, bundle, recipe_id, recipe)
+        stage["recipe_sha256"] = next(item["sha256"] for item in bundle["artifacts"] if item["id"] == recipe_id)
+
+        output_id = next(
+            identifier
+            for identifier in stage["native_output_artifact_ids"]
+            if identifier.startswith("native-output-")
+        )
+        _resign_artifact(root, config, bundle, output_id, f"recorded native output for {stage['stage']}".encode())
+
+        native_receipt_id = stage["native_receipt_artifact_id"]
+        native_receipt = _artifact_value(_load_bound_artifacts(config), native_receipt_id)
+        native_receipt.update({"fixture_only": False, "execution_mode": "recorded_native"})
+        _resign_artifact(root, config, bundle, native_receipt_id, native_receipt)
+        _resign_stage_output_bindings(root, config, bundle, stage["stage"])
+    return root, config, bundle
 
 
 def test_synthetic_fixture_checks_consistency_without_claiming_live_evidence(tmp_path: Path) -> None:
@@ -2622,6 +2718,47 @@ def test_recorded_native_execution_may_use_synthetic_input_data() -> None:
     assert _native_provenance_errors(provenance, [receipt], artifacts) == []
 
 
+@pytest.mark.parametrize("record_kind", ["provenance", "recipe", "typed_receipt", "structured_output"])
+def test_native_provenance_rejects_fixture_only_execution_mode_even_when_flag_false(
+    tmp_path: Path, record_kind: str
+) -> None:
+    root, config, bundle = _native_shaped_fixture(tmp_path)
+
+    if record_kind == "provenance":
+        bundle["provenance"].update({"fixture_only": False, "execution_mode": "fixture_only"})
+        observations = _artifact_value(_load_bound_artifacts(config), "observations")
+        _resign_artifact(root, config, bundle, "observations", observations)
+        expected_reason = "native_provenance_contradicts_offline_fixture"
+    elif record_kind == "recipe":
+        stage = next(item for item in bundle["stages"] if item["stage"] == "deploy")
+        recipe_id = stage["recipe_artifact_id"]
+        recipe = _artifact_value(_load_bound_artifacts(config), recipe_id)
+        recipe.update({"fixture_only": False, "execution_mode": "fixture_only"})
+        _resign_artifact(root, config, bundle, recipe_id, recipe)
+        stage["recipe_sha256"] = next(item["sha256"] for item in bundle["artifacts"] if item["id"] == recipe_id)
+        observations = _artifact_value(_load_bound_artifacts(config), "observations")
+        _resign_artifact(root, config, bundle, "observations", observations)
+        expected_reason = "native_recipe_marked_fixture_only"
+    elif record_kind == "typed_receipt":
+        stage = next(item for item in bundle["stages"] if item["stage"] == "deploy")
+        receipt_id = stage["native_receipt_artifact_id"]
+        native_receipt = _artifact_value(_load_bound_artifacts(config), receipt_id)
+        native_receipt.update({"fixture_only": False, "execution_mode": "fixture_only"})
+        _resign_artifact(root, config, bundle, receipt_id, native_receipt)
+        expected_reason = "native_receipt_marked_fixture_only"
+    else:
+        database_access = _artifact_value(_load_bound_artifacts(config), "database-access")
+        database_access.update({"fixture_only": False, "execution_mode": "fixture_only"})
+        _resign_artifact(root, config, bundle, "database-access", database_access)
+        _resign_stage_output_bindings(root, config, bundle, "continuity")
+        expected_reason = "native_output_marked_fixture_only"
+
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+
+    assert result["overall"] == "incomplete_or_failed"
+    assert expected_reason in result["cases"]["deploy"]["reasons"]
+
+
 def test_continuity_requires_bound_row_counts_and_authenticated_receipt(tmp_path: Path) -> None:
     root, config, bundle, _ = _loaded_fixture(tmp_path)
     observations = _artifact_value(_load_bound_artifacts(config), "observations")
@@ -2655,6 +2792,108 @@ def test_continuity_requires_bound_row_counts_and_authenticated_receipt(tmp_path
     root, config, bundle, _ = _loaded_fixture(tmp_path / "image")
     _resign_artifact(root, config, bundle, "browser-screenshot", b"not an image")
     result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+    assert result["cases"]["continuity"]["status"] == "failed"
+
+
+def test_continuity_rejects_unequal_report_bound_row_counts(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    artifacts = _load_bound_artifacts(config)
+    observations = _artifact_value(artifacts, "observations")
+    logical_restore = observations["stages"]["continuity"]["logical_restore"]
+    counts = {"source_row_count": 20, "restored_row_count": 0, "readback_row_count": 7}
+    logical_restore.update(counts)
+    access_report = _artifact_value(artifacts, "database-access")
+    access_report.update(counts)
+    _resign_artifact(root, config, bundle, "database-access", access_report)
+    _resign_artifact(root, config, bundle, "observations", observations)
+    _resign_stage_output_bindings(root, config, bundle, "continuity")
+
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+
+    assert result["cases"]["continuity"]["status"] == "failed"
+
+
+def test_continuity_requires_typed_row_counts_in_the_bound_report(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    artifacts = _load_bound_artifacts(config)
+    observations = _artifact_value(artifacts, "observations")
+    logical_restore = observations["stages"]["continuity"]["logical_restore"]
+    counts = {"source_row_count": 1, "restored_row_count": 1, "readback_row_count": 1}
+    logical_restore.update(counts)
+    access_report = _artifact_value(artifacts, "database-access")
+    access_report.update(counts)
+    access_report["source_row_count"] = True
+    _resign_artifact(root, config, bundle, "database-access", access_report)
+    _resign_artifact(root, config, bundle, "observations", observations)
+    _resign_stage_output_bindings(root, config, bundle, "continuity")
+
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+
+    assert result["cases"]["continuity"]["status"] == "failed"
+
+
+def test_continuity_accepts_source_and_isolated_restore_database_aliases(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    artifacts = _load_bound_artifacts(config)
+    observations = _artifact_value(artifacts, "observations")
+    logical_restore = observations["stages"]["continuity"]["logical_restore"]
+    logical_restore["backup_validation_database_id"] = logical_restore["source_database_id"]
+    logical_restore["restore_validation_database_id"] = logical_restore["restore_database_id"]
+    access_report = _artifact_value(artifacts, "database-access")
+    access_report["backup_validation_database_id"] = logical_restore["backup_validation_database_id"]
+    access_report["restore_validation_database_id"] = logical_restore["restore_validation_database_id"]
+    _resign_artifact(root, config, bundle, "database-access", access_report)
+    _resign_artifact(root, config, bundle, "observations", observations)
+    _resign_stage_output_bindings(root, config, bundle, "continuity")
+
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+
+    assert result["cases"]["continuity"]["status"] == "not_run"
+
+
+def test_continuity_still_requires_a_separate_restore_database(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    artifacts = _load_bound_artifacts(config)
+    observations = _artifact_value(artifacts, "observations")
+    logical_restore = observations["stages"]["continuity"]["logical_restore"]
+    logical_restore["restore_database_id"] = logical_restore["source_database_id"]
+    logical_restore["backup_validation_database_id"] = logical_restore["source_database_id"]
+    logical_restore["restore_validation_database_id"] = logical_restore["source_database_id"]
+    access_report = _artifact_value(artifacts, "database-access")
+    for field in (
+        "restore_database_id",
+        "backup_validation_database_id",
+        "restore_validation_database_id",
+    ):
+        access_report[field] = logical_restore[field]
+    _resign_artifact(root, config, bundle, "database-access", access_report)
+    _resign_artifact(root, config, bundle, "observations", observations)
+    _resign_stage_output_bindings(root, config, bundle, "continuity")
+
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+
+    assert result["cases"]["continuity"]["status"] == "failed"
+
+
+def test_continuity_rejects_malformed_but_hash_bound_png(tmp_path: Path) -> None:
+    root, config, bundle, _ = _loaded_fixture(tmp_path)
+    malformed_png = (
+        b"\x89PNG\r\n\x1a\n"
+        + struct.pack(">I", 13)
+        + b"IHDR"
+        + struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+        + b"\x00\x00\x00\x00"
+        + b"IEND\xaeB`\x82"
+    )
+    _resign_artifact(root, config, bundle, "browser-screenshot", malformed_png)
+    artifacts = _load_bound_artifacts(config)
+    browser_receipt = _artifact_value(artifacts, "browser-receipt")
+    browser_receipt["screenshot_sha256"] = artifacts["artifact_hashes"]["browser-screenshot"]
+    _resign_artifact(root, config, bundle, "browser-receipt", browser_receipt)
+    _resign_stage_output_bindings(root, config, bundle, "continuity")
+
+    result = _verify_lifecycle_evidence(config, _load_bound_artifacts(config))
+
     assert result["cases"]["continuity"]["status"] == "failed"
 
 
