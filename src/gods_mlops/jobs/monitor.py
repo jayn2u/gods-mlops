@@ -118,13 +118,16 @@ class GpuJobMonitor:
                 return await self._queue.get(job_id)
             return job
 
-        await self._repository.release_after_observed_exit(
+        released = await self._repository.release_after_observed_exit(
             job_id=job_id,
             lease_token=lease["lease_token"],
             observation=observation,
             terminal_reason=source_reason,
         )
-        return await self._queue.get(job_id)
+        job = await self._queue.get(job_id)
+        if released and job["state"] in {"completed", "failed", "cancelled"}:
+            await self._queue.settle_artifact_reservation(job_id)
+        return job
 
     async def run_once(self) -> dict | None:
         """Read and reconcile one host observation from the configured Ubuntu producer."""

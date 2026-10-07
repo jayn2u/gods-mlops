@@ -295,6 +295,108 @@ def test_public_yield_renew_checkpoint_and_release_share_the_job_lease_lock_orde
     asyncio.run(exercise())
 
 
+def test_terminal_probe_reservation_settles_only_after_monitor_proves_owner_exit() -> None:
+    async def exercise() -> None:
+        job_id = "11111111-2222-4333-8444-555555555555"
+        lease_token = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+        class FakeAdmission:
+            expected_gpu_uuid = GPU_UUID
+
+            async def record_observation(self, value):
+                observation = (
+                    value
+                    if isinstance(value, ResourceObservation)
+                    else ResourceObservation.from_dict(value)
+                )
+                return observation, {}
+
+        class FakeRepository:
+            def __init__(self) -> None:
+                self.lease = {
+                    "job_id": job_id,
+                    "lease_token": lease_token,
+                    "owner_pid": OWNER.pid,
+                    "owner_start_ticks": OWNER.start_ticks,
+                    "expires_at": BASE_TIME + timedelta(seconds=60),
+                }
+                self.release_allowed = False
+                self.release_calls = 0
+
+            async def get_active_lease(self, gpu_uuid):
+                assert gpu_uuid == GPU_UUID
+                return self.lease
+
+            async def release_after_observed_exit(
+                self, *, job_id, lease_token, observation, terminal_reason=None
+            ):
+                assert job_id == self.lease["job_id"]
+                assert lease_token == self.lease["lease_token"]
+                self.release_calls += 1
+                owner_is_live = any(
+                    item.pid == OWNER.pid and item.start_ticks == OWNER.start_ticks
+                    for item in observation.process_table
+                )
+                owner_uses_gpu = any(item.pid == OWNER.pid for item in observation.gpu_processes)
+                if (
+                    not observation.process_table_complete
+                    or not observation.gpu_process_list_complete
+                    or owner_is_live
+                    or owner_uses_gpu
+                    or not self.release_allowed
+                ):
+                    return False
+                self.lease = None
+                return True
+
+        class FakeQueue:
+            def __init__(self, repository: FakeRepository) -> None:
+                self.repository = repository
+                self.settlement_calls = 0
+                self.reservation_state = "reserved"
+
+            async def training_source_block_reasons(self, _job_id):
+                return []
+
+            async def get(self, requested_job_id):
+                assert requested_job_id == job_id
+                return {"job_id": job_id, "state": "failed"}
+
+            async def settle_artifact_reservation(self, requested_job_id):
+                assert requested_job_id == job_id
+                assert self.repository.lease is None
+                self.settlement_calls += 1
+                self.reservation_state = "settled"
+                return {"job_id": job_id, "state": "failed"}
+
+        repository = FakeRepository()
+        queue = FakeQueue(repository)
+        monitor = GpuJobMonitor(repository=repository, queue=queue, admission=FakeAdmission())
+
+        live = _observation(BASE_TIME, gpu=(OWNER,), processes=(OWNER,))
+        assert (await monitor.observe(live))["state"] == "failed"
+        assert repository.release_calls == 0
+        assert queue.settlement_calls == 0
+        assert queue.reservation_state == "reserved"
+
+        exited = _observation(BASE_TIME + timedelta(seconds=5))
+        assert (await monitor.observe(exited))["state"] == "failed"
+        assert repository.release_calls == 1
+        assert queue.settlement_calls == 0
+        assert queue.reservation_state == "reserved"
+
+        repository.release_allowed = True
+        assert (await monitor.observe(exited))["state"] == "failed"
+        assert repository.release_calls == 2
+        assert queue.settlement_calls == 1
+        assert queue.reservation_state == "settled"
+
+        assert await monitor.observe(exited) is None
+        assert queue.settlement_calls == 1
+
+    asyncio.run(exercise())
+
+
 def test_monitor_run_once_preserves_one_durable_failure_before_requesting_own_yield(
     task7_database_url: str,
 ) -> None:

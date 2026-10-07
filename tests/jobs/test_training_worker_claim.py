@@ -27,7 +27,6 @@ GPU_UUID = "GPU-e5fd41ed-1688-8aca-3cd4-7904d53d764e"
 HOST_IDENTITY = "machine-sha256:task8-test-ubuntu"
 FILESYSTEM_IDENTITY = "ext4:uuid=task8-test-data"
 STORAGE_PATH = "/data/jayn2u/gods-mlops"
-BASE_TIME = datetime(2026, 10, 6, 10, tzinfo=UTC)
 OWNER = ProcessIdentity(pid=43122, start_ticks=89123, uid=10001)
 
 
@@ -79,7 +78,7 @@ async def _training_run(database_url: str):
             "SELECT sample_id FROM dataset_items WHERE dataset_version=$1 LIMIT 1", dataset_version
         )
     job_id = await queue.submit(dataset_version, "detr", profile.config_version)
-    now = [BASE_TIME]
+    now = [await repository.artifact_database_clock()]
 
     class Observer:
         async def observe(self):
@@ -294,8 +293,9 @@ def test_worker_start_rechecks_task6_current_source_invalidation_before_cuda(tas
         repository, queue, sources, admission, _version, sample_id, job_id, now = await _training_run(
             task7_database_url
         )
+        base_time = now[0]
         for offset in range(0, 31, 5):
-            now[0] = BASE_TIME + timedelta(seconds=offset)
+            now[0] = base_time + timedelta(seconds=offset)
             running = await admission.admit(job_id, _observation(now[0]))
         assert running["state"] == "running"
         lease = await repository.get_active_lease(GPU_UUID)
@@ -419,8 +419,9 @@ def test_delayed_worker_with_old_database_fence_cannot_start_after_recovery(
         repository, queue, sources, admission, _version, _sample_id, job_id, now = await _training_run(
             task7_database_url
         )
+        base_time = now[0]
         for offset in range(0, 31, 5):
-            now[0] = BASE_TIME + timedelta(seconds=offset)
+            now[0] = base_time + timedelta(seconds=offset)
             running = await admission.admit(job_id, _observation(now[0]))
         old_lease = await repository.get_active_lease(GPU_UUID)
         old_claim = WorkerClaim.from_admitted_job(
@@ -428,14 +429,14 @@ def test_delayed_worker_with_old_database_fence_cannot_start_after_recovery(
         )
         assert await queue.bind_process(job_id, old_lease["lease_token"], OWNER)
 
-        now[0] = BASE_TIME + timedelta(seconds=35)
+        now[0] = base_time + timedelta(seconds=35)
         monitor = GpuJobMonitor(repository=repository, queue=queue, admission=admission)
         released = await monitor.observe(_observation(now[0]))
         assert released["state"] == "waiting_gpu"
         assert await repository.get_active_lease(GPU_UUID) is None
 
         for offset in range(40, 71, 5):
-            now[0] = BASE_TIME + timedelta(seconds=offset)
+            now[0] = base_time + timedelta(seconds=offset)
             recovered = await admission.admit(job_id, _observation(now[0]))
         assert recovered["state"] == "running"
         new_lease = await repository.get_active_lease(GPU_UUID)
@@ -474,9 +475,10 @@ def test_result_artifact_commit_is_idempotent_and_completion_keeps_lease_until_o
         repository, queue, sources, admission, _version, _sample_id, job_id, now = await _training_run(
             task7_database_url
         )
+        base_time = now[0]
         save_artifact = _require_method(queue, "save_result_artifact")
         for offset in range(0, 31, 5):
-            now[0] = BASE_TIME + timedelta(seconds=offset)
+            now[0] = base_time + timedelta(seconds=offset)
             running = await admission.admit(job_id, _observation(now[0]))
         lease = await repository.get_active_lease(GPU_UUID)
         token = lease["lease_token"]
@@ -516,12 +518,12 @@ def test_result_artifact_commit_is_idempotent_and_completion_keeps_lease_until_o
         assert (await repository.artifact_reservation_for(job_id))["state"] == "settled"
 
         monitor = GpuJobMonitor(repository=repository, queue=queue, admission=admission)
-        now[0] = BASE_TIME + timedelta(seconds=35)
+        now[0] = base_time + timedelta(seconds=35)
         still_owned = await monitor.observe(_observation(now[0], gpu=(owner,), processes=(owner,)))
         assert still_owned["state"] == "completed"
         assert (await repository.get_active_lease(GPU_UUID))["lease_token"] == token
 
-        now[0] = BASE_TIME + timedelta(seconds=40)
+        now[0] = base_time + timedelta(seconds=40)
         released = await monitor.observe(_observation(now[0]))
         assert released["state"] == "completed"
         assert await repository.get_active_lease(GPU_UUID) is None
@@ -563,9 +565,10 @@ def test_s3_checkpoint_and_result_use_task7_fence_and_shared_global_reservation(
         repository, queue, sources, admission, _version, _sample_id, job_id, now = await _training_run(
             task7_database_url
         )
+        base_time = now[0]
         baseline = await _storage_bytes(task7_database_url)
         for offset in range(0, 31, 5):
-            now[0] = BASE_TIME + timedelta(seconds=offset)
+            now[0] = base_time + timedelta(seconds=offset)
             running = await admission.admit(job_id, _observation(now[0]))
         lease = await repository.get_active_lease(GPU_UUID)
         identity = await repository.checkpoint_identity(job_id)
@@ -1345,6 +1348,7 @@ def test_file_checkpoint_replacements_account_only_retained_bytes_and_keep_repla
         )
         await _admit_probe(queue, admission, job_id, now)
         lease = await repository.get_active_lease(GPU_UUID)
+        assert await queue.bind_process(job_id, lease["lease_token"], OWNER)
         identity = await repository.checkpoint_identity(job_id)
         store = FileCheckpointStore(root=tmp_path)
         checkpoint_directory = tmp_path / job_id
@@ -1366,24 +1370,46 @@ def test_file_checkpoint_replacements_account_only_retained_bytes_and_keep_repla
             assert len(list(checkpoint_directory.glob("*.json"))) == 1
         assert latest is not None
 
-        failed = await queue.record_probe_measurement(
+        measured = await queue.record_probe_measurement(
             job_id=job_id,
             lease_token=lease["lease_token"],
-            exit_code=1,
-            peak_allocated_mib=None,
-            peak_reserved_mib=None,
-            optimizer_steps=0,
-            checkpoint_resumed=False,
-            checkpoint_sha256=None,
+            exit_code=0,
+            peak_allocated_mib=2_000,
+            peak_reserved_mib=4_000,
+            optimizer_steps=3,
+            checkpoint_resumed=True,
+            checkpoint_sha256=latest.sha256,
             inference_steps=0,
-            verification_details={"passed": False, "failure": "test_file_checkpoint_quota"},
+            verification_details={"passed": True},
         )
-        assert failed["result_state"] == "failed"
+        assert measured["result_state"] == "succeeded"
         retained_bytes = sum(path.stat().st_size for path in checkpoint_directory.iterdir())
+        reservation = await repository.artifact_reservation_for(job_id)
+        assert reservation["state"] == "reserved"
+        assert reservation["consumed_bytes"] == retained_bytes
+
+        monitor = GpuJobMonitor(repository=repository, queue=queue, admission=admission)
+        now[0] += timedelta(seconds=5)
+        still_owned = await monitor.observe(
+            _observation(now[0], gpu=(OWNER,), processes=(OWNER,))
+        )
+        assert still_owned["state"] == "completed"
+        assert (await repository.get_active_lease(GPU_UUID))["lease_token"] == lease["lease_token"]
+        assert (await repository.artifact_reservation_for(job_id))["state"] == "reserved"
+
+        now[0] += timedelta(seconds=5)
+        released = await monitor.observe(_observation(now[0]))
+        assert released["state"] == "completed"
+        assert await repository.get_active_lease(GPU_UUID) is None
         reservation = await repository.artifact_reservation_for(job_id)
         assert reservation["state"] == "settled"
         assert reservation["consumed_bytes"] == retained_bytes
         assert await _storage_bytes(task7_database_url) == baseline + retained_bytes
+
+        settled_bytes = await _storage_bytes(task7_database_url)
+        await queue.settle_artifact_reservation(job_id)
+        assert (await repository.artifact_reservation_for(job_id))["state"] == "settled"
+        assert await _storage_bytes(task7_database_url) == settled_bytes
         await queue.close()
         await repository.close()
         await sources.close()
