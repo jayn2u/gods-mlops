@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import subprocess
 import sys
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -41,10 +44,116 @@ EXPECTED_COMMIT_ENV = "GODS_MLOPS_TASK11_EVAL_PROGRESS_EXPECTED_COMMIT"
 EXPECTED_TREE_ENV = "GODS_MLOPS_TASK11_EVAL_PROGRESS_EXPECTED_TREE"
 EXPECTED_TEST_SHA_ENV = "GODS_MLOPS_TASK11_EVAL_PROGRESS_EXPECTED_TEST_SHA256"
 EXPECTED_MODULE_ENV = "GODS_MLOPS_TASK11_EVAL_PROGRESS_EXPECTED_MODULE"
+DIAGNOSTIC_OBSERVER_ENV = "GODS_MLOPS_TASK11_EVAL_PROGRESS_DIAGNOSTIC_OBSERVER_V4"
 WRITER_APPLICATION_NAME = "gods-mlops-eval-progress-writer"
 TEST_MODULE_NAME = "tests.jobs.test_evaluation_progress_queue_native"
 TEST_FILE = Path(__file__).resolve()
 SOURCE_ROOT = TEST_FILE.parents[2]
+_SAFE_EXCEPTION_CLASS = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,79}$")
+_SAFE_SQLSTATE = re.compile(r"^[A-Z0-9]{5}$")
+_DIAGNOSTIC_CLEANUP_OPERATIONS = frozenset(
+    {
+        "blocker_transaction_rollback",
+        "record_task_cancel_and_join",
+        "blocker_close",
+        "repository_close",
+        "sources_close",
+        "connection_close",
+    }
+)
+
+
+def _safe_native_exception_metadata(error: BaseException) -> dict[str, Any]:
+    exception_class = type(error).__name__
+    if not _SAFE_EXCEPTION_CLASS.fullmatch(exception_class):
+        exception_class = "UnknownError"
+    sqlstate = None
+    for attribute in ("sqlstate", "pgcode"):
+        try:
+            candidate = getattr(error, attribute, None)
+        except Exception:
+            candidate = None
+        if isinstance(candidate, str):
+            candidate = candidate.upper()
+            if _SAFE_SQLSTATE.fullmatch(candidate):
+                sqlstate = candidate
+                break
+    frames = []
+    for frame in traceback.extract_tb(error.__traceback__)[-16:]:
+        try:
+            path = Path(frame.filename).resolve().relative_to(SOURCE_ROOT).as_posix()
+        except (OSError, RuntimeError, ValueError):
+            basename = re.sub(r"[^A-Za-z0-9._-]", "_", Path(frame.filename).name)[:96] or "external"
+            path = f"external/{basename}"
+        function = re.sub(r"[^A-Za-z0-9_]", "_", frame.name)[:80] or "unknown"
+        frames.append({"path": path, "function": function, "line": int(frame.lineno)})
+    return {
+        "exception_class": exception_class,
+        "sqlstate": sqlstate,
+        "frames": frames,
+    }
+
+
+def _append_native_user_property(request, name: str, metadata: dict[str, Any]) -> None:
+    try:
+        request.node.user_properties.append(
+            (name, json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+        )
+    except Exception:
+        # Diagnostics must never replace the native test exception.
+        return
+
+
+async def _run_native_with_safe_diagnostic_cleanup(
+    request,
+    operation,
+    cleanup_operations,
+    *,
+    observer_enabled: bool,
+):
+    """Capture the primary exception before finally cleanup and keep cleanup errors distinct."""
+    primary_error = None
+    try:
+        try:
+            return await operation()
+        except BaseException as error:
+            primary_error = error
+            if observer_enabled:
+                _append_native_user_property(
+                    request,
+                    "task11_eval_primary_failure_v4",
+                    {
+                        "schema_version": 1,
+                        "phase": "native_test_body",
+                        **_safe_native_exception_metadata(error),
+                    },
+                )
+            raise
+    finally:
+        if not observer_enabled:
+            for _operation_name, cleanup in cleanup_operations:
+                await cleanup()
+        else:
+            cleanup_errors = []
+            for operation_name, cleanup in cleanup_operations:
+                if operation_name not in _DIAGNOSTIC_CLEANUP_OPERATIONS:
+                    operation_name = "unknown_cleanup"
+                try:
+                    await cleanup()
+                except BaseException as error:
+                    cleanup_errors.append(error)
+                    _append_native_user_property(
+                        request,
+                        "task11_eval_cleanup_failure_v4",
+                        {
+                            "schema_version": 1,
+                            "phase": "in_test_cleanup",
+                            "operation": operation_name,
+                            **_safe_native_exception_metadata(error),
+                        },
+                    )
+            if primary_error is None and cleanup_errors:
+                raise cleanup_errors[0]
 
 
 def _safe_identity_error(code: str) -> None:
@@ -418,23 +527,35 @@ async def _wait_for_profile_lock_wait(connection: asyncpg.Connection) -> None:
     raise TimeoutError("native writer did not block on the locked profile row")
 
 
-def test_native_profile_lock_wait_expiry_rolls_back_progress() -> None:
+def test_native_profile_lock_wait_expiry_rolls_back_progress(request) -> None:
     database_url, _database_name, expected_marker = _native_database_url()
     _assert_executed_source_identity()
+    observer_enabled = os.environ.get(DIAGNOSTIC_OBSERVER_ENV) == "1"
 
     async def exercise() -> None:
-        connection = await asyncpg.connect(database_url, timeout=5)
-        repository = PostgresJobQueueRepository(database_url=database_url)
-        sources = DatasetSourceRegistry(database_url=database_url)
-        queue = JobQueue(repository=repository, sources=sources)
-        blocker = await asyncpg.connect(
-            database_url,
-            timeout=5,
-            server_settings={"application_name": "gods-mlops-eval-progress-profile-lock"},
-        )
-        blocker_transaction = None
-        record_task = None
-        try:
+        resources = {
+            "connection": None,
+            "repository": None,
+            "sources": None,
+            "blocker": None,
+            "blocker_transaction": None,
+            "record_task": None,
+        }
+
+        async def body() -> None:
+            connection = await asyncpg.connect(database_url, timeout=5)
+            resources["connection"] = connection
+            repository = PostgresJobQueueRepository(database_url=database_url)
+            resources["repository"] = repository
+            sources = DatasetSourceRegistry(database_url=database_url)
+            resources["sources"] = sources
+            queue = JobQueue(repository=repository, sources=sources)
+            blocker = await asyncpg.connect(
+                database_url,
+                timeout=5,
+                server_settings={"application_name": "gods-mlops-eval-progress-profile-lock"},
+            )
+            resources["blocker"] = blocker
             database_identity = await connection.fetchrow(
                 """SELECT current_database() AS name,current_user AS owner,
                           current_setting('server_version_num')::int AS version"""
@@ -496,6 +617,7 @@ def test_native_profile_lock_wait_expiry_rolls_back_progress() -> None:
                 "training_source_checkpoint_sha256": source.checkpoint_sha256,
             }
             blocker_transaction = blocker.transaction()
+            resources["blocker_transaction"] = blocker_transaction
             await blocker_transaction.start()
             await blocker.fetchrow(
                 """SELECT config_version FROM gods_mlops_resource_profiles
@@ -514,18 +636,19 @@ def test_native_profile_lock_wait_expiry_rolls_back_progress() -> None:
                     artifact_deadline=deadline,
                 )
             )
+            resources["record_task"] = record_task
             await _wait_for_profile_lock_wait(connection)
             while await repository.artifact_database_clock() < expires_at:
                 await asyncio.sleep(0.05)
             await blocker_transaction.rollback()
-            blocker_transaction = None
+            resources["blocker_transaction"] = None
             try:
                 await asyncio.wait_for(record_task, timeout=10)
             except (RuntimeError, TimeoutError):
                 pass
             else:
                 _safe_identity_error("expired profile-lock wait published evaluation progress")
-            record_task = None
+            resources["record_task"] = None
 
             late_events = await connection.fetch(
                 """SELECT event_type FROM gods_mlops_job_events
@@ -539,15 +662,229 @@ def test_native_profile_lock_wait_expiry_rolls_back_progress() -> None:
             )
             if late_events or job is None or job["state"] != "running" or job["checkpoint_sha256"] is not None:
                 _safe_identity_error("expired profile-lock wait left progress, yield, or cursor state")
-        finally:
-            if blocker_transaction is not None:
-                await blocker_transaction.rollback()
-            if record_task is not None and not record_task.done():
-                record_task.cancel()
-                await asyncio.gather(record_task, return_exceptions=True)
-            await blocker.close()
-            await repository.close()
-            await sources.close()
-            await connection.close()
+
+        async def rollback_blocker_transaction() -> None:
+            transaction = resources["blocker_transaction"]
+            if transaction is not None:
+                await transaction.rollback()
+                resources["blocker_transaction"] = None
+
+        async def cancel_and_join_record_task() -> None:
+            task = resources["record_task"]
+            if task is None:
+                return
+            if task.done():
+                resources["record_task"] = None
+                return
+            task.cancel()
+            outcomes = await asyncio.gather(task, return_exceptions=True)
+            cleanup_errors = [
+                error
+                for error in outcomes
+                if isinstance(error, BaseException) and not isinstance(error, asyncio.CancelledError)
+            ]
+            resources["record_task"] = None
+            if observer_enabled and cleanup_errors:
+                raise cleanup_errors[0]
+
+        async def close_blocker() -> None:
+            blocker = resources["blocker"]
+            if blocker is not None:
+                await blocker.close()
+                resources["blocker"] = None
+
+        async def close_repository() -> None:
+            repository = resources["repository"]
+            if repository is not None:
+                await repository.close()
+                resources["repository"] = None
+
+        async def close_sources() -> None:
+            sources = resources["sources"]
+            if sources is not None:
+                await sources.close()
+                resources["sources"] = None
+
+        async def close_connection() -> None:
+            connection = resources["connection"]
+            if connection is not None:
+                await connection.close()
+                resources["connection"] = None
+
+        cleanup_operations = (
+            ("blocker_transaction_rollback", rollback_blocker_transaction),
+            ("record_task_cancel_and_join", cancel_and_join_record_task),
+            ("blocker_close", close_blocker),
+            ("repository_close", close_repository),
+            ("sources_close", close_sources),
+            ("connection_close", close_connection),
+        )
+        await _run_native_with_safe_diagnostic_cleanup(
+            request,
+            body,
+            cleanup_operations,
+            observer_enabled=observer_enabled,
+        )
 
     asyncio.run(exercise())
+
+
+def test_native_diagnostic_wrapper_captures_primary_before_separate_cleanup() -> None:
+    from types import SimpleNamespace
+
+    class InvalidPasswordError(Exception):
+        pass
+
+    request = SimpleNamespace(node=SimpleNamespace(user_properties=[]))
+    primary_error = RuntimeError("primary-secret-must-not-be-copied")
+    primary_error.sqlstate = "40001"
+    cleanup_error = InvalidPasswordError("private-password-must-not-be-copied")
+    cleanup_error.sqlstate = "28P01"
+    second_cleanup_error = OSError("secondary-secret-must-not-be-copied")
+    cleanup_order = []
+
+    async def fail_primary():
+        cleanup_order.append("body")
+        raise primary_error
+
+    async def fail_first_cleanup():
+        cleanup_order.append("blocker_close")
+        assert request.node.user_properties[0][0] == "task11_eval_primary_failure_v4"
+        raise cleanup_error
+
+    async def fail_second_cleanup():
+        cleanup_order.append("connection_close")
+        raise second_cleanup_error
+
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(
+            _run_native_with_safe_diagnostic_cleanup(
+                request,
+                fail_primary,
+                (
+                    ("blocker_close", fail_first_cleanup),
+                    ("connection_close", fail_second_cleanup),
+                ),
+                observer_enabled=True,
+            )
+        )
+
+    assert caught.value is primary_error
+    assert cleanup_order == ["body", "blocker_close", "connection_close"]
+    primary = json.loads(request.node.user_properties[0][1])
+    cleanup = [
+        json.loads(value)
+        for name, value in request.node.user_properties
+        if name == "task11_eval_cleanup_failure_v4"
+    ]
+    assert set(primary) == {
+        "schema_version",
+        "phase",
+        "exception_class",
+        "sqlstate",
+        "frames",
+    }
+    assert primary["schema_version"] == 1
+    assert primary["phase"] == "native_test_body"
+    assert primary["exception_class"] == "RuntimeError"
+    assert primary["sqlstate"] == "40001"
+    assert isinstance(primary["frames"], list) and primary["frames"]
+    assert all(
+        set(frame) == {"path", "function", "line"}
+        and not frame["path"].startswith("/")
+        and ".." not in Path(frame["path"]).parts
+        for frame in primary["frames"]
+    )
+    assert len(cleanup) == 2
+    assert all(
+        set(record)
+        == {
+            "schema_version",
+            "phase",
+            "operation",
+            "exception_class",
+            "sqlstate",
+            "frames",
+        }
+        and record["schema_version"] == 1
+        and record["phase"] == "in_test_cleanup"
+        for record in cleanup
+    )
+    assert [(record["operation"], record["exception_class"], record["sqlstate"]) for record in cleanup] == [
+        ("blocker_close", "InvalidPasswordError", "28P01"),
+        ("connection_close", "OSError", None),
+    ]
+    assert all(
+        isinstance(record["frames"], list)
+        and all(
+            set(frame) == {"path", "function", "line"}
+            and not frame["path"].startswith("/")
+            and ".." not in Path(frame["path"]).parts
+            for frame in record["frames"]
+        )
+        for record in cleanup
+    )
+    serialized = json.dumps(request.node.user_properties, sort_keys=True)
+    for secret in (
+        "primary-secret-must-not-be-copied",
+        "private-password-must-not-be-copied",
+        "secondary-secret-must-not-be-copied",
+    ):
+        assert secret not in serialized
+    assert "InvalidPasswordError" in serialized
+    assert "message" not in serialized
+    assert "locals" not in serialized
+
+
+def test_native_diagnostic_wrapper_keeps_expected_caught_exception_inert() -> None:
+    from types import SimpleNamespace
+
+    request = SimpleNamespace(node=SimpleNamespace(user_properties=[]))
+
+    async def expected_caught_exception():
+        try:
+            raise RuntimeError("expected and handled")
+        except RuntimeError:
+            return "expected-result"
+
+    result = asyncio.run(
+        _run_native_with_safe_diagnostic_cleanup(
+            request,
+            expected_caught_exception,
+            (),
+            observer_enabled=True,
+        )
+    )
+
+    assert result == "expected-result"
+    assert request.node.user_properties == []
+
+
+def test_native_diagnostic_wrapper_off_preserves_original_cleanup_exception_semantics() -> None:
+    from types import SimpleNamespace
+
+    request = SimpleNamespace(node=SimpleNamespace(user_properties=[]))
+    cleanup_order = []
+
+    async def fail_primary():
+        raise RuntimeError("primary")
+
+    async def fail_first_cleanup():
+        cleanup_order.append("first")
+        raise OSError("cleanup")
+
+    async def second_cleanup():
+        cleanup_order.append("second")
+
+    with pytest.raises(OSError, match="cleanup"):
+        asyncio.run(
+            _run_native_with_safe_diagnostic_cleanup(
+                request,
+                fail_primary,
+                (("blocker_close", fail_first_cleanup), ("connection_close", second_cleanup)),
+                observer_enabled=False,
+            )
+        )
+
+    assert cleanup_order == ["first"]
+    assert request.node.user_properties == []
