@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import asyncpg
+import pytest
 from conftest import seed_training_ready_dataset
 from gods_mlops.jobs.admission import GpuAdmission
 from gods_mlops.jobs.checkpoints import FileCheckpointStore
@@ -22,6 +23,15 @@ MIN_FREE_BYTES = 1024**4
 BASE_TIME = datetime.now(UTC)
 OWNER = ProcessIdentity(pid=43122, start_ticks=89123, uid=1009)
 EXTERNAL = ProcessIdentity(pid=52111, start_ticks=99113, uid=1009)
+
+
+def test_lease_expiry_normalization_accepts_datetime_and_repository_iso_value_without_database() -> None:
+    expires_at = datetime(2026, 10, 7, 14, 0, 0, tzinfo=UTC)
+
+    assert _lease_expiry_datetime(expires_at) == expires_at
+    assert _lease_expiry_datetime(expires_at.isoformat()) == expires_at
+    with pytest.raises(ValueError, match="timezone-aware"):
+        _lease_expiry_datetime("2026-10-07T14:00:00")
 
 
 def _observation(when: datetime, *, gpu=(), processes=()) -> dict:
@@ -43,6 +53,14 @@ def _observation(when: datetime, *, gpu=(), processes=()) -> dict:
         filesystem_available_bytes=2 * MIN_FREE_BYTES,
         observed_at=when,
     ).to_dict()
+
+
+def _lease_expiry_datetime(value: datetime | str) -> datetime:
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("lease expiry must be a timezone-aware timestamp")
+    return value.astimezone(UTC)
 
 
 async def _running_probe(database_url: str, *, bind_owner: bool = True):
@@ -93,7 +111,8 @@ async def _running_probe(database_url: str, *, bind_owner: bool = True):
     lease_token = result["lease_token"]
     lease = await repository.get_active_lease(GPU_UUID)
     assert lease is not None and lease["job_id"] == job_id
-    assert lease["expires_at"] > await repository.artifact_database_clock()
+    lease_expires_at = _lease_expiry_datetime(lease["expires_at"])
+    assert lease_expires_at > await repository.artifact_database_clock()
     if bind_owner:
         await queue.bind_process(job_id, lease_token, OWNER)
     monitor = GpuJobMonitor(repository=repository, queue=queue, admission=admission)
