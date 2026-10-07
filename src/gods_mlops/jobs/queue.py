@@ -1550,7 +1550,7 @@ class PostgresJobQueueRepository:
                 or job["lease_expires_at"] != lease["expires_at"]
             ):
                 return None
-            profile = await self._evaluation_progress_profile(connection, job)
+            profile = await self._evaluation_progress_profile(connection, job, lock_profile=False)
             source = _evaluation_progress_probe_input(job, profile)
             if source.evaluation_checkpoint_source is None or (
                 source.evaluation_checkpoint_source.checkpoint_sha256
@@ -1948,12 +1948,13 @@ class PostgresJobQueueRepository:
                 "idempotent_replay": False,
             }
 
-    async def _evaluation_progress_profile(self, connection, job):
+    async def _evaluation_progress_profile(self, connection, job, *, lock_profile: bool = True):
+        lock_clause = " FOR SHARE" if lock_profile else ""
         profile = await connection.fetchrow(
-            """SELECT phase,target_phase,model_kind,config_version,config_sha256,
+            f"""SELECT phase,target_phase,model_kind,config_version,config_sha256,
                       profile_state,config_json
                FROM gods_mlops_resource_profiles
-               WHERE phase='probe' AND model_kind=$1 AND config_version=$2 FOR SHARE""",
+               WHERE phase='probe' AND model_kind=$1 AND config_version=$2{lock_clause}""",
             job["model_kind"],
             job["config_version"],
         )

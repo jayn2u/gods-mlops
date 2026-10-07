@@ -152,19 +152,30 @@ def _database_state(*, job_state: str = "queued", lease_generation: int = 0):
     }
 
 
+class _ReadOnlySQLTransactionError(RuntimeError):
+    sqlstate = "25006"
+
+
 class _FakeTransaction:
-    def __init__(self, state):
+    def __init__(self, state, *, connection, readonly: bool):
         self.state = state
+        self.connection = connection
+        self.readonly = readonly
         self.snapshot = None
 
     async def __aenter__(self):
         self.snapshot = deepcopy(self.state)
+        if self.readonly:
+            self.connection.readonly_depth += 1
+            self.connection.readonly_transaction_count += 1
         return self
 
     async def __aexit__(self, error_type, error, traceback):
         if error_type is not None:
             self.state.clear()
             self.state.update(self.snapshot)
+        if self.readonly:
+            self.connection.readonly_depth -= 1
         return False
 
 
@@ -172,12 +183,23 @@ class _FakeConnection:
     def __init__(self, state):
         self.state = state
         self.lock_order = []
+        self.readonly_depth = 0
+        self.readonly_transaction_count = 0
+        self.profile_lock_queries = 0
 
     def transaction(self, *, readonly=False):
-        return _FakeTransaction(self.state)
+        return _FakeTransaction(self.state, connection=self, readonly=readonly)
 
     async def fetchrow(self, query: str, *args):
         normalized = " ".join(query.split()).lower()
+        if "from gods_mlops_resource_profiles" in normalized:
+            if "for share" in normalized:
+                self.profile_lock_queries += 1
+                if self.readonly_depth:
+                    raise _ReadOnlySQLTransactionError(
+                        "cannot execute SELECT FOR SHARE in a read-only transaction"
+                    )
+            return deepcopy(self.state["profile"])
         if "from gods_mlops_jobs" in normalized:
             self.lock_order.append("job") if "for update" in normalized else None
             return deepcopy(self.state["job"])
@@ -189,8 +211,6 @@ class _FakeConnection:
             if len(args) > 1 and str(lease["lease_token"]) != str(args[1]):
                 return None
             return deepcopy(lease)
-        if "from gods_mlops_resource_profiles" in normalized:
-            return deepcopy(self.state["profile"])
         if "from gods_mlops_worker_artifact_deadlines" in normalized:
             deadline = self.state["deadline"]
             if deadline is None:
@@ -427,6 +447,39 @@ def test_immediate_queue_yield_keeps_its_existing_return_and_call_semantics() ->
     assert queue._repository.calls == [(_JOB_ID, "existing_immediate_reason", None)]
 
 
+def test_pending_evaluation_progress_profile_read_is_safe_in_readonly_transaction(monkeypatch) -> None:
+    request_yield = _require(PostgresJobQueueRepository.request_yield, "request_yield(after_progress=...)")
+    pending = _require(
+        getattr(PostgresJobQueueRepository, "pending_evaluation_progress_yield", None),
+        "pending_evaluation_progress_yield",
+    )
+    state = _database_state()
+    repository, connection = _repository(state, monkeypatch)
+    target = _target(state["probe_input"], state["profile_object"])
+    armed = asyncio.run(request_yield(repository, _JOB_ID, _REASON, after_progress=target))
+    _activate_generation_one(state)
+
+    pending_arm = asyncio.run(
+        pending(
+            repository,
+            job_id=_JOB_ID,
+            lease_token=_LEASE_TOKEN,
+            fencing_token=1,
+            input_sha256=state["job"]["input_sha256"],
+            config_sha256=state["job"]["config_sha256"],
+            training_source_checkpoint_sha256=state["source"].checkpoint_sha256,
+        )
+    )
+
+    assert armed["pending_first_attempt"] is True
+    assert pending_arm["arm_event_id"] == armed["arm_event_id"]
+    assert pending_arm["expected_lease_generation"] == 1
+    assert connection.readonly_transaction_count == 1
+    assert connection.readonly_depth == 0
+    # Arming keeps its profile row lock; the pending read does not add one.
+    assert connection.profile_lock_queries == 1
+
+
 def test_arm_is_first_lease_only_and_same_fence_replay_does_not_duplicate_events(monkeypatch) -> None:
     request_yield = _require(PostgresJobQueueRepository.request_yield, "request_yield(after_progress=...)")
     pending = _require(
@@ -617,6 +670,7 @@ def test_profile_lock_wait_rechecks_lease_and_artifact_deadline_before_publish(m
 
     assert [event["event_type"] for event in state["events"]] == ["evaluation_yield_armed"]
     assert state["job"]["state"] == "running"
+    assert connection.profile_lock_queries == 2
 
 
 @pytest.mark.parametrize(
