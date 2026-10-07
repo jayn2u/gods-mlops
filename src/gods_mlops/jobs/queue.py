@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import posixpath
 import re
@@ -44,6 +45,7 @@ _OPERATOR_QUEUE_STATES = (
     "waiting_capacity",
 )
 _MAX_OPERATOR_RETRY_INTENT_GENERATIONS = 4096
+_ACTIVE_ARTIFACT_WRITER_WATCHERS: set[asyncio.Task] = set()
 
 
 class DatasetNotReadyForTrainingError(ValueError):
@@ -203,6 +205,237 @@ class PostgresJobQueueRepository:
             lease_token,
         )
         return job, lease
+
+    async def artifact_database_clock(self) -> datetime:
+        """Read the authority database clock used to anchor controller deadlines."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            return await connection.fetchval("SELECT clock_timestamp()")
+
+    async def bind_worker_artifact_deadline(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        fencing_token: int,
+        controller_invocation_id: str,
+        candidate_deadline_at: datetime,
+    ) -> dict[str, Any]:
+        """Bind one exact UTC deadline to the currently admitted worker fence."""
+        from gods_mlops.training.artifact_deadlines import artifact_deadline_for_attempt
+
+        try:
+            invocation_id = str(UUID(controller_invocation_id))
+        except (TypeError, ValueError, AttributeError) as error:
+            raise ValueError("controller invocation ID is invalid") from error
+        if invocation_id != controller_invocation_id:
+            raise ValueError("controller invocation ID is not canonical")
+        if candidate_deadline_at.tzinfo is None or candidate_deadline_at.utcoffset() != UTC.utcoffset(None):
+            raise ValueError("artifact deadline candidate must be a timezone-aware UTC timestamp")
+        if fencing_token <= 0:
+            raise ValueError("worker fence must be positive")
+
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
+                )
+                database_now = await connection.fetchval("SELECT clock_timestamp()")
+                if (
+                    job is None
+                    or lease is None
+                    or str(job["lease_token"]) != str(lease["lease_token"])
+                    or int(job["lease_generation"]) != fencing_token
+                    or int(lease["fencing_token"]) != fencing_token
+                    or job["state"] != "running"
+                    or lease["expires_at"] <= database_now
+                ):
+                    raise RuntimeError("worker artifact deadline requires the current unexpired running fence")
+
+                same_fence = await connection.fetchrow(
+                    """SELECT * FROM gods_mlops_worker_artifact_deadlines
+                       WHERE job_id=$1::uuid AND fencing_token=$2 FOR UPDATE""",
+                    job_id,
+                    fencing_token,
+                )
+                same_invocation = None
+                if same_fence is None:
+                    same_invocation = await connection.fetchrow(
+                        """SELECT * FROM gods_mlops_worker_artifact_deadlines
+                           WHERE job_id=$1::uuid AND controller_invocation_id=$2::uuid
+                           ORDER BY created_at, fencing_token LIMIT 1""",
+                        job_id,
+                        invocation_id,
+                    )
+                selected = artifact_deadline_for_attempt(
+                    existing_fence=dict(same_fence) if same_fence is not None else None,
+                    existing_invocation=dict(same_invocation) if same_invocation is not None else None,
+                    controller_invocation_id=invocation_id,
+                    lease_token=str(lease_token),
+                    candidate_deadline_at=candidate_deadline_at,
+                )
+                deadline_at = selected["artifact_deadline_at"].astimezone(UTC)
+                if deadline_at <= database_now:
+                    raise TimeoutError("worker artifact deadline has expired")
+                if same_fence is None:
+                    await connection.execute(
+                        """INSERT INTO gods_mlops_worker_artifact_deadlines(
+                               job_id, fencing_token, lease_token, controller_invocation_id,
+                               artifact_deadline_at
+                           ) VALUES($1::uuid,$2,$3::uuid,$4::uuid,$5)""",
+                        job_id,
+                        fencing_token,
+                        lease_token,
+                        selected["controller_invocation_id"],
+                        deadline_at,
+                    )
+                return {
+                    "job_id": str(job_id),
+                    "fencing_token": fencing_token,
+                    "lease_token": str(lease_token),
+                    "controller_invocation_id": selected["controller_invocation_id"],
+                    "artifact_deadline_at": deadline_at,
+                    "database_now": database_now,
+                }
+
+    async def read_worker_artifact_deadline(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        fencing_token: int,
+    ) -> dict[str, Any]:
+        """Read the exact current fence deadline and DB clock for worker startup."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
+                )
+                database_now = await connection.fetchval("SELECT clock_timestamp()")
+                if (
+                    job is None
+                    or lease is None
+                    or job["state"] != "running"
+                    or str(job["lease_token"]) != str(lease["lease_token"])
+                    or int(job["lease_generation"]) != fencing_token
+                    or int(lease["fencing_token"]) != fencing_token
+                    or lease["expires_at"] <= database_now
+                ):
+                    raise RuntimeError("worker artifact deadline has no current unexpired fence")
+                row = await connection.fetchrow(
+                    """SELECT * FROM gods_mlops_worker_artifact_deadlines
+                       WHERE job_id=$1::uuid AND fencing_token=$2""",
+                    job_id,
+                    fencing_token,
+                )
+                if row is None or str(row["lease_token"]) != str(lease_token):
+                    raise RuntimeError("worker artifact deadline authority record is missing or mismatched")
+                if row["artifact_deadline_at"] <= database_now:
+                    raise TimeoutError("worker artifact deadline has expired")
+                return {
+                    "job_id": str(job_id),
+                    "fencing_token": fencing_token,
+                    "lease_token": str(lease_token),
+                    "controller_invocation_id": str(row["controller_invocation_id"]),
+                    "artifact_deadline_at": row["artifact_deadline_at"],
+                    "database_now": database_now,
+                }
+
+    async def artifact_deadline_for_fence(
+        self, *, job_id: str, lease_token: str, fencing_token: int
+    ) -> dict[str, Any] | None:
+        """Read an existing deadline for immutable retained-Job comparison."""
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT * FROM gods_mlops_worker_artifact_deadlines
+                   WHERE job_id=$1::uuid AND fencing_token=$2""",
+                job_id,
+                fencing_token,
+            )
+        if row is None:
+            return None
+        if str(row["lease_token"]) != str(lease_token):
+            raise RuntimeError("retained worker deadline is bound to a different lease token")
+        return {
+            "job_id": str(job_id),
+            "fencing_token": fencing_token,
+            "lease_token": str(lease_token),
+            "controller_invocation_id": str(row["controller_invocation_id"]),
+            "artifact_deadline_at": row["artifact_deadline_at"],
+        }
+
+    async def _assert_artifact_write_deadline(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        job: asyncpg.Record,
+        lease: asyncpg.Record,
+        database_now: datetime,
+        expected_invocation_id: str | None = None,
+        expected_deadline_at: datetime | None = None,
+    ) -> None:
+        from gods_mlops.jobs.checkpoints import CheckpointIdentityError, StaleCheckpointOwnerError
+
+        if (expected_invocation_id is None) != (expected_deadline_at is None):
+            raise CheckpointIdentityError("artifact deadline authority fields are incomplete")
+        if (
+            str(job["lease_token"]) != str(lease["lease_token"])
+            or int(job["lease_generation"]) != int(lease["fencing_token"])
+            or lease["expires_at"] <= database_now
+        ):
+            raise StaleCheckpointOwnerError("artifact writer no longer owns the current unexpired fence")
+        row = await connection.fetchrow(
+            """SELECT * FROM gods_mlops_worker_artifact_deadlines
+               WHERE job_id=$1::uuid AND fencing_token=$2 FOR SHARE""",
+            job["job_id"],
+            lease["fencing_token"],
+        )
+        if row is None:
+            if expected_invocation_id is not None:
+                raise CheckpointIdentityError("worker artifact deadline authority record is missing")
+            return
+        if str(row["lease_token"]) != str(lease["lease_token"]):
+            raise StaleCheckpointOwnerError("artifact deadline belongs to a replaced lease token")
+        if row["artifact_deadline_at"] <= database_now:
+            raise TimeoutError("worker artifact deadline has expired")
+        if expected_invocation_id is not None and (
+            str(row["controller_invocation_id"]) != str(expected_invocation_id)
+            or row["artifact_deadline_at"] != expected_deadline_at
+        ):
+            raise CheckpointIdentityError("worker artifact deadline differs from its durable authority record")
+
+    async def _require_artifact_writers_quiescent(
+        self,
+        connection: asyncpg.Connection,
+        *,
+        job_id: str,
+        operation_id: str,
+        required: bool,
+    ) -> None:
+        from gods_mlops.jobs.checkpoints import StaleCheckpointOwnerError
+
+        rows = await connection.fetch(
+            """SELECT event_type,details FROM gods_mlops_job_events
+               WHERE job_id=$1::uuid AND event_type IN
+                 ('artifact_write_started','artifact_write_quiescent')
+               ORDER BY event_id""",
+            job_id,
+        )
+        attempts = [
+            (row["event_type"], _json_value(row["details"]))
+            for row in rows
+            if str(_json_value(row["details"]).get("operation_id", "")) == operation_id
+        ]
+        starts = [event for event in attempts if event[0] == "artifact_write_started"]
+        if (required and not starts) or _unmatched_artifact_writers(attempts):
+            raise StaleCheckpointOwnerError("artifact publication is blocked until every writer is quiescent")
 
     async def ensure_schema(self) -> None:
         if self._schema_ready:
@@ -1760,6 +1993,8 @@ class PostgresJobQueueRepository:
         operation: str,
         source_registry: DatasetSourceRegistry | None = None,
         runtime_measurements: dict[str, Any] | None = None,
+        artifact_invocation_id: str | None = None,
+        artifact_deadline_at: datetime | None = None,
     ) -> str | None:
         """Persist an exact S3 write intent and charge its reserved bytes before object I/O."""
         from gods_mlops.jobs.checkpoints import CheckpointIdentityError, StaleCheckpointOwnerError
@@ -1815,6 +2050,15 @@ class PostgresJobQueueRepository:
                     or job["state"] not in allowed_states
                 ):
                     raise StaleCheckpointOwnerError("artifact writer no longer owns the active GPU lease")
+                database_now = await connection.fetchval("SELECT clock_timestamp()")
+                await self._assert_artifact_write_deadline(
+                    connection,
+                    job=job,
+                    lease=lease,
+                    database_now=database_now,
+                    expected_invocation_id=artifact_invocation_id,
+                    expected_deadline_at=artifact_deadline_at,
+                )
                 if identity != _checkpoint_identity_from_row(job) or str(job["job_id"]) != job_id:
                     raise CheckpointIdentityError("artifact write identity differs from the immutable job")
                 if identity.phase == "evaluation":
@@ -1833,7 +2077,19 @@ class PostgresJobQueueRepository:
                     and str(job["checkpoint_sha256"] or "").strip() == digest
                     and _json_value(job["checkpoint_identity"] or {}) == identity.as_dict()
                 ):
-                    return None
+                    committed = await connection.fetchrow(
+                        """SELECT details FROM gods_mlops_job_events
+                           WHERE job_id=$1::uuid AND event_type='checkpoint_committed'
+                             AND details->>'checkpoint_uri'=$2 AND details->>'sha256'=$3
+                           ORDER BY event_id DESC LIMIT 1""",
+                        job_id,
+                        uri,
+                        digest,
+                    )
+                    existing_operation_id = (
+                        _json_value(committed["details"]).get("operation_id") if committed else None
+                    )
+                    return str(existing_operation_id) if existing_operation_id else None
                 profile = await connection.fetchrow(
                     """SELECT checkpoint_reservation_bytes,result_reservation_bytes
                        FROM gods_mlops_resource_profiles
@@ -1909,9 +2165,12 @@ class PostgresJobQueueRepository:
                         if (
                             existing_uri == uri
                             and details.get("sha256") == digest
+                            and details.get("size_bytes") == size_bytes
                             and details.get("identity") == identity.as_dict()
+                            and details.get("runtime_measurements") == measured_details
                         ):
-                            return None
+                            existing_operation_id = details.get("operation_id")
+                            return str(existing_operation_id) if existing_operation_id else None
                         raise ResultArtifactConflictError(
                             "result artifact kind already has different immutable bytes"
                         )
@@ -1937,10 +2196,7 @@ class PostgresJobQueueRepository:
                         and details.get("size_bytes") == size_bytes
                         and details.get("identity") == identity.as_dict()
                         and details.get("kind") == kind
-                        and (
-                            measured_details is None
-                            or details.get("runtime_measurements") == measured_details
-                        )
+                        and details.get("runtime_measurements") == measured_details
                     ):
                         return operation_id
                     if operation == "result":
@@ -1971,7 +2227,7 @@ class PostgresJobQueueRepository:
                     "charge_bytes": charge_bytes,
                     "identity": identity.as_dict(),
                 }
-                if operation == "result" and measured_details is not None:
+                if operation == "result":
                     details["runtime_measurements"] = measured_details
                 if operation == "checkpoint":
                     details.update(
@@ -1982,6 +2238,7 @@ class PostgresJobQueueRepository:
                             "previous_size_bytes": getattr(prepared, "previous_size_bytes", None),
                         }
                     )
+                details["writer_quiescence_required"] = True
                 await connection.execute(
                     """UPDATE gods_mlops_artifact_reservations
                        SET consumed_bytes=consumed_bytes+$2 WHERE job_id=$1::uuid""",
@@ -1999,6 +2256,154 @@ class PostgresJobQueueRepository:
                 )
                 return operation_id
 
+    async def record_artifact_writer_started(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        operation_id: str,
+        writer_attempt_id: str,
+        artifact_invocation_id: str | None = None,
+        artifact_deadline_at: datetime | None = None,
+    ) -> None:
+        """Persist the writer attempt before its thread can touch the object store."""
+        from gods_mlops.jobs.checkpoints import CheckpointIdentityError, StaleCheckpointOwnerError
+
+        attempt_id = str(UUID(writer_attempt_id))
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                job, lease = await self._lock_job_then_lease(
+                    connection, job_id=job_id, lease_token=lease_token
+                )
+                database_now = await connection.fetchval("SELECT clock_timestamp()")
+                if (
+                    job is None
+                    or lease is None
+                    or str(job["lease_token"]) != str(lease["lease_token"])
+                    or job["state"] not in {"running", "yield_requested"}
+                ):
+                    raise StaleCheckpointOwnerError("artifact writer start no longer has the current GPU lease")
+                await self._assert_artifact_write_deadline(
+                    connection,
+                    job=job,
+                    lease=lease,
+                    database_now=database_now,
+                    expected_invocation_id=artifact_invocation_id,
+                    expected_deadline_at=artifact_deadline_at,
+                )
+                events = await connection.fetch(
+                    """SELECT event_type, details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type IN
+                         ('artifact_write_pending','artifact_write_deleted','checkpoint_committed',
+                          'result_artifact_committed','artifact_write_started','artifact_write_quiescent')
+                       ORDER BY event_id""",
+                    job_id,
+                )
+                pending = None
+                committed = False
+                deleted = False
+                for row in events:
+                    details = _json_value(row["details"])
+                    if str(details.get("operation_id", "")) != operation_id:
+                        continue
+                    if row["event_type"] == "artifact_write_pending":
+                        pending = details
+                    elif row["event_type"] in {"checkpoint_committed", "result_artifact_committed"}:
+                        committed = True
+                    elif row["event_type"] == "artifact_write_deleted":
+                        deleted = True
+                    elif (
+                        row["event_type"] == "artifact_write_started"
+                        and str(details.get("writer_attempt_id")) == attempt_id
+                    ):
+                        return
+                if deleted or (pending is None and not committed):
+                    raise CheckpointIdentityError("artifact writer start has no pending or committed exact operation")
+                if pending is not None:
+                    if pending.get("operation") not in {"checkpoint", "result"}:
+                        raise CheckpointIdentityError("artifact writer start has an invalid pending operation")
+                    allowed_states = {"running", "yield_requested"} if pending["operation"] == "checkpoint" else {"running"}
+                    if job["state"] not in allowed_states:
+                        raise StaleCheckpointOwnerError("artifact writer start is forbidden for this job state")
+                await connection.execute(
+                    """INSERT INTO gods_mlops_job_events(
+                           job_id,event_type,state,fencing_token,details
+                       ) VALUES($1::uuid,'artifact_write_started',$2,$3,$4::jsonb)""",
+                    job_id,
+                    job["state"],
+                    lease["fencing_token"],
+                    _canonical_json(
+                        {
+                            "operation_id": operation_id,
+                            "writer_attempt_id": attempt_id,
+                            "lease_token": str(lease_token),
+                            "fencing_token": int(lease["fencing_token"]),
+                        }
+                    ),
+                )
+
+    async def record_artifact_writer_quiescent(
+        self,
+        *,
+        job_id: str,
+        operation_id: str,
+        writer_attempt_id: str,
+    ) -> None:
+        """Record that a submitted writer thread has actually returned."""
+        from gods_mlops.jobs.checkpoints import CheckpointIdentityError
+
+        attempt_id = str(UUID(writer_attempt_id))
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            async with connection.transaction():
+                job = await connection.fetchrow(
+                    "SELECT state FROM gods_mlops_jobs WHERE job_id=$1::uuid", job_id
+                )
+                if job is None:
+                    raise KeyError(f"GPU job {job_id} does not exist")
+                events = await connection.fetch(
+                    """SELECT event_type, fencing_token, details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid AND event_type IN
+                         ('artifact_write_started','artifact_write_quiescent')
+                       ORDER BY event_id""",
+                    job_id,
+                )
+                started = None
+                for row in events:
+                    details = _json_value(row["details"])
+                    if (
+                        str(details.get("operation_id", "")) == operation_id
+                        and str(details.get("writer_attempt_id", "")) == attempt_id
+                    ):
+                        if row["event_type"] == "artifact_write_started":
+                            started = row
+                        elif started is None:
+                            raise CheckpointIdentityError("artifact writer quiescence has no durable start event")
+                        elif row["event_type"] == "artifact_write_quiescent":
+                            return
+                if started is None:
+                    raise CheckpointIdentityError("artifact writer quiescence has no durable start event")
+                start_details = _json_value(started["details"])
+                await connection.execute(
+                    """INSERT INTO gods_mlops_job_events(
+                           job_id,event_type,state,fencing_token,details
+                       ) VALUES($1::uuid,'artifact_write_quiescent',$2,$3,$4::jsonb)""",
+                    job_id,
+                    job["state"],
+                    started["fencing_token"],
+                    _canonical_json(
+                        {
+                            "operation_id": operation_id,
+                            "writer_attempt_id": attempt_id,
+                            "lease_token": start_details.get("lease_token"),
+                            "fencing_token": start_details.get("fencing_token"),
+                        }
+                    ),
+                )
+
     async def commit_checkpoint(
         self,
         *,
@@ -2010,6 +2415,92 @@ class PostgresJobQueueRepository:
         source_registry: DatasetSourceRegistry | None = None,
         operation_id: str | None = None,
         precharged: bool = False,
+        verified_artifact=None,
+        artifact_invocation_id: str | None = None,
+        artifact_deadline_at: datetime | None = None,
+    ):
+        try:
+            return await self._commit_checkpoint_transaction(
+                job_id=job_id,
+                lease_token=lease_token,
+                identity=identity,
+                prepared=prepared,
+                store=store,
+                source_registry=source_registry,
+                operation_id=operation_id,
+                precharged=precharged,
+                verified_artifact=verified_artifact,
+                artifact_invocation_id=artifact_invocation_id,
+                artifact_deadline_at=artifact_deadline_at,
+            )
+        except BaseException:
+            if operation_id and precharged and verified_artifact is not None:
+                try:
+                    committed = await asyncio.shield(
+                        self._checkpoint_operation_matches(
+                            job_id=job_id,
+                            operation_id=operation_id,
+                            identity=identity,
+                            prepared=prepared,
+                            store=store,
+                            verified=verified_artifact,
+                        )
+                    )
+                except BaseException:
+                    committed = False
+                if committed:
+                    return verified_artifact
+            raise
+
+    async def _checkpoint_operation_matches(
+        self, *, job_id: str, operation_id: str, identity, prepared, store, verified
+    ) -> bool:
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT j.checkpoint_uri,j.checkpoint_sha256,j.checkpoint_identity,e.details
+                   FROM gods_mlops_jobs j JOIN gods_mlops_job_events e ON e.job_id=j.job_id
+                   WHERE j.job_id=$1::uuid AND e.event_type='checkpoint_committed'
+                     AND e.details->>'operation_id'=$2
+                   ORDER BY e.event_id DESC LIMIT 1""",
+                job_id,
+                operation_id,
+            )
+        if row is None:
+            return False
+        details = _json_value(row["details"])
+        uri = _prepared_artifact_uri(prepared, store)
+        verified_uri = _verified_checkpoint_uri(verified)
+        return (
+            str(row["checkpoint_uri"] or "") == uri == verified_uri
+            and str(row["checkpoint_sha256"] or "").strip() == str(prepared.sha256).strip()
+            and _json_value(row["checkpoint_identity"] or {}) == identity.as_dict()
+            and details.get("operation_id") == operation_id
+            and details.get("checkpoint_uri") == uri
+            and details.get("sha256") == prepared.sha256
+            and details.get("size_bytes") == prepared.size_bytes
+            and details.get("metadata_size_bytes", 0) == prepared.metadata_size_bytes
+            and details.get("object_key") == getattr(prepared, "object_key", None)
+            and details.get("identity") == identity.as_dict()
+            and str(verified.sha256).strip() == str(prepared.sha256).strip()
+            and int(verified.size_bytes) == int(prepared.size_bytes)
+        )
+
+    async def _commit_checkpoint_transaction(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        identity,
+        prepared,
+        store,
+        source_registry: DatasetSourceRegistry | None = None,
+        operation_id: str | None = None,
+        precharged: bool = False,
+        verified_artifact=None,
+        artifact_invocation_id: str | None = None,
+        artifact_deadline_at: datetime | None = None,
     ):
         from gods_mlops.jobs.checkpoints import (
             CheckpointIdentityError,
@@ -2041,13 +2532,24 @@ class PostgresJobQueueRepository:
                 job, lease = await self._lock_job_then_lease(
                     connection, job_id=job_id, lease_token=lease_token
                 )
+                database_now = await connection.fetchval("SELECT clock_timestamp()")
                 if (
                     job is None
                     or lease is None
                     or str(job["lease_token"]) != str(lease["lease_token"])
+                    or int(job["lease_generation"]) != int(lease["fencing_token"])
+                    or lease["expires_at"] <= database_now
                     or job["state"] not in {"running", "yield_requested"}
                 ):
                     raise StaleCheckpointOwnerError("checkpoint writer no longer owns the active GPU lease")
+                await self._assert_artifact_write_deadline(
+                    connection,
+                    job=job,
+                    lease=lease,
+                    database_now=database_now,
+                    expected_invocation_id=artifact_invocation_id,
+                    expected_deadline_at=artifact_deadline_at,
+                )
                 expected = _checkpoint_identity_from_row(job)
                 if identity != expected or prepared.identity != expected:
                     raise CheckpointIdentityError("checkpoint input, phase, model, or config identity changed")
@@ -2135,16 +2637,63 @@ class PostgresJobQueueRepository:
                     pending_details = _json_value(pending["details"])
                     if (
                         pending_details.get("operation") != "checkpoint"
+                        or pending_details.get("operation_id") != operation_id
                         or pending_details.get("uri") != checkpoint_uri_expected
+                        or pending_details.get("object_key") != getattr(prepared, "object_key", None)
                         or pending_details.get("sha256") != prepared.sha256
                         or pending_details.get("size_bytes") != prepared.size_bytes
+                        or pending_details.get("metadata_size_bytes", 0) != prepared.metadata_size_bytes
+                        or pending_details.get("charge_bytes")
+                        != prepared.size_bytes + prepared.metadata_size_bytes
+                        or pending_details.get("previous_uri") != getattr(prepared, "previous_uri", None)
+                        or pending_details.get("previous_sha256") != getattr(prepared, "previous_sha256", None)
+                        or pending_details.get("previous_size_bytes")
+                        != getattr(prepared, "previous_size_bytes", None)
                         or pending_details.get("identity") != identity.as_dict()
+                        or reservation is None
+                        or reservation["consumed_bytes"] < pending_details.get("charge_bytes", 0)
                     ):
                         raise CheckpointIdentityError("checkpoint write differs from its durable pending intent")
+                    await self._require_artifact_writers_quiescent(
+                        connection,
+                        job_id=job_id,
+                        operation_id=operation_id,
+                        required=getattr(prepared, "object_key", None) is not None,
+                    )
                 if existing_marker:
-                    verified = store.commit(prepared)
+                    if getattr(prepared, "object_key", None) is not None:
+                        verified = verified_artifact
+                        if verified is None:
+                            raise CheckpointIdentityError("S3 checkpoint retry has no off-loop exact readback")
+                        if operation_id:
+                            await self._require_artifact_writers_quiescent(
+                                connection,
+                                job_id=job_id,
+                                operation_id=operation_id,
+                                required=True,
+                            )
+                    else:
+                        verified = store.commit(prepared)
+                    if (
+                        verified.identity != identity
+                        or str(verified.sha256).strip() != str(prepared.sha256).strip()
+                        or int(verified.size_bytes) != int(prepared.size_bytes)
+                        or _verified_checkpoint_uri(verified) != checkpoint_uri_expected
+                    ):
+                        raise CheckpointIdentityError("verified checkpoint retry differs from its commit marker")
                     return verified
-                verified = store.commit(prepared)
+                if getattr(prepared, "object_key", None) is not None:
+                    verified = verified_artifact
+                    if verified is None:
+                        raise CheckpointIdentityError("S3 checkpoint finalization has no verified object")
+                else:
+                    verified = store.commit(prepared)
+                if (
+                    verified.identity != identity
+                    or str(verified.sha256).strip() != str(prepared.sha256).strip()
+                    or int(verified.size_bytes) != int(prepared.size_bytes)
+                ):
+                    raise CheckpointIdentityError("verified checkpoint differs from its immutable write intent")
                 checkpoint_uri = _verified_checkpoint_uri(verified)
                 if checkpoint_uri != checkpoint_uri_expected:
                     raise CheckpointIdentityError("verified checkpoint URI differs from its pending object identity")
@@ -2272,10 +2821,22 @@ class PostgresJobQueueRepository:
                     """SELECT event_type,details FROM gods_mlops_job_events
                        WHERE job_id=$1::uuid
                          AND event_type IN ('artifact_write_pending','artifact_write_deleted',
-                                            'result_artifact_committed','checkpoint_committed')
+                                            'result_artifact_committed','checkpoint_committed',
+                                            'artifact_write_started','artifact_write_quiescent')
                        ORDER BY event_id""",
                     job_id,
                 )
+        writer_events = [
+            (row["event_type"], _json_value(row["details"]))
+            for row in rows
+            if row["event_type"] in {
+                "artifact_write_pending",
+                "artifact_write_started",
+                "artifact_write_quiescent",
+            }
+        ]
+        if _unmatched_artifact_writers(writer_events):
+            raise ValueError("pending artifact cleanup is blocked by an active or unknown object writer")
         pending: dict[str, dict[str, Any]] = {}
         resolved: set[str] = set()
         for row in rows:
@@ -2325,10 +2886,23 @@ class PostgresJobQueueRepository:
                     """SELECT event_type,details FROM gods_mlops_job_events
                        WHERE job_id=$1::uuid AND event_type IN
                          ('artifact_write_pending','artifact_write_deleted',
-                          'result_artifact_committed','checkpoint_committed')
+                          'result_artifact_committed','checkpoint_committed',
+                          'artifact_write_started','artifact_write_quiescent')
                        ORDER BY event_id""",
                     job_id,
                 )
+                writer_events = [
+                    (row["event_type"], _json_value(row["details"]))
+                    for row in rows
+                    if str(_json_value(row["details"]).get("operation_id", "")) == operation_id
+                    and row["event_type"] in {
+                        "artifact_write_pending",
+                        "artifact_write_started",
+                        "artifact_write_quiescent",
+                    }
+                ]
+                if _unmatched_artifact_writers(writer_events):
+                    raise ValueError("artifact deletion is blocked by an active or unknown object writer")
                 pending = None
                 committed = False
                 deleted = False
@@ -2340,7 +2914,7 @@ class PostgresJobQueueRepository:
                         pending = event_details
                     elif row["event_type"] == "artifact_write_deleted":
                         deleted = True
-                    else:
+                    elif row["event_type"] in {"result_artifact_committed", "checkpoint_committed"}:
                         committed = True
                 if deleted:
                     return False
@@ -2522,6 +3096,89 @@ class PostgresJobQueueRepository:
         operation_id: str | None = None,
         precharged: bool = False,
         runtime_measurements: dict[str, Any] | None = None,
+        verified_artifact=None,
+        artifact_invocation_id: str | None = None,
+        artifact_deadline_at: datetime | None = None,
+    ):
+        try:
+            return await self._commit_result_artifact_transaction(
+                job_id=job_id,
+                lease_token=lease_token,
+                identity=identity,
+                prepared=prepared,
+                store=store,
+                source_registry=source_registry,
+                operation_id=operation_id,
+                precharged=precharged,
+                runtime_measurements=runtime_measurements,
+                verified_artifact=verified_artifact,
+                artifact_invocation_id=artifact_invocation_id,
+                artifact_deadline_at=artifact_deadline_at,
+            )
+        except BaseException:
+            if operation_id and precharged and verified_artifact is not None:
+                try:
+                    committed = await asyncio.shield(
+                        self._result_operation_matches(
+                            job_id=job_id,
+                            operation_id=operation_id,
+                            identity=identity,
+                            prepared=prepared,
+                            verified=verified_artifact,
+                            runtime_measurements=runtime_measurements,
+                        )
+                    )
+                except BaseException:
+                    committed = False
+                if committed:
+                    return verified_artifact
+            raise
+
+    async def _result_operation_matches(
+        self, *, job_id: str, operation_id: str, identity, prepared, verified, runtime_measurements
+    ) -> bool:
+        measured_details = json.loads(_canonical_json(runtime_measurements)) if runtime_measurements is not None else None
+        await self.ensure_schema()
+        pool = await self._get_pool()
+        async with pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """SELECT details FROM gods_mlops_job_events
+                   WHERE job_id=$1::uuid AND event_type='result_artifact_committed'
+                     AND details->>'operation_id'=$2
+                   ORDER BY event_id DESC LIMIT 1""",
+                job_id,
+                operation_id,
+            )
+        if row is None:
+            return False
+        details = _json_value(row["details"])
+        return (
+            details.get("operation_id") == operation_id
+            and details.get("kind") == prepared.kind == verified.kind
+            and details.get("uri") == _prepared_artifact_uri(prepared, store=None)
+            and details.get("object_key") == getattr(prepared, "object_key", None)
+            and details.get("sha256") == prepared.sha256 == verified.sha256
+            and details.get("size_bytes") == prepared.size_bytes == verified.size_bytes
+            and details.get("identity") == identity.as_dict()
+            and details.get("runtime_measurements") == measured_details
+            and verified.identity == identity
+        )
+
+    async def _commit_result_artifact_transaction(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        identity,
+        prepared,
+        store,
+        source_registry: DatasetSourceRegistry,
+        operation_id: str | None = None,
+        precharged: bool = False,
+        runtime_measurements: dict[str, Any] | None = None,
+        verified_artifact=None,
+        artifact_invocation_id: str | None = None,
+        artifact_deadline_at: datetime | None = None,
     ):
         """Publish one immutable S3/file result under the current fence and reserved quota."""
         from gods_mlops.jobs.checkpoints import CheckpointIdentityError, StaleCheckpointOwnerError
@@ -2551,13 +3208,24 @@ class PostgresJobQueueRepository:
                 job, lease = await self._lock_job_then_lease(
                     connection, job_id=job_id, lease_token=lease_token
                 )
+                database_now = await connection.fetchval("SELECT clock_timestamp()")
                 if (
                     job is None
                     or lease is None
                     or str(job["lease_token"]) != str(lease["lease_token"])
+                    or int(job["lease_generation"]) != int(lease["fencing_token"])
+                    or lease["expires_at"] <= database_now
                     or job["state"] != "running"
                 ):
                     raise StaleCheckpointOwnerError("result artifact writer no longer owns the running GPU lease")
+                await self._assert_artifact_write_deadline(
+                    connection,
+                    job=job,
+                    lease=lease,
+                    database_now=database_now,
+                    expected_invocation_id=artifact_invocation_id,
+                    expected_deadline_at=artifact_deadline_at,
+                )
                 expected = _checkpoint_identity_from_row(job)
                 if identity != expected or prepared.identity != expected or str(job["job_id"]) != job_id:
                     raise CheckpointIdentityError("result artifact input, phase, model, or config identity changed")
@@ -2594,18 +3262,34 @@ class PostgresJobQueueRepository:
                 if same_kind and any(
                     item.get("sha256") != prepared.sha256
                     or item.get("identity") != identity.as_dict()
-                    or (
-                        measured_details is not None
-                        and item.get("runtime_measurements") != measured_details
-                    )
+                    or item.get("runtime_measurements") != measured_details
                     for item in same_kind
                 ):
                     raise ResultArtifactConflictError("result artifact kind already has different immutable bytes")
                 if same_kind:
                     prior = same_kind[-1]
-                    verified = store.commit(prepared)
+                    if getattr(prepared, "object_key", None) is not None:
+                        verified = verified_artifact
+                        if verified is None:
+                            raise CheckpointIdentityError("S3 result retry has no off-loop exact readback")
+                        if operation_id:
+                            await self._require_artifact_writers_quiescent(
+                                connection,
+                                job_id=job_id,
+                                operation_id=operation_id,
+                                required=True,
+                            )
+                    else:
+                        verified = store.commit(prepared)
                     if prior.get("uri") != verified.uri or prior.get("size_bytes") != verified.size_bytes:
                         raise ResultArtifactConflictError("result artifact retry does not match its prior commit")
+                    if (
+                        verified.identity != identity
+                        or verified.kind != prepared.kind
+                        or verified.sha256 != prepared.sha256
+                        or (operation_id is not None and prior.get("operation_id") != operation_id)
+                    ):
+                        raise ResultArtifactConflictError("result artifact retry verification differs from its marker")
                     return verified
                 if (
                     reservation["state"] != "reserved"
@@ -2630,18 +3314,38 @@ class PostgresJobQueueRepository:
                     pending_details = _json_value(pending["details"])
                     if (
                         pending_details.get("operation") != "result"
+                        or pending_details.get("operation_id") != operation_id
                         or pending_details.get("kind") != prepared.kind
                         or pending_details.get("uri") != _prepared_artifact_uri(prepared, store)
+                        or pending_details.get("object_key") != getattr(prepared, "object_key", None)
                         or pending_details.get("sha256") != prepared.sha256
                         or pending_details.get("size_bytes") != prepared.size_bytes
+                        or pending_details.get("charge_bytes") != prepared.size_bytes
                         or pending_details.get("identity") != identity.as_dict()
-                        or (
-                            measured_details is not None
-                            and pending_details.get("runtime_measurements") != measured_details
-                        )
+                        or pending_details.get("runtime_measurements") != measured_details
+                        or reservation["consumed_bytes"] < pending_details.get("charge_bytes", 0)
                     ):
                         raise CheckpointIdentityError("result write differs from its durable pending intent")
-                verified = store.commit(prepared)
+                    await self._require_artifact_writers_quiescent(
+                        connection,
+                        job_id=job_id,
+                        operation_id=operation_id,
+                        required=getattr(prepared, "object_key", None) is not None,
+                    )
+                if getattr(prepared, "object_key", None) is not None:
+                    verified = verified_artifact
+                    if verified is None:
+                        raise CheckpointIdentityError("S3 result finalization has no verified object")
+                else:
+                    verified = store.commit(prepared)
+                if (
+                    verified.identity != identity
+                    or verified.kind != prepared.kind
+                    or str(verified.sha256).strip() != str(prepared.sha256).strip()
+                    or int(verified.size_bytes) != int(prepared.size_bytes)
+                    or verified.uri != _prepared_artifact_uri(prepared, store)
+                ):
+                    raise CheckpointIdentityError("verified result differs from its immutable write intent")
                 details = {
                     "kind": prepared.kind,
                     "uri": verified.uri,
@@ -2651,8 +3355,7 @@ class PostgresJobQueueRepository:
                     "object_key": getattr(prepared, "object_key", None),
                     "operation_id": operation_id,
                 }
-                if measured_details is not None:
-                    details["runtime_measurements"] = measured_details
+                details["runtime_measurements"] = measured_details
                 if not precharged:
                     await connection.execute(
                         "UPDATE gods_mlops_artifact_reservations SET consumed_bytes=consumed_bytes+$2 WHERE job_id=$1::uuid",
@@ -3199,6 +3902,18 @@ class PostgresJobQueueRepository:
                     return _job_dict(job)
                 if job["state"] not in {"completed", "failed", "cancelled"}:
                     raise ValueError("only terminal jobs can settle their artifact reservation")
+                writer_rows = await connection.fetch(
+                    """SELECT event_type,details FROM gods_mlops_job_events
+                       WHERE job_id=$1::uuid
+                         AND event_type IN ('artifact_write_pending','artifact_write_started',
+                                            'artifact_write_quiescent')
+                       ORDER BY event_id""",
+                    job_id,
+                )
+                if _unmatched_artifact_writers(
+                    [(row["event_type"], _json_value(row["details"])) for row in writer_rows]
+                ):
+                    raise ValueError("artifact reservation cannot settle while an object writer is active or unknown")
                 if usage["used_bytes"] < reservation["reserved_bytes"]:
                     raise RuntimeError("shared object-storage ledger is below the active reservation")
                 used_after = usage["used_bytes"] - reservation["reserved_bytes"] + reservation["consumed_bytes"]
@@ -4158,6 +4873,58 @@ class JobQueue:
             lease_seconds=GPU_LEASE_SECONDS,
         )
 
+    async def _tracked_s3_artifact_write(
+        self,
+        *,
+        job_id: str,
+        lease_token: str,
+        operation_id: str,
+        store,
+        prepared,
+        artifact_deadline: dict[str, Any] | None,
+    ):
+        writer_attempt_id = str(uuid4())
+        deadline_kwargs = _artifact_deadline_kwargs(artifact_deadline)
+        await self._repository.record_artifact_writer_started(
+            job_id=job_id,
+            lease_token=lease_token,
+            operation_id=operation_id,
+            writer_attempt_id=writer_attempt_id,
+            **deadline_kwargs,
+        )
+        loop = asyncio.get_running_loop()
+        writer_future = loop.run_in_executor(None, store.commit, prepared)
+
+        async def record_quiescence() -> None:
+            try:
+                await writer_future
+            except BaseException:
+                pass
+            await self._repository.record_artifact_writer_quiescent(
+                job_id=job_id,
+                operation_id=operation_id,
+                writer_attempt_id=writer_attempt_id,
+            )
+
+        quiescence_task = asyncio.create_task(record_quiescence())
+        _ACTIVE_ARTIFACT_WRITER_WATCHERS.add(quiescence_task)
+
+        def release_watcher(task: asyncio.Task) -> None:
+            _ACTIVE_ARTIFACT_WRITER_WATCHERS.discard(task)
+            if not task.cancelled():
+                task.exception()
+
+        quiescence_task.add_done_callback(release_watcher)
+        try:
+            verified = await asyncio.shield(writer_future)
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            await asyncio.shield(quiescence_task)
+            raise
+        await asyncio.shield(quiescence_task)
+        return verified
+
     async def save_checkpoint(
         self,
         *,
@@ -4166,6 +4933,7 @@ class JobQueue:
         lease_token: str,
         identity,
         payload: bytes,
+        artifact_deadline: dict[str, Any] | None = None,
     ):
         """Write payload bytes, then publish metadata only under the current fence."""
         from gods_mlops.jobs.checkpoints import (
@@ -4188,7 +4956,8 @@ class JobQueue:
         if profile is None:
             raise CheckpointIdentityError("checkpoint resource profile is no longer available")
         previous = await self._repository.checkpoint_metadata_for(job_id)
-        prepared = store.prepare(
+        prepared = await asyncio.to_thread(
+            store.prepare,
             identity=identity,
             payload=payload,
             reservation_bytes=profile["checkpoint_reservation_bytes"],
@@ -4209,6 +4978,25 @@ class JobQueue:
                 store=store,
                 operation="checkpoint",
                 source_registry=self._sources,
+                **_artifact_deadline_kwargs(artifact_deadline),
+            )
+        verified_artifact = None
+        if precharged and operation_id:
+            verified_artifact = await self._tracked_s3_artifact_write(
+                job_id=job_id,
+                lease_token=lease_token,
+                operation_id=operation_id,
+                store=store,
+                prepared=prepared,
+                artifact_deadline=artifact_deadline,
+            )
+        elif precharged:
+            verified_artifact = await asyncio.to_thread(
+                store.load_uri,
+                _prepared_artifact_uri(prepared, store),
+                expected_identity=identity,
+                expected_sha256=prepared.sha256,
+                expected_size_bytes=prepared.size_bytes,
             )
         verified = await self._repository.commit_checkpoint(
             job_id=job_id,
@@ -4219,9 +5007,11 @@ class JobQueue:
             source_registry=self._sources,
             operation_id=operation_id,
             precharged=precharged,
+            verified_artifact=verified_artifact,
+            **_artifact_deadline_kwargs(artifact_deadline),
         )
         if previous is not None and previous["uri"] != _verified_checkpoint_uri(verified):
-            store.prune_previous(prepared)
+            await asyncio.to_thread(store.prune_previous, prepared)
             await self._repository.complete_checkpoint_prune(job_id=job_id, previous=previous)
         return verified
 
@@ -4235,10 +5025,18 @@ class JobQueue:
         kind: str,
         payload: bytes,
         runtime_measurements: dict[str, Any] | None = None,
+        artifact_deadline: dict[str, Any] | None = None,
     ):
         """Commit one result bundle under the Task 7 fence and shared reservation."""
         from gods_mlops.jobs.checkpoints import CheckpointIdentityError, StaleCheckpointOwnerError
 
+        measured_snapshot = (
+            json.loads(_canonical_json(runtime_measurements))
+            if runtime_measurements is not None
+            else None
+        )
+        if measured_snapshot is not None and not isinstance(measured_snapshot, dict):
+            raise ValueError("result runtime measurements must be a JSON object")
         current_job = await self.get(job_id)
         expected = await self._repository.checkpoint_identity(job_id)
         if identity != expected:
@@ -4252,7 +5050,8 @@ class JobQueue:
         )
         if profile is None:
             raise CheckpointIdentityError("result resource profile is no longer available")
-        prepared = store.prepare(
+        prepared = await asyncio.to_thread(
+            store.prepare,
             identity=identity,
             kind=kind,
             payload=payload,
@@ -4269,9 +5068,34 @@ class JobQueue:
                 store=store,
                 operation="result",
                 source_registry=self._sources,
-                runtime_measurements=runtime_measurements,
+                runtime_measurements=measured_snapshot,
+                **_artifact_deadline_kwargs(artifact_deadline),
             )
         try:
+            verified_artifact = None
+            if precharged and operation_id:
+                verified_artifact = await self._tracked_s3_artifact_write(
+                    job_id=job_id,
+                    lease_token=lease_token,
+                    operation_id=operation_id,
+                    store=store,
+                    prepared=prepared,
+                    artifact_deadline=artifact_deadline,
+                )
+            elif precharged:
+                existing_details = {
+                    "kind": prepared.kind,
+                    "uri": _prepared_artifact_uri(prepared, store),
+                    "sha256": prepared.sha256,
+                    "size_bytes": prepared.size_bytes,
+                    "identity": identity.as_dict(),
+                    "object_key": getattr(prepared, "object_key", None),
+                }
+                verified_artifact, _payload = await asyncio.to_thread(
+                    store.read_committed,
+                    existing_details,
+                    expected_identity=identity,
+                )
             return await self._repository.commit_result_artifact(
                 job_id=job_id,
                 lease_token=lease_token,
@@ -4281,9 +5105,11 @@ class JobQueue:
                 source_registry=self._sources,
                 operation_id=operation_id,
                 precharged=precharged,
-                runtime_measurements=runtime_measurements,
+                runtime_measurements=measured_snapshot,
+                verified_artifact=verified_artifact,
+                **_artifact_deadline_kwargs(artifact_deadline),
             )
-        except Exception:
+        except BaseException:
             discard = getattr(store, "discard", None)
             if not precharged and callable(discard):
                 discard(prepared)
@@ -4338,7 +5164,8 @@ class JobQueue:
             return []
         completed = []
         for previous in await self._repository.pending_checkpoint_prunes_for(job_id):
-            prune_uri(
+            await asyncio.to_thread(
+                prune_uri,
                 previous["uri"],
                 sha256_digest=previous["sha256"],
                 size_bytes=int(previous["size_bytes"]),
@@ -4380,13 +5207,14 @@ class JobQueue:
         if identity.as_dict() != details["identity"]:
             raise CheckpointIntegrityError("checkpoint identity changed in the job commit marker")
         if hasattr(store, "load_uri"):
-            return store.load_uri(
+            return await asyncio.to_thread(
+                store.load_uri,
                 details["uri"],
                 expected_identity=identity,
                 expected_sha256=details["sha256"],
                 expected_size_bytes=details["size_bytes"],
             )
-        checkpoint = store.load(job_id, expected_identity=identity)
+        checkpoint = await asyncio.to_thread(store.load, job_id, expected_identity=identity)
         if checkpoint is None or checkpoint.sha256 != details["sha256"]:
             raise CheckpointIntegrityError("local checkpoint does not match the database commit marker")
         return checkpoint
@@ -5018,6 +5846,45 @@ def _operator_retry_request_matches(
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def _artifact_deadline_kwargs(authority: dict[str, Any] | None) -> dict[str, Any]:
+    if authority is None:
+        return {"artifact_invocation_id": None, "artifact_deadline_at": None}
+    return {
+        "artifact_invocation_id": authority.get("controller_invocation_id"),
+        "artifact_deadline_at": authority.get("artifact_deadline_at"),
+    }
+
+
+def _unmatched_artifact_writers(events: list[tuple[str, dict[str, Any]]]) -> set[tuple[str, str]]:
+    """Return writer attempts whose thread completion is not durably acknowledged."""
+    started: set[tuple[str, str]] = set()
+    quiescent: set[tuple[str, str]] = set()
+    required_operations: set[str] = set()
+    for event_type, details in events:
+        operation_id = str(details.get("operation_id", ""))
+        attempt_id = str(details.get("writer_attempt_id", ""))
+        if event_type == "artifact_write_pending" and details.get("writer_quiescence_required") is True:
+            if operation_id:
+                required_operations.add(operation_id)
+            else:
+                started.add(("", ""))
+        if not operation_id or not attempt_id:
+            if event_type in {"artifact_write_started", "artifact_write_quiescent"}:
+                started.add(("", ""))
+            continue
+        key = operation_id, attempt_id
+        if event_type == "artifact_write_started":
+            started.add(key)
+        elif event_type == "artifact_write_quiescent":
+            quiescent.add(key)
+    started_operations = {operation_id for operation_id, _attempt_id in started}
+    missing_start = {
+        (operation_id, "<missing-start>")
+        for operation_id in required_operations - started_operations
+    }
+    return (started - quiescent) | (quiescent - started) | missing_start
 
 
 def _checkpoint_lifetime_id(details: dict[str, Any]) -> str:

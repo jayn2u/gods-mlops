@@ -1020,6 +1020,8 @@ def test_docker_probe_starts_only_a_pinned_uid_worker_with_readonly_cache_and_lo
     assert environment["GODS_MLOPS_FENCE"] == "2"
     assert environment["GODS_MLOPS_MODEL_CACHE_ROOT"] == "/mnt/model-cache"
     assert environment["GODS_MLOPS_MODEL_LOCK"] == "/app/models/lock.json"
+    assert "GODS_MLOPS_WORKER_ARTIFACT_DEADLINE_UTC" not in environment
+    assert "GODS_MLOPS_WORKER_ARTIFACT_INVOCATION_ID" not in environment
 
     captured = {}
 

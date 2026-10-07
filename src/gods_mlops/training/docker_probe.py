@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
@@ -27,6 +28,7 @@ from .contracts import locked_model
 from .data import dataset_object_store_from_environment
 from .placement import validate_worker_placement
 from .probe_setup import candidate_profile, create_probe_input, load_evaluation_probe_checkpoint_source
+from .artifact_deadlines import artifact_deadline_environment
 from .worker_adapter import resolve_owned_docker_process
 
 _IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -320,6 +322,7 @@ async def run_docker_model_probe(
         if current_profile is None or current_profile["profile_state"] != "candidate":
             raise DockerProbeError("candidate profile is not available for a new real-model measurement")
         run_deadline = time.monotonic() + timeout_seconds
+        controller_invocation_id = str(uuid4())
         owner = None
         lease_generations: list[int] = []
         owner_processes: list[dict[str, int]] = []
@@ -340,6 +343,14 @@ async def run_docker_model_probe(
             claim = WorkerClaim.from_admitted_job(
                 await queue.get(job_id), lease, image_id=expected_image_id
             )
+            artifact_deadline, remaining = await _bind_docker_artifact_deadline(
+                repository,
+                job_id=job_id,
+                lease_token=claim.lease_token,
+                fencing_token=claim.fence,
+                controller_invocation_id=controller_invocation_id,
+                run_deadline=run_deadline,
+            )
             lease_generations.append(claim.fence)
             container_name = f"gods-task8-{uuid4().hex[:12]}"
             environment = _worker_environment(
@@ -349,6 +360,7 @@ async def run_docker_model_probe(
                 storage_remote_port=tunnel_s3_port,
                 image_id=expected_image_id,
                 gpu_uuid=gpu_uuid,
+                artifact_deadline=artifact_deadline,
             )
             container_id = await _start_worker_container(
                 ssh_target=ssh_target,
@@ -656,6 +668,7 @@ def _worker_environment(
     storage_remote_port: int,
     image_id: str,
     gpu_uuid: str,
+    artifact_deadline: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     values = {
         "GODS_MLOPS_DATABASE_URL": _remote_database_url(database_url, database_remote_port),
@@ -688,7 +701,41 @@ def _worker_environment(
         "HF_HUB_DISABLE_TELEMETRY": "1",
         "TOKENIZERS_PARALLELISM": "false",
     }
+    if artifact_deadline is not None:
+        values.update(artifact_deadline_environment(artifact_deadline))
     return values
+
+
+async def _bind_docker_artifact_deadline(
+    repository,
+    *,
+    job_id: str,
+    lease_token: str,
+    fencing_token: int,
+    controller_invocation_id: str,
+    run_deadline: float,
+    clock=time.monotonic,
+) -> tuple[dict, float]:
+    monotonic_before = clock()
+    database_now = await repository.artifact_database_clock()
+    monotonic_after = clock()
+    if monotonic_after < monotonic_before:
+        raise DockerProbeError("controller monotonic clock moved backwards during deadline sampling")
+    remaining = run_deadline - monotonic_after
+    if remaining <= 0:
+        raise TimeoutError("real-model probe exceeded its bounded end-to-end timeout")
+    candidate_deadline_at = database_now + timedelta(seconds=remaining)
+    authority = await repository.bind_worker_artifact_deadline(
+        job_id=job_id,
+        lease_token=lease_token,
+        fencing_token=fencing_token,
+        controller_invocation_id=controller_invocation_id,
+        candidate_deadline_at=candidate_deadline_at,
+    )
+    remaining = run_deadline - clock()
+    if remaining <= 0:
+        raise TimeoutError("real-model probe exceeded its bounded end-to-end timeout")
+    return authority, remaining
 
 
 async def _start_worker_container(

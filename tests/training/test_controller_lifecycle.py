@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -211,5 +211,74 @@ def test_yielded_live_owner_is_monitored_before_a_new_fence_can_launch() -> None
         assert admission.calls == 1
         assert monitor.calls == 3
         assert repository.lease is None
+
+    asyncio.run(exercise())
+
+
+def test_controller_binds_one_authority_deadline_after_admission_and_passes_it_to_worker() -> None:
+    async def exercise() -> None:
+        job = _job("waiting_gpu", None)
+        repository = _Repository(job, None)
+        db_now = datetime(2026, 10, 7, 0, 0, tzinfo=UTC)
+        monotonic_now = [0.0]
+        deadline_records = []
+
+        class DeadlineRepository(_Repository):
+            async def artifact_database_clock(self):
+                monotonic_now[0] += 2.0
+                return db_now
+
+            async def bind_worker_artifact_deadline(
+                self,
+                *,
+                job_id,
+                lease_token,
+                fencing_token,
+                controller_invocation_id,
+                candidate_deadline_at,
+            ):
+                record = {
+                    "job_id": job_id,
+                    "lease_token": lease_token,
+                    "fencing_token": fencing_token,
+                    "controller_invocation_id": controller_invocation_id,
+                    "artifact_deadline_at": candidate_deadline_at,
+                }
+                deadline_records.append(record)
+                return record
+
+        class DeadlineAdapter(_Adapter):
+            def __init__(self):
+                super().__init__()
+                self.deadlines = []
+
+            def ensure_worker(self, *, job, lease, profile, artifact_deadline=None):
+                self.deadlines.append(artifact_deadline)
+                return super().ensure_worker(job=job, lease=lease, profile=profile)
+
+        repository = DeadlineRepository(job, None)
+        adapter = DeadlineAdapter()
+        admission = _Admission(job, repository)
+        monitor = _Monitor(job, repository)
+        controller = TrainingController(
+            queue=_Queue(job),
+            repository=repository,
+            admission=admission,
+            monitor=monitor,
+            observer=_Observer(),
+            worker_adapter=adapter,
+            core_api=SimpleNamespace(),
+            namespace="gods-mlops",
+            sleep=lambda _seconds: asyncio.sleep(0),
+            clock=lambda: monotonic_now[0],
+        )
+
+        completed = await controller.run(JOB_ID, timeout_seconds=100)
+
+        assert completed["state"] == "completed"
+        assert len(deadline_records) == 1
+        assert UUID(deadline_records[0]["controller_invocation_id"])
+        assert deadline_records[0]["artifact_deadline_at"] == db_now + timedelta(seconds=98)
+        assert adapter.deadlines == deadline_records
 
     asyncio.run(exercise())

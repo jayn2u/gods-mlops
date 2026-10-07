@@ -42,6 +42,7 @@ _MIGRATIONS = (
     (13, "0013_gpu_job_queue.sql"),
     (14, "0014_operator_queue_order.sql"),
     (15, "0015_operator_retry_intent_generations.sql"),
+    (16, "0016_worker_artifact_deadlines.sql"),
 )
 _MIGRATION_RESOURCES = files("gods_mlops.migrations")
 

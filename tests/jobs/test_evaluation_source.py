@@ -6,6 +6,7 @@ import importlib
 import json
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -1127,6 +1128,7 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
             "job_id": "e4d82c26-8f0a-4f45-8b88-5fe84302d948",
             "state": "running",
             "lease_token": "8ad96890-3434-4f07-85bb-8cde17a2b009",
+            "lease_generation": 1,
             "phase": "probe",
             "target_phase": "evaluation",
             "input_kind": "probe_input",
@@ -1172,7 +1174,13 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
                 "dataset_version": None,
             }
         )
-        lease = {"job_id": job["job_id"], "lease_token": job["lease_token"], "fencing_token": 1}
+        database_now = datetime.now(UTC)
+        lease = {
+            "job_id": job["job_id"],
+            "lease_token": job["lease_token"],
+            "fencing_token": 1,
+            "expires_at": database_now + timedelta(minutes=1),
+        }
         reservation = {"job_id": job["job_id"], "reserved_bytes": 4096, "consumed_bytes": 0, "state": "reserved"}
         changes = {"authority_valid": True, "writes": []}
 
@@ -1201,6 +1209,11 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
                     return {"details": commit}
                 if "FROM gods_mlops_artifact_reservations" in query:
                     return reservation
+                return None
+
+            async def fetchval(self, query, *_args):
+                if "clock_timestamp" in query:
+                    return database_now
                 return None
 
             async def fetch(self, query, *_args):
@@ -1829,6 +1842,7 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
         class Database:
             def __init__(self):
                 self.events = []
+                self.event_rows = []
                 self.source_reads = 0
                 self.stale = False
 
@@ -1836,6 +1850,8 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
 
         class Connection:
             async def fetchrow(self, query, *_args):
+                if "JOIN gods_mlops_job_events e" in query:
+                    return None
                 if "ingestion_storage_usage" in query:
                     database.events.append("global_ledger_lock")
                     return {"used_bytes": 0}
@@ -1848,7 +1864,10 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
                         "job_id": job_id,
                         "lease_token": lease_token,
                         "fencing_token": 3,
+                        "expires_at": datetime.now(UTC) + timedelta(minutes=1),
                     }
+                if "SELECT state FROM gods_mlops_jobs" in query:
+                    return {"state": eval_job["state"]}
                 if "FROM gods_mlops_jobs" in query and "checkpoint_uri" not in query:
                     return training_job
                 if "WHERE phase = 'training'" in query:
@@ -1865,16 +1884,38 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
 
             async def fetch(self, query, *_args):
                 if "gods_mlops_job_events" in query:
-                    return []
+                    return list(database.event_rows)
                 return []
 
             async def fetchval(self, query, *_args):
+                if "clock_timestamp" in query:
+                    return datetime.now(UTC)
                 if "result_artifact_committed" in query or "checkpoint_prune_pending" in query:
                     return False
                 return None
 
-            async def execute(self, *_args):
+            async def execute(self, query, *args):
                 database.events.append("database_write")
+                if "'artifact_write_pending'" in query:
+                    database.event_rows.append(
+                        {"event_type": "artifact_write_pending", "details": json.loads(args[3])}
+                    )
+                elif "'artifact_write_started'" in query:
+                    database.event_rows.append(
+                        {
+                            "event_type": "artifact_write_started",
+                            "fencing_token": args[2],
+                            "details": json.loads(args[3]),
+                        }
+                    )
+                elif "'artifact_write_quiescent'" in query:
+                    database.event_rows.append(
+                        {
+                            "event_type": "artifact_write_quiescent",
+                            "fencing_token": args[2],
+                            "details": json.loads(args[3]),
+                        }
+                    )
 
             def transaction(self):
                 return self
@@ -1940,7 +1981,13 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
 
             def commit(self, _prepared):
                 database.events.append("object_commit")
-                raise AssertionError("invalidated checkpoint must not reach object commit")
+                return SimpleNamespace(
+                    identity=identity,
+                    sha256=_prepared.sha256,
+                    size_bytes=_prepared.size_bytes,
+                    uri=_prepared.uri,
+                    path=None,
+                )
 
         queue = JobQueue(repository=Repository(database_url="postgresql://unused"), sources=Sources())
         error_type = DatasetNotReadyForEvaluationError
@@ -1956,17 +2003,18 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
             )
 
         self.assertEqual(database.source_reads, 2)
-        self.assertEqual(database.events[:7], [
+        self.assertEqual(database.events[:4], [
             "global_ledger_lock",
             "current_evaluation_source_check",
             "job_lock",
             "lease_lock",
-            "database_write",
-            "database_write",
-            "global_ledger_lock",
         ])
-        self.assertEqual(database.events[7], "current_evaluation_source_check")
-        self.assertNotIn("object_commit", database.events)
+        self.assertEqual(database.events[-2:], ["global_ledger_lock", "current_evaluation_source_check"])
+        self.assertIn("object_commit", database.events)
+        self.assertTrue(any(row["event_type"] == "artifact_write_pending" for row in database.event_rows))
+        self.assertTrue(any(row["event_type"] == "artifact_write_started" for row in database.event_rows))
+        self.assertTrue(any(row["event_type"] == "artifact_write_quiescent" for row in database.event_rows))
+        self.assertFalse(any(row["event_type"] == "checkpoint_committed" for row in database.event_rows))
 
     def test_save_checkpoint_facade_rejects_stale_lease_at_final_evaluation_commit(self) -> None:
         from gods_mlops.jobs.checkpoints import StaleCheckpointOwnerError
@@ -1996,6 +2044,11 @@ class EvaluationCheckpointSourceTests(unittest.TestCase):
                 if "FROM gods_mlops_gpu_leases" in query and "FOR UPDATE" in query:
                     events.append("lease_lock")
                     return None
+                return None
+
+            async def fetchval(self, query, *_args):
+                if "clock_timestamp" in query:
+                    return datetime.now(UTC)
                 return None
 
             def transaction(self):

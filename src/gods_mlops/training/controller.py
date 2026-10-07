@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from datetime import timedelta
 from typing import Any
+from uuid import uuid4
 
 from gods_mlops.jobs.admission import GpuAdmission
 from gods_mlops.jobs.models import AnnotationSourceSelection, ResourceObservation
@@ -52,6 +54,7 @@ class TrainingController:
     async def run(self, job_id: str, *, timeout_seconds: int = 86_400) -> dict[str, Any]:
         if timeout_seconds <= 0:
             raise ValueError("controller timeout must be positive")
+        controller_invocation_id = str(uuid4())
         deadline = self._clock() + timeout_seconds
         while self._clock() < deadline:
             job = await self._queue.get(job_id)
@@ -80,13 +83,28 @@ class TrainingController:
                 continue
             worker_job = None
             if job.get("state") == "running":
-                worker_job = self._worker_adapter.ensure_worker(job=job, lease=lease, profile=profile)
+                artifact_deadline = await self._bind_artifact_deadline(
+                    job_id=job_id,
+                    lease=lease,
+                    controller_invocation_id=controller_invocation_id,
+                    run_deadline=deadline,
+                )
+                deadline_kwargs = (
+                    {"artifact_deadline": artifact_deadline} if artifact_deadline is not None else {}
+                )
+                worker_job = self._worker_adapter.ensure_worker(
+                    job=job, lease=lease, profile=profile, **deadline_kwargs
+                )
             elif job.get("state") in {"yield_requested", "completed", "failed", "cancelled"}:
                 # A retained lease can outlive the job's runnable state. Read its
                 # exact owned Job for observation, but never turn a yield/terminal
                 # state into a new GPU launch.
+                artifact_deadline = await self._existing_artifact_deadline(job_id=job_id, lease=lease)
+                deadline_kwargs = (
+                    {"artifact_deadline": artifact_deadline} if artifact_deadline is not None else {}
+                )
                 worker_job = self._worker_adapter.read_existing_worker(
-                    job=job, lease=lease, profile=profile
+                    job=job, lease=lease, profile=profile, **deadline_kwargs
                 )
             worker_uid = _get(_get(worker_job, "metadata"), "uid") if worker_job is not None else None
             if worker_job is not None and not worker_uid:
@@ -123,6 +141,49 @@ class TrainingController:
                 return current
             await self._sleep(self._interval_seconds)
         raise TimeoutError(f"training controller timed out for job {job_id}")
+
+    async def _bind_artifact_deadline(
+        self,
+        *,
+        job_id: str,
+        lease: dict[str, Any],
+        controller_invocation_id: str,
+        run_deadline: float,
+    ) -> dict[str, Any] | None:
+        sample_clock = getattr(self._repository, "artifact_database_clock", None)
+        bind = getattr(self._repository, "bind_worker_artifact_deadline", None)
+        if not callable(sample_clock) and not callable(bind):
+            return None
+        if not callable(sample_clock) or not callable(bind):
+            raise RuntimeError("worker artifact deadline authority is incomplete")
+        monotonic_before = self._clock()
+        database_now = await sample_clock()
+        monotonic_after = self._clock()
+        if monotonic_after < monotonic_before:
+            raise RuntimeError("controller monotonic clock moved backwards during deadline sampling")
+        remaining = run_deadline - monotonic_after
+        if remaining <= 0:
+            raise TimeoutError("training controller timed out before worker launch")
+        candidate_deadline_at = database_now + timedelta(seconds=remaining)
+        return await bind(
+            job_id=job_id,
+            lease_token=str(lease["lease_token"]),
+            fencing_token=int(lease["fencing_token"]),
+            controller_invocation_id=controller_invocation_id,
+            candidate_deadline_at=candidate_deadline_at,
+        )
+
+    async def _existing_artifact_deadline(
+        self, *, job_id: str, lease: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        read_existing = getattr(self._repository, "artifact_deadline_for_fence", None)
+        if not callable(read_existing):
+            return None
+        return await read_existing(
+            job_id=job_id,
+            lease_token=str(lease["lease_token"]),
+            fencing_token=int(lease["fencing_token"]),
+        )
 
     async def _observer_call(self) -> ResourceObservation:
         method = self._observer.observe

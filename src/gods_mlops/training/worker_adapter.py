@@ -8,6 +8,7 @@ from typing import Any
 from uuid import UUID
 
 from gods_mlops.jobs.models import ProcessIdentity, ResourceObservation
+from .artifact_deadlines import artifact_deadline_environment
 from .claims import WorkerClaim, WorkerAuthorizationError, validate_worker_claim
 
 _IMAGE_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*@sha256:[0-9a-f]{64}$")
@@ -23,6 +24,7 @@ def build_gpu_worker_job(
     image: str,
     model_cache_claim: str = "gods-mlops-model-cache",
     checkpoint_claim: str = "gods-mlops-artifacts",
+    artifact_deadline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one deterministic Ubuntu/A6000 worker Job for an already admitted lease."""
     return _build_gpu_worker_job(
@@ -34,6 +36,7 @@ def build_gpu_worker_job(
         model_cache_claim=model_cache_claim,
         checkpoint_claim=checkpoint_claim,
         allowed_job_states=frozenset({"running"}),
+        artifact_deadline=artifact_deadline,
     )
 
 
@@ -47,6 +50,7 @@ def _build_gpu_worker_job(
     model_cache_claim: str,
     checkpoint_claim: str,
     allowed_job_states: frozenset[str],
+    artifact_deadline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Render the immutable worker contract for creation or read-only recovery."""
     if not re.fullmatch(r"[a-z0-9](?:[-a-z0-9.]{0,61}[a-z0-9])?", namespace):
@@ -113,6 +117,11 @@ def _build_gpu_worker_job(
         {"name": "GODS_MLOPS_MODEL_CACHE_ROOT", "value": "/mnt/model-cache"},
         {"name": "GODS_MLOPS_CHECKPOINT_ROOT", "value": "/mnt/gods-objects/checkpoints"},
     ]
+    if artifact_deadline is not None:
+        env.extend(
+            {"name": name, "value": value}
+            for name, value in artifact_deadline_environment(artifact_deadline).items()
+        )
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -175,6 +184,7 @@ class KubernetesOwnedWorkerAdapter:
         job: dict[str, Any],
         lease: dict[str, Any],
         profile: dict[str, Any],
+        artifact_deadline: dict[str, Any] | None = None,
     ) -> Any:
         body = build_gpu_worker_job(
             job=job,
@@ -182,6 +192,7 @@ class KubernetesOwnedWorkerAdapter:
             profile=profile,
             namespace=self._namespace,
             image=self._image,
+            artifact_deadline=artifact_deadline,
         )
         name = body["metadata"]["name"]
         try:
@@ -199,6 +210,7 @@ class KubernetesOwnedWorkerAdapter:
         job: dict[str, Any],
         lease: dict[str, Any],
         profile: dict[str, Any],
+        artifact_deadline: dict[str, Any] | None = None,
     ) -> Any | None:
         """Read the exact owned worker for a retained non-running lease, never creating one."""
         allowed_states = frozenset({"yield_requested", "completed", "failed", "cancelled"})
@@ -213,6 +225,7 @@ class KubernetesOwnedWorkerAdapter:
             model_cache_claim="gods-mlops-model-cache",
             checkpoint_claim="gods-mlops-artifacts",
             allowed_job_states=allowed_states,
+            artifact_deadline=artifact_deadline,
         )
         name = body["metadata"]["name"]
         try:

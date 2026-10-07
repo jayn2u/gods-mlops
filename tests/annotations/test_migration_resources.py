@@ -5,6 +5,7 @@ from importlib.resources import files
 
 def test_all_schema_migrations_are_packaged_as_stable_resources() -> None:
     migrations = files("gods_mlops.migrations")
+    from gods_mlops.annotations.storage import _MIGRATIONS
 
     names = sorted(item.name for item in migrations.iterdir() if item.name.endswith(".sql"))
 
@@ -24,5 +25,7 @@ def test_all_schema_migrations_are_packaged_as_stable_resources() -> None:
         "0013_gpu_job_queue.sql",
         "0014_operator_queue_order.sql",
         "0015_operator_retry_intent_generations.sql",
+        "0016_worker_artifact_deadlines.sql",
     ]
     assert all(migrations.joinpath(name).read_text(encoding="utf-8").strip() for name in names)
+    assert (16, "0016_worker_artifact_deadlines.sql") in _MIGRATIONS

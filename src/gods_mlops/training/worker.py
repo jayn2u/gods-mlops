@@ -20,6 +20,11 @@ from gods_mlops.jobs.sources import DatasetSourceRegistry
 
 from .artifacts import S3ResultArtifactStore
 from .checkpoints import S3CheckpointStore
+from .artifact_deadlines import (
+    LEGACY_ARTIFACT_TIMEOUT_SECONDS,
+    anchor_worker_deadline,
+    parse_worker_deadline_environment,
+)
 from .claims import (
     WorkerAuthorizationError,
     WorkerClaim,
@@ -30,6 +35,59 @@ from .claims import (
 from .data import dataset_object_store_from_environment
 
 
+async def resolve_worker_artifact_deadline(
+    repository,
+    *,
+    job_id: str,
+    lease_token: str,
+    fencing_token: int,
+    environment_value: tuple[str, Any] | None,
+    monotonic_clock=time.monotonic,
+) -> tuple[float, dict[str, Any] | None]:
+    if environment_value is None:
+        return monotonic_clock() + LEGACY_ARTIFACT_TIMEOUT_SECONDS, None
+    monotonic_before_read = monotonic_clock()
+    authority_record = await repository.read_worker_artifact_deadline(
+        job_id=job_id,
+        lease_token=lease_token,
+        fencing_token=fencing_token,
+    )
+    monotonic_after_read = monotonic_clock()
+    local_deadline = anchor_worker_deadline(
+        environment_value=environment_value,
+        authority_record=authority_record,
+        monotonic_before_read=monotonic_before_read,
+        monotonic_after_read=monotonic_after_read,
+    )
+    return local_deadline, authority_record
+
+
+async def await_worker_artifact_operation(
+    operation,
+    *,
+    local_deadline: float,
+    monotonic_clock=time.monotonic,
+):
+    remaining = local_deadline - monotonic_clock()
+    if remaining <= 0:
+        close = getattr(operation, "close", None)
+        if callable(close):
+            close()
+        raise TimeoutError("worker artifact deadline has expired")
+    try:
+        return await asyncio.wait_for(operation, timeout=remaining)
+    except asyncio.TimeoutError as error:
+        raise TimeoutError("worker artifact operation exceeded its deadline") from error
+
+
+def _snapshot_runtime_measurements(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("result runtime measurements must be a JSON object")
+    return json.loads(canonical_json(value))
+
+
 async def run_worker() -> int:
     """Re-read the exact lease and source before importing any model/GPU runtime."""
     database_url = _required("GODS_MLOPS_DATABASE_URL")
@@ -37,10 +95,11 @@ async def run_worker() -> int:
     lease_token = _required("GODS_MLOPS_LEASE_TOKEN")
     image_id = _required("GODS_MLOPS_IMAGE_ID")
     gpu_uuid = _required("GODS_MLOPS_GPU_UUID")
+    deadline_environment = parse_worker_deadline_environment(dict(os.environ))
     repository = PostgresJobQueueRepository(database_url=database_url)
     sources = DatasetSourceRegistry(database_url=database_url)
     queue = JobQueue(repository=repository, sources=sources)
-    objects = dataset_object_store_from_environment()
+    objects = None
     evaluation_publisher = None
     evaluation_model_id = None
     try:
@@ -54,6 +113,14 @@ async def run_worker() -> int:
         claim = WorkerClaim.from_admitted_job(job, lease, image_id=image_id)
         if claim.lease_token != lease_token:
             raise WorkerAuthorizationError("worker lease token differs from its current database fence")
+        artifact_deadline_monotonic, artifact_deadline_authority = await resolve_worker_artifact_deadline(
+            repository,
+            job_id=job_id,
+            lease_token=lease_token,
+            fencing_token=claim.fence,
+            environment_value=deadline_environment,
+        )
+        objects = dataset_object_store_from_environment()
         _verify_claim_environment(claim)
         job, lease = await validate_current_worker_claim(queue, claim, object_store=objects)
         if profile is None:
@@ -166,7 +233,24 @@ async def run_worker() -> int:
         async def still_current() -> bool:
             return await _worker_claim_at_safe_boundary(queue, claim, object_store=objects)
 
-        def from_runner(coroutine):
+        def from_runner(coroutine, *, artifact: bool = False):
+            if artifact:
+                remaining = artifact_deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    close = getattr(coroutine, "close", None)
+                    if callable(close):
+                        close()
+                    raise TimeoutError("worker artifact deadline has expired")
+                submitted = await_worker_artifact_operation(
+                    coroutine,
+                    local_deadline=artifact_deadline_monotonic,
+                )
+                future = asyncio.run_coroutine_threadsafe(submitted, event_loop)
+                try:
+                    return future.result(timeout=remaining)
+                except FutureTimeout as error:
+                    future.cancel()
+                    raise RuntimeError("fenced artifact operation exceeded its authority deadline") from error
             future = asyncio.run_coroutine_threadsafe(coroutine, event_loop)
             try:
                 return future.result(timeout=30)
@@ -185,10 +269,13 @@ async def run_worker() -> int:
                     lease_token=lease_token,
                     identity=identity,
                     payload=payload,
-                )
+                    artifact_deadline=artifact_deadline_authority,
+                ),
+                artifact=True,
             )
 
         def commit_result(kind: str, payload: bytes, runtime_measurements=None):
+            measurements_snapshot = _snapshot_runtime_measurements(runtime_measurements)
             return from_runner(
                 queue.save_result_artifact(
                     store=result_store,
@@ -197,8 +284,10 @@ async def run_worker() -> int:
                     identity=identity,
                     kind=kind,
                     payload=payload,
-                    runtime_measurements=runtime_measurements,
-                )
+                    runtime_measurements=measurements_snapshot,
+                    artifact_deadline=artifact_deadline_authority,
+                ),
+                artifact=True,
             )
 
         config["_assert_current"] = assert_current
@@ -253,12 +342,16 @@ async def run_worker() -> int:
         if result.get("status") == "yielded":
             payload = result.get("checkpoint_payload")
             if isinstance(payload, bytes) and payload:
-                await queue.save_checkpoint(
-                    store=checkpoint_store,
-                    job_id=job_id,
-                    lease_token=lease_token,
-                    identity=identity,
-                    payload=payload,
+                await await_worker_artifact_operation(
+                    queue.save_checkpoint(
+                        store=checkpoint_store,
+                        job_id=job_id,
+                        lease_token=lease_token,
+                        identity=identity,
+                        payload=payload,
+                        artifact_deadline=artifact_deadline_authority,
+                    ),
+                    local_deadline=artifact_deadline_monotonic,
                 )
             return 0
         if result.get("status") != "succeeded":
@@ -321,12 +414,16 @@ async def run_worker() -> int:
         checkpoint_digest = result.get("checkpoint_sha256")
         checkpoint_payload = result.get("checkpoint_payload")
         if isinstance(checkpoint_payload, bytes) and checkpoint_payload:
-            verified = await queue.save_checkpoint(
-                store=checkpoint_store,
-                job_id=job_id,
-                lease_token=lease_token,
-                identity=identity,
-                payload=checkpoint_payload,
+            verified = await await_worker_artifact_operation(
+                queue.save_checkpoint(
+                    store=checkpoint_store,
+                    job_id=job_id,
+                    lease_token=lease_token,
+                    identity=identity,
+                    payload=checkpoint_payload,
+                    artifact_deadline=artifact_deadline_authority,
+                ),
+                local_deadline=artifact_deadline_monotonic,
             )
             checkpoint_digest = verified.sha256
         result_payload = result.get("result_artifact_payload")
@@ -340,14 +437,19 @@ async def run_worker() -> int:
                     "evaluation probe result provenance differs from its typed checkpoint source"
                 )
         if isinstance(result_payload, bytes) and result_payload:
-            artifact = await queue.save_result_artifact(
-                store=result_store,
-                job_id=job_id,
-                lease_token=lease_token,
-                identity=identity,
-                kind=str(result["result_artifact_kind"]),
-                payload=result_payload,
-                runtime_measurements=result.get("resource_measurements"),
+            measurements_snapshot = _snapshot_runtime_measurements(result.get("resource_measurements"))
+            artifact = await await_worker_artifact_operation(
+                queue.save_result_artifact(
+                    store=result_store,
+                    job_id=job_id,
+                    lease_token=lease_token,
+                    identity=identity,
+                    kind=str(result["result_artifact_kind"]),
+                    payload=result_payload,
+                    runtime_measurements=measurements_snapshot,
+                    artifact_deadline=artifact_deadline_authority,
+                ),
+                local_deadline=artifact_deadline_monotonic,
             )
             result["result_uri"] = artifact.uri
 
@@ -577,7 +679,8 @@ async def _load_verified_evaluation_checkpoint(queue, store, source: EvaluationC
     ):
         raise WorkerAuthorizationError("evaluation checkpoint metadata differs from the immutable source reference")
     try:
-        verified = store.load_uri(
+        verified = await asyncio.to_thread(
+            store.load_uri,
             source.checkpoint_uri,
             expected_identity=actual_identity,
             expected_sha256=source.checkpoint_sha256,
@@ -638,7 +741,8 @@ async def _load_verified_evaluation_probe_checkpoint(
     if actual_identity.as_dict() != source.checkpoint_identity:
         raise WorkerAuthorizationError("evaluation probe checkpoint identity differs from its DB origin")
     try:
-        verified = store.load_uri(
+        verified = await asyncio.to_thread(
+            store.load_uri,
             source.checkpoint_uri,
             expected_identity=actual_identity,
             expected_sha256=source.checkpoint_sha256,
@@ -724,7 +828,9 @@ async def _recover_committed_result(
     if details.get("kind") != expected_kind:
         raise WorkerAuthorizationError("committed result kind differs from the immutable job phase")
     try:
-        verified = result_store.verify_committed(details, expected_identity=identity)
+        verified = await asyncio.to_thread(
+            result_store.verify_committed, details, expected_identity=identity
+        )
     except Exception as error:
         raise WorkerAuthorizationError("committed result bytes or identity failed recovery verification") from error
 
@@ -779,7 +885,8 @@ async def _recover_committed_result(
         if claim.target_phase == "evaluation":
             if verified.object_key is None:
                 raise WorkerAuthorizationError("evaluation probe result has no immutable S3 object key")
-            result_payload = objects.read_source(
+            result_payload = await asyncio.to_thread(
+                objects.read_source,
                 object_key=verified.object_key,
                 sha256_digest=verified.sha256,
                 size_bytes=verified.size_bytes,
