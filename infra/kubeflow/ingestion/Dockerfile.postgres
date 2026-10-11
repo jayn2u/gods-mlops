@@ -1,0 +1,9 @@
+FROM docker.io/pgvector/pgvector:0.8.1-pg17@sha256:3e8b3adfd27b5707128f60956f62a793c3c9326ea8cfaf0eab7adccb5d700b21
+
+USER root
+RUN groupmod --gid 10001 postgres \
+    && usermod --uid 10001 --gid 10001 postgres \
+    && chown --recursive 10001:10001 /var/lib/postgresql \
+    && install --directory --owner=10001 --group=10001 /var/run/postgresql
+
+USER 10001:10001

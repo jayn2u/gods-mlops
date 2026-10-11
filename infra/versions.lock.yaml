@@ -1,0 +1,66 @@
+schema_version: 1
+
+platform:
+  k3s: v1.36.2+k3s1
+  kubeflow:
+    version: 26.03.1
+    commit: f09f3eeaa25cc852665f460497a42b7fc68639ac
+  kubeflow_pipelines: 2.16.1
+  nvidia_device_plugin: 0.19.3
+  label_studio:
+    version: 1.23.2
+    commit: df96d79183156e556d91825d15fa7721f1145e1a
+
+training:
+  python: 3.12.15
+  torch: 2.12.0+cu130
+  torchvision: 0.27.0+cu130
+  transformers: 4.57.1
+  huggingface_hub: 0.36.2
+  numpy: 2.3.3
+  pycocotools: 2.0.11
+  pyyaml: 6.0.3
+  pillow: 12.0.0
+  safetensors: 0.7.0
+
+runtime_tools:
+  debian_bookworm_openssh_client: "1:9.2p1-2+deb12u10"
+
+storage:
+  engine: SeaweedFS
+  version: "4.47"
+  api: S3-compatible
+  license: Apache-2.0
+  source_repository: https://github.com/seaweedfs/seaweedfs/tree/4.47
+
+images:
+  - name: training-python-base
+    source: docker.io/library/python
+    tag: 3.12-slim-bookworm
+    digest: sha256:54c85f3c47607a77f32adec749d3c81d1348bf25833671f512b26a9b6d778cb3
+
+  - name: uv-build-tool
+    source: ghcr.io/astral-sh/uv
+    tag: 0.12.20
+    digest: sha256:100047e74f30778ab704942321a09750d6158739573ff58bf3924085cc6cd2d8
+
+  - name: object-storage
+    source: ghcr.io/chrislusf/seaweedfs
+    tag: "4.47"
+    digest: sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
+    license: Apache-2.0
+    source_repository: https://github.com/seaweedfs/seaweedfs/tree/4.47
+
+  - name: label-studio
+    source: docker.io/heartexlabs/label-studio
+    tag: 1.23.2
+    digest: sha256:afcc516a22775a39d0d66f4c2ddc95d01be3e3d3862b21fcf4f9de34b4ad4e12
+    license: Apache-2.0
+    source_repository: https://github.com/HumanSignal/label-studio/tree/1.23.2
+
+  - name: ingestion-postgres-base
+    source: docker.io/pgvector/pgvector
+    tag: 0.8.1-pg17
+    digest: sha256:3e8b3adfd27b5707128f60956f62a793c3c9326ea8cfaf0eab7adccb5d700b21
+    license: PostgreSQL
+    source_repository: https://github.com/pgvector/pgvector/tree/v0.8.1

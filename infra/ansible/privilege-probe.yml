@@ -1,0 +1,17 @@
+---
+- name: Verify normal Ansible become authentication without changing host state
+  hosts: gods_cluster
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Read the effective UID after authenticated become
+      ansible.builtin.command:
+        argv: [id, -u]
+      register: gods_effective_uid
+      changed_when: false
+
+    - name: Require authenticated effective root
+      ansible.builtin.assert:
+        that:
+          - gods_effective_uid.stdout | trim == '0'
+        fail_msg: "Ansible become did not produce effective uid 0 on {{ inventory_hostname }}."

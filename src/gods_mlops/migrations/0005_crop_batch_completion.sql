@@ -1,0 +1,2 @@
+ALTER TABLE annotation_crops
+    ADD COLUMN IF NOT EXISTS crop_set_ready BOOLEAN NOT NULL DEFAULT FALSE;

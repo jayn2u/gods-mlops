@@ -1,0 +1,123 @@
+all:
+  vars:
+    ansible_user: jayn2u
+    ansible_ssh_common_args: "-o BatchMode=yes"
+    gods_k3s_data_dir_name: k3s
+    gods_owner_marker_name: .gods-mlops-owner.json
+    gods_cluster_marker_name: .gods-mlops-cluster-owner.json
+    gods_container_uid: 10001
+    gods_container_gid: 10001
+    gods_expected_root_uid: 0
+    gods_network_flows:
+      - name: K3s API
+        protocol: tcp
+        port: 6443
+        source: 203.253.21.179/32
+        destination: 203.253.25.54/32
+        interface: ubuntu eno3; vis-lab target interface is recorded by preflight
+      - name: K3s Flannel VXLAN
+        protocol: udp
+        port: 8472
+        source: 203.253.21.179/32 and 203.253.25.54/32
+        destination: peer K3s node address
+        interface: interface selected by each node's ip route get result
+      - name: Kubelet API for control-plane operations
+        protocol: tcp
+        port: 10250
+        source: 203.253.25.54/32
+        destination: 203.253.21.179/32
+        interface: target interface selected by vis-lab ip route get
+  children:
+    gods_server:
+      hosts:
+        vis-lab:
+          ansible_host: 203.253.25.54
+          ansible_port: 2222
+          k3s_node_ip: 203.253.25.54
+          gods_peer_ip: 203.253.21.179
+          gods_k3s_data_dir: "{{ gods_data_root }}/{{ gods_k3s_data_dir_name }}"
+          gods_storage_mount: /mnt/data
+          gods_data_root: /mnt/data/gods-mlops-runtime
+          gods_recovery_root: /mnt/data/gods-mlops-recovery
+          gods_recovery_credential_ids:
+            - gods-k3s-token
+            - gods-ingestion-port-forward-kubeconfig
+          gods_min_free_gib: 50
+          gods_data_directories:
+            - path: /mnt/data/gods-mlops-runtime/spool
+              capacity: 20Gi
+              role: spool
+          gods_preserve_paths:
+            - /mnt/data/gods-mlops
+            - /mnt/data/minio-code
+            - /mnt/data/minio-data
+            - /mnt/data/labclip-cache
+            - /mnt/data/labclip-k3s
+            - /mnt/data/gods-mlops-recovery
+          gods_preserve_patterns: []
+          gods_preserve_services: []
+    gods_gpu_worker:
+      hosts:
+        ubuntu:
+          ansible_host: jayn2u-179-pub-vis
+          k3s_node_ip: 203.253.21.179
+          gods_peer_ip: 203.253.25.54
+          gods_k3s_data_dir: "{{ gods_data_root }}/{{ gods_k3s_data_dir_name }}"
+          gods_storage_mount: /data
+          gods_data_root: /data/jayn2u/gods-mlops
+          gods_recovery_root: /data/jayn2u/gods-mlops-recovery
+          gods_recovery_credential_ids:
+            - kubeflow-dex-operator
+            - gods-object-store-credentials
+            - gods-database-credentials
+            - gods-sample-ingestion-credentials
+            - gods-label-studio-credentials
+          gods_min_free_gib: 1024
+          gods_gpu_model: NVIDIA RTX A6000
+          gods_data_directories:
+            - path: /data/jayn2u/gods-mlops/objects
+              capacity: 1Ti
+              role: objects
+            - path: /data/jayn2u/gods-mlops/cache
+              capacity: 200Gi
+              role: cache
+            - path: /data/jayn2u/gods-mlops/metadata/platform
+              capacity: 50Gi
+              role: metadata-platform
+            - path: /data/jayn2u/gods-mlops/metadata/ingestion-postgres
+              capacity: 10Gi
+              role: metadata-ingestion-postgres
+            - path: /data/jayn2u/gods-mlops/metadata/label-studio-media
+              capacity: 100Gi
+              role: metadata-label-studio-media
+            - path: /data/jayn2u/gods-mlops/metadata/kubeflow-user/gods-mlops/metadata-postgres
+              capacity: 10Gi
+              role: metadata-postgres
+            - path: /data/jayn2u/gods-mlops/metadata/kubeflow/katib-mysql
+              capacity: 10Gi
+              role: katib-mysql
+            - path: /data/jayn2u/gods-mlops/metadata/kubeflow/model-catalog-postgres
+              capacity: 5Gi
+              role: model-catalog-postgres
+            - path: /data/jayn2u/gods-mlops/metadata/kubeflow/mysql-pv-claim
+              capacity: 20Gi
+              role: mysql-pv-claim
+            - path: /data/jayn2u/gods-mlops/metadata/kubeflow/seaweedfs-pvc
+              capacity: 20Gi
+              role: seaweedfs-pvc
+          gods_preserve_paths:
+            - /data/jayn2u/minio
+            - /data/jayn2u/minio-data
+            - /data/jayn2u/labclip-cache
+            - /data/jayn2u/labclip-k3s
+            - /data/jayn2u/gods-mlops-model-preparation
+            - /data/jayn2u/gods-mlops-recovery
+          gods_preserve_patterns:
+            - /data/docker/volumes/rtsp-video-loop_*
+          gods_preserve_services:
+            - rtsp-video-loop-app-1
+            - rtsp-video-loop-mediamtx-1
+    gods_cluster:
+      children:
+        gods_server:
+        gods_gpu_worker:

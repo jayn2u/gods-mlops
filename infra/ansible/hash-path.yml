@@ -1,0 +1,29 @@
+---
+- name: Hash one explicit local data or recovery path on its owning node
+  hosts: gods_cluster
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Require an exact path beneath this node's configured Gods roots
+      ansible.builtin.assert:
+        that:
+          - gods_hash_path is defined
+          - gods_hash_path.startswith(gods_data_root ~ '/') or gods_hash_path == gods_data_root or gods_hash_path.startswith(gods_recovery_root ~ '/') or gods_hash_path == gods_recovery_root
+        fail_msg: "Hash paths must stay beneath this node's Gods data or recovery root."
+
+    - name: Hash a regular path tree without following symlinks
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/../../src/gods_mlops/lifecycle/recovery.py
+          hash-tree --path {{ gods_hash_path | quote }}
+      changed_when: false
+      when: gods_hash_dump_format is not defined
+
+    - name: Hash a canonical logical SQL dump for backup and restored-dump comparison
+      ansible.builtin.script:
+        cmd: >-
+          {{ playbook_dir }}/../../src/gods_mlops/lifecycle/recovery.py
+          hash-database-dump --path {{ gods_hash_path | quote }}
+          --format {{ gods_hash_dump_format | quote }}
+      changed_when: false
+      when: gods_hash_dump_format is defined

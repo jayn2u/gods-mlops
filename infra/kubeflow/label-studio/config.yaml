@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gods-mlops-label-studio-config
+  namespace: gods-mlops
+data:
+  DJANGO_DB: default
+  POSTGRE_NAME: gods_ingestion
+  POSTGRE_USER: gods_ingestion
+  POSTGRE_HOST: gods-mlops-ingestion-postgres
+  POSTGRE_PORT: "5432"
+  LABEL_STUDIO_BASE_DATA_DIR: /label-studio/data
+  LABEL_STUDIO_HOST: http://gods-mlops-label-studio.gods-mlops.svc.cluster.local:8080
+  DISABLE_SIGNUP_WITHOUT_LINK: "true"
+  SSRF_PROTECTION_ENABLED: "true"
+  DEBUG: "false"
+  COLLECT_ANALYTICS: "false"
+  LATEST_VERSION_CHECK: "false"
+  JSON_LOG: "true"

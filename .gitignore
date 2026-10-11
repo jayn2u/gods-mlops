@@ -1,0 +1,23 @@
+# Python, pytest, and local virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+
+# Ansible preflight output, private credentials, and generated kubeconfig
+infra/ansible/artifacts/
+infra/ansible/generated/
+infra/ansible/vault.yml
+
+# Terraform plugins, plans, state, and private variable files
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.*
+infra/terraform/*.tfplan
+infra/terraform/*.tfvars
+infra/terraform/*.tfvars.json
+!infra/terraform/*.tfvars.example

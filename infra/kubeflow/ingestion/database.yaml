@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: gods-mlops-ingestion-postgres
+  namespace: gods-mlops
+  labels:
+    app.kubernetes.io/name: gods-mlops-ingestion-postgres
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: gods-mlops-ingestion-postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: gods-mlops-ingestion-postgres
+  namespace: gods-mlops
+  labels:
+    app.kubernetes.io/name: gods-mlops-ingestion-postgres
+spec:
+  serviceName: gods-mlops-ingestion-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gods-mlops-ingestion-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gods-mlops-ingestion-postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: postgres
+          image: gods-mlops-ingestion-postgres:0.8.1-pg17-10001
+          imagePullPolicy: Never
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: gods-mlops-ingestion-config
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gods-mlops-ingestion-credentials
+                  key: DATABASE_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - /usr/bin/pg_isready
+                - -h
+                - 127.0.0.1
+                - -U
+                - gods_ingestion
+                - -d
+                - gods_ingestion
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: gods-mlops-ingestion-postgres

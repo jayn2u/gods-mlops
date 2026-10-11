@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Gods MLOps operator login</title>
+    <script src="/static/csrf.js" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>Gods MLOps</h1>
+      <p>Local operator sign in</p>
+      <p role="alert">{{error}}</p>
+      <form method="post" action="/login" data-csrf-form>
+        <label for="username">Operator</label>
+        <input id="username" name="username" autocomplete="username" required>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button type="submit">Sign in</button>
+      </form>
+    </main>
+  </body>
+</html>

@@ -1,0 +1,6 @@
+asyncpg==0.30.0
+boto3==1.40.53
+fastapi==0.116.1
+pillow==12.0.0
+python-multipart==0.0.20
+uvicorn==0.35.0
