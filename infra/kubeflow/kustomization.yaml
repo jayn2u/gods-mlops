@@ -11,6 +11,56 @@ resources:
 
 patches:
   - target:
+      kind: NetworkPolicy
+      name: trainer-webhook
+      namespace: kubeflow-system
+    patch: |-
+      - op: replace
+        path: /spec/podSelector/matchLabels
+        value:
+          app.kubernetes.io/name: trainer
+  - target:
+      namespace: kubeflow-user-example-com
+    patch: |-
+      - op: replace
+        path: /metadata/namespace
+        value: gods-mlops
+  - target:
+      kind: ClusterRoleBinding
+      name: model-registry-(create-sars|retrieve-clusterrolebindings|ui-services-reader)-binding
+    patch: |-
+      - op: replace
+        path: /subjects/0/namespace
+        value: gods-mlops
+  - target:
+      kind: DestinationRule
+      name: model-registry-service
+    patch: |-
+      - op: replace
+        path: /spec/host
+        value: model-registry-service.gods-mlops.svc.cluster.local
+  - target:
+      kind: DestinationRule
+      name: model-registry-ui
+    patch: |-
+      - op: replace
+        path: /spec/host
+        value: model-registry-ui-service.gods-mlops.svc.cluster.local
+  - target:
+      kind: VirtualService
+      name: model-registry
+    patch: |-
+      - op: replace
+        path: /spec/http/0/route/0/destination/host
+        value: model-registry-service.gods-mlops.svc.cluster.local
+  - target:
+      kind: VirtualService
+      name: model-registry-ui
+    patch: |-
+      - op: replace
+        path: /spec/http/0/route/0/destination/host
+        value: model-registry-ui-service.gods-mlops.svc.cluster.local
+  - target:
       group: kubeflow.org
       version: v1beta1
       kind: Profile

@@ -67,7 +67,7 @@ spec:
           readinessProbe:
             exec:
               command:
-                - /usr/local/bin/pg_isready
+                - /usr/bin/pg_isready
                 - -h
                 - 127.0.0.1
                 - -U

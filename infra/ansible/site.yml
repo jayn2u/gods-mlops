@@ -98,10 +98,11 @@
 
     - name: Fetch the Gods control-plane kubeconfig to the controller
       ansible.builtin.fetch:
-        src: "{{ gods_k3s_data_dir }}/server/cred/admin.kubeconfig"
+        src: /etc/rancher/k3s/k3s.yaml
         dest: "{{ playbook_dir }}/generated/kubeconfig"
         flat: true
         validate_checksum: true
+      no_log: true
 
     - name: Point the private kubeconfig at the configured control-plane address
       ansible.builtin.replace:

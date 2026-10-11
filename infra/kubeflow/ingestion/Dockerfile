@@ -12,6 +12,8 @@ COPY pyproject.toml uv.lock ./
 RUN apt-get update \
     && apt-get install --no-install-recommends -y openssh-client=1:9.2p1-2+deb12u10 \
     && rm -rf /var/lib/apt/lists/*
+RUN groupadd --gid 10001 gods-mlops \
+    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent gods-mlops
 RUN uv export --locked --no-dev --no-emit-project --no-hashes --output-file /tmp/uv-constraints.txt
 COPY infra/kubeflow/ingestion/requirements.txt /tmp/ingestion-requirements.txt
 RUN pip install --no-cache-dir --constraint /tmp/uv-constraints.txt --requirement /tmp/ingestion-requirements.txt \

@@ -26,7 +26,7 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       initContainers:
         - name: prepare-ssh-credentials
-          image: gods-mlops-ingestion:0.3.0
+          image: gods-mlops-ingestion:0.3.1-observer-user
           imagePullPolicy: Never
           command:
             - /bin/sh
@@ -52,7 +52,7 @@ spec:
               memory: 64Mi
       containers:
         - name: resource-observer
-          image: gods-mlops-ingestion:0.3.0
+          image: gods-mlops-ingestion:0.3.1-observer-user
           imagePullPolicy: Never
           command:
             - python
